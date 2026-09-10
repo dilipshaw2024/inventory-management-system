@@ -1,0 +1,3 @@
+# Admin profile uploads are runtime data and must not be committed.
+*
+!.gitignore

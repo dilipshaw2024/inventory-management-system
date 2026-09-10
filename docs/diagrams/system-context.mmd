@@ -1,0 +1,11 @@
+flowchart LR
+    Guest[Guest] --> Browser[Web browser]
+    Admin[Authenticated admin] --> Browser
+    Browser --> App[Laravel application]
+    App --> Auth[Session authentication]
+    App --> Controllers[Admin and POS controllers]
+    Controllers --> Views[Blade views and printable reports]
+    Controllers --> JSON[AJAX JSON lookups]
+    Controllers --> Eloquent[Eloquent models]
+    Eloquent --> DB[(MySQL database)]
+    Controllers --> Uploads[(public/upload files)]

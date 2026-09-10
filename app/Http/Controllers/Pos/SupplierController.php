@@ -1,0 +1,107 @@
+<?php
+
+namespace App\Http\Controllers\Pos;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Supplier;
+use App\Http\Requests\Pos\SupplierRequest;
+use Auth;
+use Illuminate\Support\Carbon;
+
+class SupplierController extends Controller
+{
+    public function SupplierAll(){
+        // $suppliers = Supplier::all();
+        $suppliers = Supplier::latest()->get();
+        return view('backend.supplier.supplier_all',compact('suppliers'));
+    } // End Method 
+
+
+    public function SupplierAdd(){
+     return view('backend.supplier.supplier_add');
+    } // End Method 
+
+
+    public function SupplierStore(SupplierRequest $request){
+
+        Supplier::insert([
+            'name' => $request->name,
+            'mobile_no' => $request->mobile_no,
+            'email' => $request->email,
+            'address' => $request->address,
+            'created_by' => Auth::user()->id,
+            'created_at' => Carbon::now(), 
+
+        ]);
+
+         $notification = array(
+            'message' => 'Supplier Inserted Successfully', 
+            'alert-type' => 'success'
+        );
+
+        return redirect()->route('supplier.all')->with($notification);
+
+    } // End Method 
+
+
+    public function SupplierEdit($id){
+
+        $supplier = Supplier::findOrFail($id);
+        return view('backend.supplier.supplier_edit',compact('supplier'));
+
+    } // End Method 
+
+    public function SupplierUpdate(Request $request){
+
+        $request->validate([
+            'id' => ['required', 'integer', 'exists:suppliers,id'],
+            'name' => ['required', 'string', 'max:255'],
+            'mobile_no' => ['nullable', 'string', 'max:30'],
+            'email' => ['nullable', 'email', 'max:255'],
+            'address' => ['nullable', 'string', 'max:255'],
+        ]);
+
+        $sullier_id = $request->id;
+
+        Supplier::findOrFail($sullier_id)->update([
+            'name' => $request->name,
+            'mobile_no' => $request->mobile_no,
+            'email' => $request->email,
+            'address' => $request->address,
+            'updated_by' => Auth::user()->id,
+            'updated_at' => Carbon::now(), 
+
+        ]);
+
+         $notification = array(
+            'message' => 'Supplier Updated Successfully', 
+            'alert-type' => 'success'
+        );
+
+        return redirect()->route('supplier.all')->with($notification);
+
+    } // End Method 
+
+
+    public function SupplierDelete($id){
+
+      $supplier = Supplier::findOrFail($id);
+      if ($supplier->products()->exists() || $supplier->purchases()->exists()) {
+        return redirect()->back()->with(['message' => 'This supplier cannot be deleted because it is linked to products or purchases.', 'alert-type' => 'error']);
+      }
+
+      $supplier->delete();
+      
+       $notification = array(
+            'message' => 'Supplier Deleted Successfully', 
+            'alert-type' => 'success'
+        );
+
+        return redirect()->back()->with($notification);
+
+    } // End Method 
+
+
+}
+ 

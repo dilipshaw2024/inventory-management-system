@@ -1,0 +1,15 @@
+flowchart TD
+    A[Open purchase form] --> B[Select supplier]
+    B --> C[AJAX: get categories]
+    C --> D[Select category]
+    D --> E[AJAX: get products]
+    E --> F[Add one or more purchase lines]
+    F --> G[Client calculates buying price and total]
+    G --> H[POST purchase/store]
+    H --> I[(Purchase status = 0)]
+    I --> J[Pending purchase list]
+    J --> K{Approve purchase?}
+    K -- No --> J
+    K -- Yes --> L[Product quantity increases]
+    L --> M[(Purchase status = 1)]
+    M --> N[Approved purchase reports and stock totals]

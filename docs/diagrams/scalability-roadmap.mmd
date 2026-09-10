@@ -1,0 +1,17 @@
+flowchart LR
+    Current[Current Laravel POS MVP] --> P0[P0 Production foundation]
+    P0 --> Small[Small company ready]
+    Small --> P1[P1 Operations expansion]
+    P1 --> Medium[Medium company ready]
+    Medium --> P2[P2 Enterprise platform]
+    P2 --> Enterprise[Enterprise company ready]
+
+    P0 --> Auth[Roles, validation, integrity, tests]
+    P0 --> SafeStock[Transactional and idempotent stock]
+    P1 --> Locations[Branches and warehouses]
+    P1 --> Procurement[Procurement, returns, tax, accounting]
+    P1 --> Reports[Live reports, imports, exports]
+    P2 --> Tenancy[Multi-company or tenant isolation]
+    P2 --> Integrations[Versioned APIs and integrations]
+    P2 --> Operations[Queues, monitoring, DR, scaling]
+    P2 --> Compliance[Audit, SSO/MFA, compliance]

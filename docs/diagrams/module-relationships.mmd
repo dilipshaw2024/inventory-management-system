@@ -1,0 +1,24 @@
+flowchart LR
+    Auth[Authentication] --> Admin[Admin/profile]
+    Admin --> Supplier[Supplier]
+    Admin --> Customer[Customer]
+    Admin --> Unit[Unit]
+    Admin --> Category[Category]
+    Supplier --> Product[Product]
+    Unit --> Product
+    Category --> Product
+    Supplier --> Purchase[Purchase]
+    Category --> Purchase
+    Product --> Purchase
+    Customer --> Invoice[Invoice]
+    Category --> Invoice
+    Product --> Invoice
+    Invoice --> Payment[Payment]
+    Payment --> Customer
+    Purchase --> Stock[Stock]
+    Invoice --> Stock
+    Product --> Stock
+    Stock --> Reports[Reports / printable views]
+    Payment --> Reports
+    Invoice --> Reports
+    Purchase --> Reports

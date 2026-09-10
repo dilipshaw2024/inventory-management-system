@@ -1,0 +1,96 @@
+erDiagram
+    USERS {
+        bigint id PK
+        string name
+        string username
+        string email
+        datetime email_verified_at
+    }
+    SUPPLIERS {
+        bigint id PK
+        string name
+        string mobile_no
+        string email
+        tinyint status
+    }
+    CUSTOMERS {
+        bigint id PK
+        string name
+        string customer_image
+        string mobile_no
+        string email
+    }
+    UNITS {
+        bigint id PK
+        string name
+        tinyint status
+    }
+    CATEGORIES {
+        bigint id PK
+        string name
+        tinyint status
+    }
+    PRODUCTS {
+        bigint id PK
+        bigint supplier_id FK
+        bigint unit_id FK
+        bigint category_id FK
+        string name
+        double quantity
+        tinyint status
+    }
+    PURCHASES {
+        bigint id PK
+        bigint supplier_id FK
+        bigint category_id FK
+        bigint product_id FK
+        string purchase_no
+        double buying_qty
+        double unit_price
+        double buying_price
+        tinyint status
+    }
+    INVOICES {
+        bigint id PK
+        string invoice_no
+        date date
+        tinyint status
+    }
+    INVOICE_DETAILS {
+        bigint id PK
+        bigint invoice_id FK
+        bigint category_id FK
+        bigint product_id FK
+        double selling_qty
+        double selling_price
+        tinyint status
+    }
+    PAYMENTS {
+        bigint id PK
+        bigint invoice_id FK
+        bigint customer_id FK
+        string paid_status
+        double paid_amount
+        double due_amount
+        double total_amount
+    }
+    PAYMENT_DETAILS {
+        bigint id PK
+        bigint invoice_id FK
+        double current_paid_amount
+        date date
+        bigint updated_by
+    }
+
+    SUPPLIERS ||--o{ PRODUCTS : supplies
+    UNITS ||--o{ PRODUCTS : measures
+    CATEGORIES ||--o{ PRODUCTS : groups
+    SUPPLIERS ||--o{ PURCHASES : receives_from
+    CATEGORIES ||--o{ PURCHASES : classifies
+    PRODUCTS ||--o{ PURCHASES : purchased
+    INVOICES ||--o{ INVOICE_DETAILS : contains
+    CATEGORIES ||--o{ INVOICE_DETAILS : classifies
+    PRODUCTS ||--o{ INVOICE_DETAILS : sold
+    INVOICES ||--o| PAYMENTS : has_summary
+    CUSTOMERS ||--o{ PAYMENTS : owes_or_pays
+    INVOICES ||--o{ PAYMENT_DETAILS : payment_events

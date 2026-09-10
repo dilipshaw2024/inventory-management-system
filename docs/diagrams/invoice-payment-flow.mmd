@@ -1,0 +1,19 @@
+flowchart TD
+    A[Open invoice form] --> B[Select category and product]
+    B --> C[AJAX: load products and current stock]
+    C --> D[Add invoice lines]
+    D --> E[Calculate selling totals minus discount]
+    E --> F[Select existing or inline customer]
+    F --> G[Select full paid, full due, or partial paid]
+    G --> H[POST invoice/store]
+    H --> I[(Invoice, details, payment, payment detail; pending)]
+    I --> J[Invoice approval screen]
+    J --> K{Every line within stock?}
+    K -- No --> J
+    K -- Yes --> L[Product quantity decreases]
+    L --> M[(Invoice and details approved)]
+    M --> N[Print invoice and reports]
+    I --> O[Credit customer list]
+    O --> P[Record later payment]
+    P --> Q[Update payment summary]
+    Q --> R[Append payment detail history]

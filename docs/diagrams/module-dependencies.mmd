@@ -1,0 +1,27 @@
+flowchart TB
+    subgraph Presentation
+        Blade[Blade views]
+        JS[JavaScript / AJAX]
+    end
+    subgraph HTTP
+        Routes[web.php and auth.php]
+        Middleware[auth / guest / CSRF]
+        Controllers[Controllers]
+    end
+    subgraph Domain
+        Models[Eloquent models]
+        Rules[Approval, stock, payment rules]
+    end
+    subgraph Persistence
+        Database[(MySQL tables)]
+        Files[(public uploads)]
+    end
+    Blade --> Routes
+    JS --> Routes
+    Routes --> Middleware
+    Middleware --> Controllers
+    Controllers --> Models
+    Controllers --> Rules
+    Rules --> Models
+    Models --> Database
+    Controllers --> Files

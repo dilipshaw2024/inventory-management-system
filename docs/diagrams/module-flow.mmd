@@ -1,0 +1,21 @@
+flowchart TD
+    A[Authenticate user] --> B[Create supplier, unit, category]
+    B --> C[Create product with links to master data]
+    C --> D[Create purchase lines]
+    D --> E[Purchase pending]
+    E --> F{Purchase approved?}
+    F -- Yes --> G[Increase product quantity]
+    F -- No --> E
+    G --> H[Create customer or choose existing customer]
+    H --> I[Create invoice lines]
+    I --> J[Create payment summary]
+    J --> K[Invoice pending]
+    K --> L{Stock sufficient?}
+    L -- No --> K
+    L -- Yes --> M[Approve invoice]
+    M --> N[Decrease product quantity]
+    N --> O{Due amount remains?}
+    O -- Yes --> P[Record customer payment]
+    O -- No --> Q[Paid invoice]
+    P --> Q
+    Q --> R[Stock, invoice, customer, and date reports]

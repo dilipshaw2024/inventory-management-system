@@ -1,0 +1,50 @@
+# Laravel application secrets and local environment files
+/.env
+/.env.*
+!/.env.example
+
+# Dependencies
+/vendor/
+/node_modules/
+
+# Laravel generated/runtime files
+/public/hot
+/public/storage
+/storage/*.key
+/storage/logs/*.log
+/storage/framework/cache/data/*
+/storage/framework/sessions/*
+/storage/framework/testing/*
+/storage/framework/views/*
+/bootstrap/cache/*.php
+
+# Uploaded files are runtime data and must not be committed.
+/public/upload/customer/*
+!/public/upload/customer/.gitignore
+/public/upload/admin_images/*
+!/public/upload/admin_images/.gitignore
+
+# Test, coverage, and local tooling output
+/.phpunit.result.cache
+/coverage/
+/phpunit.xml.bak
+
+# Frontend and package-manager logs/build output
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+/.sass-cache/
+
+# Local development environments and IDE metadata
+/.idea/
+/.vscode/
+/.fleet/
+/.zed/
+/.DS_Store
+Thumbs.db
+
+# Local development overrides
+/docker-compose.override.yml
+/Homestead.json
+/Homestead.yaml
