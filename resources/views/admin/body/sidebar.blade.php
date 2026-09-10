@@ -2,17 +2,20 @@
 
                 <div data-simplebar class="h-100">
 
-                    <!-- User details -->
-                
+                    <div class="inventory-sidebar-context">
+                        <div class="inventory-sidebar-context-icon"><i class="ri-store-2-line"></i></div>
+                        <div><span>WORKSPACE</span><strong>Inventory operations</strong></div>
+                        <i class="ri-more-2-fill ms-auto"></i>
+                    </div>
 
                     <!--- Sidemenu -->
                     <div id="sidebar-menu">
                         <!-- Left Menu Start -->
                         <ul class="metismenu list-unstyled" id="side-menu">
-                            <li class="menu-title">Menu</li>
+                            <li class="menu-title">Workspace</li>
 
                             <li>
-                                <a href="{{ url('/dashboard') }}" class="waves-effect">
+                                <a href="{{ route('dashboard') }}" class="waves-effect {{ request()->routeIs('dashboard') ? 'active' : '' }}">
                                     <i class="ri-home-fill"></i> 
                                     <span>Dashboard</span>
                                 </a>
@@ -20,7 +23,7 @@
  
                 
         <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('supplier.*') ? 'active' : '' }}">
                 <i class="ri-hotel-fill"></i>
                 <span>Manage Suppliers</span>
             </a>
@@ -32,7 +35,7 @@
 
 
         <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('customer.*') || request()->routeIs('credit.customer') || request()->routeIs('paid.customer') ? 'active' : '' }}">
                 <i class="ri-shield-user-fill"></i>
                 <span>Manage Customers</span>
             </a>
@@ -48,7 +51,7 @@
 
 
          <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('unit.*') ? 'active' : '' }}">
                 <i class="ri-delete-back-fill"></i>
                 <span>Manage Units</span>
             </a>
@@ -59,7 +62,7 @@
         </li>
 
          <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('category.*') ? 'active' : '' }}">
                 <i class="ri-apps-2-fill"></i>
                 <span>Manage Category</span>
             </a>
@@ -71,7 +74,7 @@
 
 
           <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('product.*') ? 'active' : '' }}">
                 <i class="ri-reddit-fill"></i>
                 <span>Manage Product</span>
             </a>
@@ -83,7 +86,7 @@
 
 
           <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('purchase.*') || request()->routeIs('daily.purchase.*') ? 'active' : '' }}">
                 <i class="ri-oil-fill"></i>
                 <span>Manage Purchase</span>
             </a>
@@ -97,7 +100,7 @@
 
 
           <li>
-            <a href="javascript: void(0);" class="has-arrow waves-effect">
+            <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('invoice.*') || request()->routeIs('print.invoice.*') || request()->routeIs('daily.invoice.*') ? 'active' : '' }}">
                 <i class="ri-compass-2-fill"></i>
                 <span>Manage Invoice</span>
             </a>
@@ -116,10 +119,10 @@
 
 
 
-                            <li class="menu-title">Stock</li>
+                            <li class="menu-title">Inventory &amp; reports</li>
 
     <li>
-        <a href="javascript: void(0);" class="has-arrow waves-effect">
+        <a href="javascript: void(0);" class="has-arrow waves-effect {{ request()->routeIs('stock.*') || request()->routeIs('supplier.wise.*') || request()->routeIs('product.wise.*') ? 'active' : '' }}">
             <i class="ri-gift-fill"></i>
             <span>Manage Stock</span>
         </a>
@@ -136,12 +139,8 @@
                                     <span>Support</span>
                                 </a>
                                 <ul class="sub-menu" aria-expanded="false">
-                                    <li><a href="pages-starter.html">Starter Page</a></li>
-                                    <li><a href="pages-timeline.html">Timeline</a></li>
-                                    <li><a href="pages-directory.html">Directory</a></li>
-                                    <li><a href="pages-invoice.html">Invoice</a></li>
-                                    <li><a href="pages-404.html">Error 404</a></li>
-                                    <li><a href="pages-500.html">Error 500</a></li>
+                                    <li><a href="{{ route('admin.profile') }}">My profile</a></li>
+                                    <li><a href="{{ route('change.password') }}">Security</a></li>
                                 </ul>
                             </li>
 

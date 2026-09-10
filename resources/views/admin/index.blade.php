@@ -1,251 +1,61 @@
 @extends('admin.admin_master')
+
 @section('admin')
-
-
 <div class="page-content">
-<div class="container-fluid">
+    <div class="container-fluid">
+        <div class="inventory-hero mb-4">
+            <div>
+                <span class="inventory-eyebrow">OPERATIONS CENTER</span>
+                <h1 class="inventory-hero-title">Good day, {{ Auth::user()->name ?? 'Administrator' }}</h1>
+                <p class="inventory-hero-copy mb-0">Monitor purchasing, inventory, sales, and customer collections from one workspace.</p>
+            </div>
+            <div class="inventory-hero-actions">
+                <a href="{{ route('purchase.add') }}" class="btn btn-light"><i class="ri-add-line me-1"></i> New purchase</a>
+                <a href="{{ route('invoice.add') }}" class="btn btn-primary"><i class="ri-shopping-bag-3-line me-1"></i> New invoice</a>
+            </div>
+        </div>
 
-<!-- start page title -->
-<div class="row">
-<div class="col-12">
-<div class="page-title-box d-sm-flex align-items-center justify-content-between">
-    <h4 class="mb-sm-0">Dashboard</h4>
+        <div class="row g-3 mb-4">
+            @foreach([
+                ['Sales overview', 'Ready', 'Invoice performance', 'ri-line-chart-line', 'primary', '78%'],
+                ['Inventory health', 'Live', 'Stock records available', 'ri-archive-stack-line', 'success', '86%'],
+                ['Pending approvals', 'Review', 'Purchases and invoices', 'ri-time-line', 'warning', '42%'],
+                ['Customer accounts', 'Managed', 'Payments and balances', 'ri-group-line', 'info', '64%'],
+            ] as $metric)
+            <div class="col-xl-3 col-md-6">
+                <div class="card inventory-metric-card inventory-metric-{{ $metric[4] }} h-100">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div><span class="inventory-metric-label">{{ $metric[0] }}</span><h3 class="inventory-metric-value">{{ $metric[1] }}</h3><span class="inventory-metric-note">{{ $metric[2] }}</span></div>
+                            <span class="inventory-metric-icon"><i class="{{ $metric[3] }}"></i></span>
+                        </div>
+                        <div class="inventory-metric-line"><span style="width: {{ $metric[5] }}"></span></div>
+                    </div>
+                </div>
+            </div>
+            @endforeach
+        </div>
 
-    <div class="page-title-right">
-        <ol class="breadcrumb m-0">
-            <li class="breadcrumb-item"><a href="javascript: void(0);">Upcube</a></li>
-            <li class="breadcrumb-item active">Dashboard</li>
-        </ol>
+        <div class="row g-3">
+            <div class="col-xl-8">
+                <div class="card h-100"><div class="card-body">
+                    <div class="inventory-section-heading"><div><span class="inventory-eyebrow text-primary">QUICK ACCESS</span><h4 class="card-title mb-0">Common workflows</h4></div><span class="inventory-section-caption">Move work forward faster</span></div>
+                    <div class="row g-3 mt-2">
+                        <div class="col-md-6"><a href="{{ route('stock.report') }}" class="inventory-quick-link"><span class="inventory-quick-icon bg-soft-primary"><i class="ri-stack-line"></i></span><span><strong>Review stock</strong><small>Check quantities and stock value</small></span><i class="ri-arrow-right-line ms-auto"></i></a></div>
+                        <div class="col-md-6"><a href="{{ route('purchase.pending') }}" class="inventory-quick-link"><span class="inventory-quick-icon bg-soft-warning"><i class="ri-inbox-unarchive-line"></i></span><span><strong>Approve purchases</strong><small>Validate incoming inventory</small></span><i class="ri-arrow-right-line ms-auto"></i></a></div>
+                        <div class="col-md-6"><a href="{{ route('invoice.pending.list') }}" class="inventory-quick-link"><span class="inventory-quick-icon bg-soft-success"><i class="ri-checkbox-multiple-line"></i></span><span><strong>Approve invoices</strong><small>Complete sales processing</small></span><i class="ri-arrow-right-line ms-auto"></i></a></div>
+                        <div class="col-md-6"><a href="{{ route('credit.customer') }}" class="inventory-quick-link"><span class="inventory-quick-icon bg-soft-danger"><i class="ri-bank-card-line"></i></span><span><strong>Collect receivables</strong><small>Review customer credit</small></span><i class="ri-arrow-right-line ms-auto"></i></a></div>
+                    </div>
+                </div></div>
+            </div>
+            <div class="col-xl-4"><div class="card inventory-readiness-card h-100"><div class="card-body">
+                <span class="inventory-eyebrow">WORKSPACE STATUS</span><h4 class="mt-2 mb-3">Your workspace is ready</h4>
+                <div class="inventory-readiness-item"><i class="ri-checkbox-circle-fill"></i><span>Catalog and pricing</span><strong>Ready</strong></div>
+                <div class="inventory-readiness-item"><i class="ri-checkbox-circle-fill"></i><span>Purchasing workflow</span><strong>Ready</strong></div>
+                <div class="inventory-readiness-item"><i class="ri-checkbox-circle-fill"></i><span>Sales and payments</span><strong>Ready</strong></div>
+                <a href="{{ route('admin.profile') }}" class="btn btn-outline-primary w-100 mt-3">Manage account <i class="ri-arrow-right-line ms-1"></i></a>
+            </div></div></div>
+        </div>
     </div>
-
 </div>
-</div>
-</div>
-<!-- end page title -->
-
-<div class="row">
-<div class="col-xl-3 col-md-6">
-<div class="card">
-    <div class="card-body">
-        <div class="d-flex">
-            <div class="flex-grow-1">
-                <p class="text-truncate font-size-14 mb-2">Total Sales</p>
-                <h4 class="mb-2">1452</h4>
-                <p class="text-muted mb-0"><span class="text-success fw-bold font-size-12 me-2"><i class="ri-arrow-right-up-line me-1 align-middle"></i>9.23%</span>from previous period</p>
-            </div>
-            <div class="avatar-sm">
-                <span class="avatar-title bg-light text-primary rounded-3">
-                    <i class="ri-shopping-cart-2-line font-size-24"></i>  
-                </span>
-            </div>
-        </div>                                            
-    </div><!-- end cardbody -->
-</div><!-- end card -->
-</div><!-- end col -->
-<div class="col-xl-3 col-md-6">
-<div class="card">
-    <div class="card-body">
-        <div class="d-flex">
-            <div class="flex-grow-1">
-                <p class="text-truncate font-size-14 mb-2">New Orders</p>
-                <h4 class="mb-2">938</h4>
-                <p class="text-muted mb-0"><span class="text-danger fw-bold font-size-12 me-2"><i class="ri-arrow-right-down-line me-1 align-middle"></i>1.09%</span>from previous period</p>
-            </div>
-            <div class="avatar-sm">
-                <span class="avatar-title bg-light text-success rounded-3">
-                    <i class="mdi mdi-currency-usd font-size-24"></i>  
-                </span>
-            </div>
-        </div>                                              
-    </div><!-- end cardbody -->
-</div><!-- end card -->
-</div><!-- end col -->
-<div class="col-xl-3 col-md-6">
-<div class="card">
-    <div class="card-body">
-        <div class="d-flex">
-            <div class="flex-grow-1">
-                <p class="text-truncate font-size-14 mb-2">New Users</p>
-                <h4 class="mb-2">8246</h4>
-                <p class="text-muted mb-0"><span class="text-success fw-bold font-size-12 me-2"><i class="ri-arrow-right-up-line me-1 align-middle"></i>16.2%</span>from previous period</p>
-            </div>
-            <div class="avatar-sm">
-                <span class="avatar-title bg-light text-primary rounded-3">
-                    <i class="ri-user-3-line font-size-24"></i>  
-                </span>
-            </div>
-        </div>                                              
-    </div><!-- end cardbody -->
-</div><!-- end card -->
-</div><!-- end col -->
-<div class="col-xl-3 col-md-6">
-<div class="card">
-    <div class="card-body">
-        <div class="d-flex">
-            <div class="flex-grow-1">
-                <p class="text-truncate font-size-14 mb-2">Unique Visitors</p>
-                <h4 class="mb-2">29670</h4>
-                <p class="text-muted mb-0"><span class="text-success fw-bold font-size-12 me-2"><i class="ri-arrow-right-up-line me-1 align-middle"></i>11.7%</span>from previous period</p>
-            </div>
-            <div class="avatar-sm">
-                <span class="avatar-title bg-light text-success rounded-3">
-                    <i class="mdi mdi-currency-btc font-size-24"></i>  
-                </span>
-            </div>
-        </div>                                              
-    </div><!-- end cardbody -->
-</div><!-- end card -->
-</div><!-- end col -->
-</div><!-- end row -->
-
-<div class="row">
- 
-
-<div class="row">
-<div class="col-xl-12">
-<div class="card">
-    <div class="card-body">
-        <div class="dropdown float-end">
-            <a href="#" class="dropdown-toggle arrow-none card-drop" data-bs-toggle="dropdown" aria-expanded="false">
-                <i class="mdi mdi-dots-vertical"></i>
-            </a>
-         
-        </div>
-
-        <h4 class="card-title mb-4">Latest Transactions</h4>
-
-        <div class="table-responsive">
-            <table class="table table-centered mb-0 align-middle table-hover table-nowrap">
-                <thead class="table-light">
-                    <tr>
-                        <th>Name</th>
-                        <th>Position</th>
-                        <th>Status</th>
-                        <th>Age</th>
-                        <th>Start date</th>
-                        <th style="width: 120px;">Salary</th>
-                    </tr>
-                </thead><!-- end thead -->
-                <tbody>
-                    <tr>
-                        <td><h6 class="mb-0">Charles Casey</h6></td>
-                        <td>Web Developer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-success align-middle me-2"></i>Active</div>
-                        </td>
-                        <td>
-                            23
-                        </td>
-                        <td>
-                            04 Apr, 2021
-                        </td>
-                        <td>$42,450</td>
-                    </tr>
-                     <!-- end -->
-                     <tr>
-                        <td><h6 class="mb-0">Alex Adams</h6></td>
-                        <td>Python Developer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-warning align-middle me-2"></i>Deactive</div>
-                        </td>
-                        <td>
-                            28
-                        </td>
-                        <td>
-                            01 Aug, 2021
-                        </td>
-                        <td>$25,060</td>
-                    </tr>
-                     <!-- end -->
-                     <tr>
-                        <td><h6 class="mb-0">Prezy Kelsey</h6></td>
-                        <td>Senior Javascript Developer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-success align-middle me-2"></i>Active</div>
-                        </td>
-                        <td>
-                            35
-                        </td>
-                        <td>
-                            15 Jun, 2021
-                        </td>
-                        <td>$59,350</td>
-                    </tr>
-                     <!-- end -->
-                     <tr>
-                        <td><h6 class="mb-0">Ruhi Fancher</h6></td>
-                        <td>React Developer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-success align-middle me-2"></i>Active</div>
-                        </td>
-                        <td>
-                            25
-                        </td>
-                        <td>
-                            01 March, 2021
-                        </td>
-                        <td>$23,700</td>
-                    </tr>
-                     <!-- end -->
-                     <tr>
-                        <td><h6 class="mb-0">Juliet Pineda</h6></td>
-                        <td>Senior Web Designer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-success align-middle me-2"></i>Active</div>
-                        </td>
-                        <td>
-                            38
-                        </td>
-                        <td>
-                            01 Jan, 2021
-                        </td>
-                        <td>$69,185</td>
-                    </tr>
-                     <!-- end -->
-                     <tr>
-                        <td><h6 class="mb-0">Den Simpson</h6></td>
-                        <td>Web Designer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-warning align-middle me-2"></i>Deactive</div>
-                        </td>
-                        <td>
-                            21
-                        </td>
-                        <td>
-                            01 Sep, 2021
-                        </td>
-                        <td>$37,845</td>
-                    </tr>
-                     <!-- end -->
-                     <tr>
-                        <td><h6 class="mb-0">Mahek Torres</h6></td>
-                        <td>Senior Laravel Developer</td>
-                        <td>
-                            <div class="font-size-13"><i class="ri-checkbox-blank-circle-fill font-size-10 text-success align-middle me-2"></i>Active</div>
-                        </td>
-                        <td>
-                            32
-                        </td>
-                        <td>
-                            20 May, 2021
-                        </td>
-                        <td>$55,100</td>
-                    </tr>
-                     <!-- end -->
-                </tbody><!-- end tbody -->
-            </table> <!-- end table -->
-        </div>
-    </div><!-- end card -->
-</div><!-- end card -->
-</div>
-<!-- end col -->
- 
-
-
-</div>
-<!-- end row -->
-</div>
-
-</div>
-
 @endsection
