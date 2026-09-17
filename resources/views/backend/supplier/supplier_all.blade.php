@@ -36,6 +36,10 @@
                             <th>Mobile Number </th>
                             <th>Email</th>
                             <th>Address</th> 
+                            <th>Tax number</th>
+                            <th>Terms</th>
+                            <th>Rating</th>
+                            <th>Status</th>
                             <th>Action</th>
                             
                         </thead>
@@ -50,6 +54,10 @@
                              <td> {{ $item->mobile_no }} </td> 
                               <td> {{ $item->email }} </td> 
                                <td> {{ $item->address }} </td> 
+                               <td> {{ $item->tax_number ?: '—' }} </td>
+                               <td> {{ $item->payment_terms_days }} days </td>
+                               <td> {{ $item->rating ?: '—' }} </td>
+                               <td> {{ $item->is_active === false ? 'Inactive' : 'Active' }} </td>
                             <td>
    <a href="{{ route('supplier.edit',$item->id) }}" class="btn btn-info sm" title="Edit Data">  <i class="fas fa-edit"></i> </a>
 

@@ -36,6 +36,12 @@
                             <th>Customer Image </th>
                             <th>Email</th>
                             <th>Address</th> 
+                            <th>Tax number</th>
+                            <th>Group</th>
+                            <th>Currency</th>
+                            <th>Status</th>
+                            <th>Credit limit</th>
+                            <th>Credit terms</th>
                             <th>Action</th>
                             
                         </thead>
@@ -50,6 +56,12 @@
            <td> <img src="{{ asset( $item->customer_image ) }}" style="width:60px; height:50px"> </td> 
                               <td> {{ $item->email }} </td> 
                                <td> {{ $item->address }} </td> 
+                               <td> {{ $item->tax_number ?: '—' }} </td>
+                               <td> {{ $item->customer_group ?: '—' }} </td>
+                               <td> {{ $item->currency_code ?: '—' }} </td>
+                               <td> {{ $item->is_active === false ? 'Inactive' : 'Active' }} </td>
+                               <td> {{ number_format((float) $item->credit_limit, 2) }} </td>
+                               <td> {{ $item->credit_hold ? 'On hold' : $item->credit_days.' days' }} </td>
                             <td>
    <a href="{{ route('customer.edit',$item->id) }}" class="btn btn-info sm" title="Edit Data">  <i class="fas fa-edit"></i> </a>
 

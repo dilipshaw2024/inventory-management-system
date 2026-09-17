@@ -3,6 +3,7 @@
 namespace App\Http\Requests\Pos;
 
 use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
 
 class PurchaseRequest extends FormRequest
 {
@@ -13,17 +14,19 @@ class PurchaseRequest extends FormRequest
 
     public function rules(): array
     {
+        $companyId = auth()->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         return [
             'date' => ['required', 'array', 'min:1'],
             'date.*' => ['required', 'date'],
             'purchase_no' => ['required', 'array', 'min:1'],
             'purchase_no.*' => ['required', 'string', 'max:255'],
             'supplier_id' => ['required', 'array', 'min:1'],
-            'supplier_id.*' => ['required', 'integer', 'exists:suppliers,id'],
+            'supplier_id.*' => ['required', 'integer', $owned('suppliers')],
             'category_id' => ['required', 'array', 'min:1'],
-            'category_id.*' => ['required', 'integer', 'exists:categories,id'],
+            'category_id.*' => ['required', 'integer', $owned('categories')],
             'product_id' => ['required', 'array', 'min:1'],
-            'product_id.*' => ['required', 'integer', 'exists:products,id'],
+            'product_id.*' => ['required', 'integer', $owned('products')],
             'buying_qty' => ['required', 'array', 'min:1'],
             'buying_qty.*' => ['required', 'numeric', 'gt:0'],
             'unit_price' => ['required', 'array', 'min:1'],

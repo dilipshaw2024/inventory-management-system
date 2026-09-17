@@ -23,6 +23,8 @@
                     <input name="name" class="form-control" type="text"    >
                 </div>
             </div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Code</label><div class="form-group col-sm-4"><input name="code" class="form-control" placeholder="e.g. kg"></div><label class="col-sm-2 col-form-label">Decimals</label><div class="form-group col-sm-4"><input name="decimal_places" type="number" min="0" max="8" value="3" class="form-control" required></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Dimension</label><div class="form-group col-sm-4"><input name="dimension" value="unit" class="form-control" pattern="[A-Za-z][A-Za-z0-9_-]*" required></div><div class="form-group col-sm-4 offset-sm-2"><label><input type="checkbox" name="is_base" value="1"> Base unit</label></div></div>
             <!-- end row --> 
 
         

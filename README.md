@@ -7,6 +7,35 @@
 <a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
 </p>
 
+# Inventory Management System — ERP Platform
+
+This project is a Laravel-based inventory and point-of-sale system being upgraded into a multi-company ERP platform. The ERP foundation includes organization hierarchy, tenant-scoped users and permissions, warehouse locations, immutable inventory movements, purchasing, sales fulfillment, batch/serial tracking, costing, planning, manufacturing, service, accounting, audit controls, reporting, and Sanctum-protected integration APIs.
+
+## Start here
+
+- [Setup and deployment guide](docs/SETUP_AND_DEPLOYMENT.md) — environment, migrations, schedulers, queues, and integration endpoints.
+- [ERP feature matrix](docs/MISSING_FEATURES.md) — current implementation status and remaining backlog across every ERP module.
+
+```bash
+composer install
+cp .env.example .env
+php artisan key:generate
+php artisan migrate
+php artisan serve
+```
+
+The current schema migration head is documented in the deployment guide. Back up the database before applying migrations. Run scheduled work with `php artisan schedule:work` and background jobs with `php artisan queue:work` where enabled.
+
+## Testing
+
+```bash
+vendor/bin/phpunit tests/Unit
+vendor/bin/phpunit
+```
+
+The full suite requires a working test database configured through the testing environment.
+For a disposable local MySQL test database, copy `.env.testing.example` to `.env.testing`, then run `docker compose -f docker-compose.testing.yml up -d`.
+
 ## About Laravel
 
 Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:

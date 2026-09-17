@@ -26,6 +26,8 @@
             </div>
             <!-- end row -->
 
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Tax jurisdiction</label><div class="form-group col-sm-10"><input name="tax_jurisdiction" value="{{ $customer->tax_jurisdiction }}" class="form-control" maxlength="100" placeholder="Domestic, state, export..."></div></div>
+
 
               <div class="row mb-3">
                 <label for="example-text-input" class="col-sm-2 col-form-label">Customer Mobile </label>
@@ -52,6 +54,15 @@
                 </div>
             </div>
             <!-- end row -->
+
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Tax number</label><div class="form-group col-sm-10"><input name="tax_number" value="{{ $customer->tax_number }}" class="form-control" maxlength="100"></div></div><div class="row mb-3"><label class="col-sm-2 col-form-label">Tax exemption</label><div class="form-group col-sm-10"><input name="tax_exempt" value="1" type="checkbox" class="form-check-input" @checked($customer->tax_exempt)> Exempt <input name="tax_exemption_number" value="{{ $customer->tax_exemption_number }}" class="form-control mt-2" maxlength="100" placeholder="Exemption certificate/reference"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Customer group</label><div class="form-group col-sm-10"><input name="customer_group" value="{{ $customer->customer_group }}" class="form-control" maxlength="100"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Sales channel</label><div class="form-group col-sm-10"><input name="sales_channel" value="{{ $customer->sales_channel }}" class="form-control" maxlength="50"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Preferred currency</label><div class="form-group col-sm-10"><input name="currency_code" value="{{ $customer->currency_code }}" class="form-control" maxlength="3"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Credit limit</label><div class="form-group col-sm-10"><input name="credit_limit" type="number" min="0" step="0.000001" class="form-control" value="{{ $customer->credit_limit }}"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Credit days</label><div class="form-group col-sm-10"><input name="credit_days" type="number" min="0" max="3650" class="form-control" value="{{ $customer->credit_days }}"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Hold after overdue days</label><div class="form-group col-sm-10"><input name="credit_hold_after_days" type="number" min="0" max="3650" class="form-control" value="{{ $customer->credit_hold_after_days ?? 0 }}"><small class="text-muted">Zero disables automatic overdue blocking.</small></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Credit hold</label><div class="form-group col-sm-10"><input name="credit_hold" value="1" type="checkbox" class="form-check-input" @checked($customer->credit_hold)></div></div>
 
               <div class="row mb-3">
                 <label for="example-text-input" class="col-sm-2 col-form-label">Customer Image </label>

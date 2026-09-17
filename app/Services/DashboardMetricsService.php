@@ -1,0 +1,104 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Delivery;
+use App\Models\GoodsReceipt;
+use App\Models\InventoryAdjustment;
+use App\Models\InventoryReturn;
+use App\Models\Invoice;
+use App\Models\InventoryDocument;
+use App\Models\Payment;
+use App\Models\Product;
+use App\Models\InventoryReplenishmentPolicy;
+use App\Models\Purchase;
+use App\Models\PurchaseInvoice;
+use App\Models\PurchaseOrder;
+use App\Models\SalesOrder;
+use App\Models\StockCount;
+use App\Models\CustomerPaymentAllocation;
+use App\Models\ServiceRequest;
+use App\Models\MaintenanceOrder;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
+
+class DashboardMetricsService
+{
+    public function forCurrentCompany(): array
+    {
+        $companyId = auth()->user()?->company_id ?: 'global';
+        $ttl = (int) config('erp.dashboard_cache_ttl', 60);
+        if ($ttl === 0) return $this->calculate();
+        return Cache::remember('erp.dashboard.metrics.'.$companyId, now()->addSeconds($ttl), fn (): array => $this->calculate());
+    }
+
+    private function calculate(): array
+    {
+        $companyId = (int) (auth()->user()?->company_id ?? 0);
+        $settings = app(ErpSettingService::class);
+        $monthStart = Carbon::now()->startOfMonth()->toDateString();
+        $monthSales = (float) Invoice::whereIn('status', [1, 'approved'])->whereDate('date', '>=', $monthStart)->sum('total_amount');
+        $products = Product::where('status', 1)->get(); $availability = app(InventoryAvailabilityService::class)->availableMany($products, true, null, auth()->user()?->company_id);
+        $totalProducts = max(1, $products->count()); $planningCounts = $this->thresholdCounts($products, $companyId, $availability); $lowStock = $planningCounts['low'];
+        $pendingApprovals = Invoice::where('status', 0)->count() + Purchase::where('status', 0)->count() + InventoryAdjustment::where('status', 'pending')->count() + PurchaseOrder::where('status', 'submitted')->count() + GoodsReceipt::where('status', 'pending')->count() + PurchaseInvoice::where('status', 'pending')->count() + SalesOrder::where('status', 'submitted')->count() + Delivery::where('status', 'pending')->count() + InventoryReturn::where('status', 'pending')->count() + InventoryDocument::where('status', 'pending')->count() + StockCount::where('status', 'submitted')->count();
+        $receivables = max(0, (float) Payment::where('due_amount', '>', 0)->where('is_reversed', false)->sum('due_amount') - (float) CustomerPaymentAllocation::whereNull('voided_at')->whereHas('payment', fn ($query) => $query->where('is_reversed', false))->sum('amount'));
+        $openServiceRequests = ServiceRequest::whereIn('status', ['open', 'assigned', 'in_progress'])->count();
+        $breachedServiceRequests = ServiceRequest::whereNotNull('response_due_at')->whereNotIn('status', ['resolved', 'cancelled'])->where(function ($query): void { $query->where(function ($nested): void { $nested->whereNull('assigned_at')->where('response_due_at', '<', now()); })->orWhereColumn('assigned_at', '>', 'response_due_at'); })->count();
+        $activeMaintenanceOrders = MaintenanceOrder::whereIn('status', ['planned', 'in_progress'])->count();
+        return [
+            'month_sales' => $monthSales, 'total_products' => $totalProducts, 'low_stock' => $lowStock,
+            'pending_approvals' => $pendingApprovals, 'receivables' => $receivables,
+            'open_service_requests' => $openServiceRequests, 'breached_service_requests' => $breachedServiceRequests,
+            'active_maintenance_orders' => $activeMaintenanceOrders,
+            'planning_windows' => [
+                'slow_moving_days' => (int) $settings->get('slow_moving_days', 90, $companyId),
+                'dead_stock_days' => (int) $settings->get('dead_stock_days', 180, $companyId),
+                'expiry_alert_days' => (int) $settings->get('expiry_alert_days', 90, $companyId),
+            ],
+            'capacity_alert_threshold_percent' => (float) $settings->get('warehouse_capacity_alert_percent', 80, $companyId),
+            'abc_thresholds_percent' => [
+                'a' => (float) $settings->get('abc_a_threshold_percent', 80, $companyId),
+                'b' => (float) $settings->get('abc_b_threshold_percent', 95, $companyId),
+            ],
+        ];
+    }
+
+    /**
+     * Return product-level planning counts while honoring active location policies.
+     * A product is counted once when any applicable location is below/above policy.
+     * Products without a location policy retain the legacy product-wide behavior.
+     */
+    public function thresholdCounts($products, int $companyId, ?array $globalAvailability = null): array
+    {
+        $products = collect($products);
+        $globalAvailability ??= app(InventoryAvailabilityService::class)->availableMany($products, true, null, $companyId);
+        $policies = InventoryReplenishmentPolicy::where('is_active', true)
+            ->whereIn('product_id', $products->pluck('id'))
+            ->whereHas('location.warehouse.branch', fn ($query) => $query->where('company_id', $companyId))
+            ->get()->groupBy('product_id');
+        $locationAvailability = [];
+        $availabilityService = app(InventoryAvailabilityService::class);
+        foreach ($policies->flatten()->pluck('location_id')->unique() as $locationId) {
+            $locationAvailability[(int) $locationId] = $availabilityService->availableMany($products, true, (int) $locationId, $companyId);
+        }
+        $low = 0; $excess = 0;
+        foreach ($products as $product) {
+            $productPolicies = $policies->get($product->id, collect());
+            if ($productPolicies->isEmpty()) {
+                $current = (float) ($globalAvailability[$product->id] ?? 0);
+                if ($current <= (float) $product->reorder_level) $low++;
+                if ($product->max_stock !== null && $current > (float) $product->max_stock) $excess++;
+                continue;
+            }
+            $isLow = false; $isExcess = false;
+            foreach ($productPolicies as $policy) {
+                $current = (float) ($locationAvailability[(int) $policy->location_id][$product->id] ?? 0);
+                $isLow = $isLow || $current <= (float) $policy->reorder_point;
+                $isExcess = $isExcess || ($policy->max_stock !== null && $current > (float) $policy->max_stock);
+            }
+            if ($isLow) $low++;
+            if ($isExcess) $excess++;
+        }
+        return ['low' => $low, 'excess' => $excess];
+    }
+}

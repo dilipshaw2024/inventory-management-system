@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Auth;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\Rule;
+use App\Services\PasswordPolicyService;
 
 class AdminController extends Controller
 {
@@ -85,7 +86,7 @@ class AdminController extends Controller
 
         $validateData = $request->validate([
             'oldpassword' => 'required',
-            'newpassword' => 'required|min:8',
+            'newpassword' => app(PasswordPolicyService::class)->rules(false),
             'confirm_password' => 'required|same:newpassword',
 
         ]);
@@ -93,6 +94,8 @@ class AdminController extends Controller
         $hashedPassword = Auth::user()->password;
         if (Hash::check($request->oldpassword,$hashedPassword )) {
             $users = User::find(Auth::id());
+            app(PasswordPolicyService::class)->assertNotReused($users, $request->newpassword, 'newpassword');
+            app(PasswordPolicyService::class)->rememberCurrent($users);
             $users->password = bcrypt($request->newpassword);
             $users->save();
 

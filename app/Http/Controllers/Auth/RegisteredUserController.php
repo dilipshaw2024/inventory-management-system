@@ -9,7 +9,9 @@ use Illuminate\Auth\Events\Registered;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rules;
+use App\Services\PasswordPolicyService;
 
 class RegisteredUserController extends Controller
 {
@@ -35,16 +37,22 @@ class RegisteredUserController extends Controller
     {
         $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'username' => ['required', 'string','max:255', 'unique:users'],
+            'username' => ['nullable', 'string','max:255', 'unique:users'],
             'email' => ['required', 'string', 'email', 'max:255', 'unique:users'],
-            'password' => ['required', 'confirmed', Rules\Password::defaults()],
+            'password' => app(PasswordPolicyService::class)->rules(),
         ]);
+
+        $username = $request->input('username') ?: Str::before($request->email, '@');
+        while (User::where('username', $username)->exists()) {
+            $username = Str::before($request->email, '@').'-'.Str::lower(Str::random(6));
+        }
 
         $user = User::create([
             'name' => $request->name,
-            'username' => $request->username,
+            'username' => $username,
             'email' => $request->email,
             'password' => Hash::make($request->password),
+            'is_active' => true,
         ]);
 
         event(new Registered($user));

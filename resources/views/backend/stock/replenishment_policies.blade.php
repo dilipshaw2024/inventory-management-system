@@ -1,0 +1,5 @@
+@extends('admin.admin_master')
+@section('admin')
+<div class="page-content"><div class="container-fluid"><div class="page-title-box d-flex justify-content-between"><h4>Location Replenishment Policies</h4><a href="{{ route('planning.policies.create') }}" class="btn btn-primary">New policy</a></div><div class="card"><div class="card-body table-responsive"><table class="table table-bordered"><thead><tr><th>Product</th><th>Location</th><th>Reorder</th><th>Safety</th><th>Min / Max</th><th>Lead / Buffer</th></tr></thead><tbody>@forelse($policies as $policy)<tr><td>{{ $policy->product->name }}</td><td>{{ $policy->location->code }}</td><td>{{ $policy->reorder_point }}</td><td>{{ $policy->safety_stock }}</td><td>{{ $policy->min_stock }} / {{ $policy->max_stock ?? '—' }}</td><td>{{ $policy->lead_time_days }} / {{ $policy->safety_time_days }} days</td></tr>@empty<tr><td colspan="6" class="text-center">No location policies configured.</td></tr>@endforelse</tbody></table>{{ $policies->links() }}</div></div></div></div>
+@include('backend.stock.replenishment_policy_maintenance')
+@endsection

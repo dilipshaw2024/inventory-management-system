@@ -9,6 +9,7 @@ use App\Http\Controllers\Auth\PasswordResetLinkController;
 use App\Http\Controllers\Auth\RegisteredUserController;
 use App\Http\Controllers\Auth\VerifyEmailController;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\MfaController;
 
 Route::middleware('guest')->group(function () {
     Route::get('register', [RegisteredUserController::class, 'create'])
@@ -35,6 +36,11 @@ Route::middleware('guest')->group(function () {
 });
 
 Route::middleware('auth')->group(function () {
+    Route::get('security/mfa/setup', [MfaController::class, 'setup'])->name('mfa.setup');
+    Route::post('security/mfa/enable', [MfaController::class, 'enable'])->name('mfa.enable');
+    Route::get('security/mfa/challenge', [MfaController::class, 'challenge'])->name('mfa.challenge');
+    Route::post('security/mfa/challenge', [MfaController::class, 'verifyChallenge'])->name('mfa.challenge.verify');
+    Route::post('security/mfa/disable', [MfaController::class, 'disable'])->name('mfa.disable');
     Route::get('verify-email', [EmailVerificationPromptController::class, '__invoke'])
                 ->name('verification.notice');
 

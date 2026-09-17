@@ -61,11 +61,15 @@
                     <span class="btn btn-warning">Pending</span>
                     @elseif($item->status == '1')
                     <span class="btn btn-success">Approved</span>
+                    @elseif($item->status == '2')
+                    <span class="btn btn-danger">Rejected</span><small class="d-block text-muted">{{ $item->rejection_reason }}</small>
                     @endif </td>
 
       <td>
        @if($item->status == '0')
- <a href="{{ route('invoice.approve',$item->id) }}" class="btn btn-dark sm" title="Approved Data" >  <i class="fas fa-check-circle"></i> </a>
+<a href="{{ route('invoice.approve',$item->id) }}" class="btn btn-dark sm" title="Approved Data" >  <i class="fas fa-check-circle"></i> </a>
+
+<form method="POST" action="{{ route('invoice.reject',$item->id) }}" class="d-inline"> @csrf <input name="rejection_reason" value="Rejected by approver" class="form-control form-control-sm d-inline-block" style="width:155px" required maxlength="2000"><button type="submit" class="btn btn-warning sm" title="Reject invoice">Reject</button> </form>
 
 <form method="POST" action="{{ route('invoice.delete',$item->id) }}" class="d-inline" onsubmit="return confirm('Delete this pending invoice?');"> @csrf <button type="submit" class="btn btn-danger sm" title="Delete Data"><i class="fas fa-trash-alt"></i></button> </form>
 @endif  

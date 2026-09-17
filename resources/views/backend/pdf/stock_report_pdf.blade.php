@@ -108,9 +108,9 @@
         @foreach($allData as $key => $item)
 
  @php
-$buying_total = App\Models\Purchase::where('category_id',$item->category_id)->where('product_id',$item->id)->where('status','1')->sum('buying_qty');
+$buying_total = $item->report_inbound_quantity;
 
-$selling_total = App\Models\InvoiceDetail::where('category_id',$item->category_id)->where('product_id',$item->id)->where('status','1')->sum('selling_qty');
+$selling_total = $item->report_outbound_quantity;
 @endphp
 
 
@@ -122,7 +122,7 @@ $selling_total = App\Models\InvoiceDetail::where('category_id',$item->category_i
          <td class="text-center"> {{ $item->name }} </td> 
           <td class="text-center"> {{ $buying_total }} </td> 
            <td class="text-center"> {{ $selling_total }} </td> 
-         <td class="text-center"> {{ $item->quantity }} </td> 
+         <td class="text-center"> {{ $item->report_on_hand_quantity }} </td>
             
             
         </tr>

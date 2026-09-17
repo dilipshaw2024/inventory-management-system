@@ -25,6 +25,11 @@
             </div>
             <!-- end row --> 
 
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Category code</label><div class="form-group col-sm-10"><input name="code" class="form-control" maxlength="50"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Parent category</label><div class="form-group col-sm-10"><select name="parent_id" class="form-select"><option value="">Top level</option>@foreach($categories as $category)<option value="{{ $category->id }}">{{ $category->name }}</option>@endforeach</select></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Default tax rate</label><div class="form-group col-sm-10"><input name="tax_rate" type="number" min="0" max="100" step="0.0001" class="form-control" value="0"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Required variant attributes</label><div class="form-group col-sm-10"><select name="required_attribute_ids[]" class="form-select" multiple size="4">@foreach($attributes as $attribute)<option value="{{ $attribute->id }}">{{ $attribute->name }}</option>@endforeach</select><small class="text-muted">Optional. Selected attributes must be supplied when creating variants in this category.</small></div></div>
+
         
 <input type="submit" class="btn btn-info waves-effect waves-light" value="Add Category">
             </form>

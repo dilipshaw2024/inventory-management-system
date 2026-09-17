@@ -13,6 +13,9 @@ use Auth;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use App\Http\Requests\Pos\PurchaseRequest;
+use App\Services\InventoryLedgerService;
+use App\Services\AuditService;
+use App\Services\ProductLifecycleService;
 
 class PurchaseController extends Controller
 {
@@ -51,6 +54,8 @@ class PurchaseController extends Controller
             if (!$product || (int) $product->supplier_id !== (int) $request->supplier_id[$i] || (int) $product->category_id !== (int) $request->category_id[$i]) {
                 return redirect()->back()->withInput()->with(['message' => 'One or more purchase products do not match the selected supplier/category.', 'alert-type' => 'error']);
             }
+            try { app(ProductLifecycleService::class)->assertPurchasable($product); }
+            catch (\RuntimeException $exception) { return redirect()->back()->withInput()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         }
 
         DB::transaction(function () use ($request, $count_category) {
@@ -115,8 +120,19 @@ class PurchaseController extends Controller
             }
 
             $product = Product::lockForUpdate()->findOrFail($purchase->product_id);
+            app(ProductLifecycleService::class)->assertPurchasable($product);
             $product->quantity = (float) $product->quantity + (float) $purchase->buying_qty;
             $product->save();
+            app(InventoryLedgerService::class)->post(
+                $product->id,
+                'receipt',
+                (float) $purchase->buying_qty,
+                (float) $purchase->unit_price,
+                null,
+                $purchase,
+                'Approved purchase receipt'
+            );
+            app(AuditService::class)->record('purchase.approved', $purchase, ['status' => 0], ['status' => 1]);
             $purchase->status = 1;
             $purchase->updated_by = Auth::user()->id;
             $purchase->save();
@@ -144,9 +160,10 @@ class PurchaseController extends Controller
 
 
     public function DailyPurchasePdf(Request $request){
-
-        $sdate = date('Y-m-d',strtotime($request->start_date));
-        $edate = date('Y-m-d',strtotime($request->end_date));
+        abort_unless(auth()->user()?->company_id, 403, 'A company is required for purchase reporting.');
+        $dates = $request->validate(['start_date' => ['required', 'date'], 'end_date' => ['required', 'date', 'after_or_equal:start_date']]);
+        $sdate = $dates['start_date'];
+        $edate = $dates['end_date'];
         $allData = Purchase::whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
 
 

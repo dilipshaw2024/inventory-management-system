@@ -1,5 +1,6 @@
 @extends('admin.admin_master')
 @section('admin')
+<div class="container-fluid"><div class="row g-3 mb-3"><div class="col-md-3"><label class="form-label">Store</label><select id="invoice-store" class="form-select"><option value="">No store</option>@foreach($stores as $store)<option value="{{ $store->id }}" @selected(old('store_id') == $store->id)>{{ $store->name }} ({{ $store->branch->name }})</option>@endforeach</select></div></div></div>
  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
 
 <div class="page-content">
@@ -27,6 +28,8 @@
             <div class="md-3">
                 <label for="example-text-input" class="form-label">Date</label>
                  <input class="form-control example-date-input" value="{{ $date }}" name="date" type="date"  id="date">
+                 <label class="form-label">Due date</label>
+                 <input class="form-control example-date-input" value="{{ old('due_date') }}" name="due_date" type="date" id="due_date">
             </div>
         </div>
  
@@ -84,6 +87,11 @@
         <div class="card-body">
         <form method="post" action="{{ route('invoice.store') }}">
             @csrf
+            <div class="row g-2 mb-3">
+                <div class="col-md-2"><label class="form-label">Currency</label><input name="currency_code" value="{{ old('currency_code', auth()->user()?->company?->base_currency ?? 'USD') }}" maxlength="3" class="form-control"></div>
+                <div class="col-md-2"><label class="form-label">Rate to base</label><input name="exchange_rate" value="{{ old('exchange_rate') }}" type="number" min="0.000001" step="0.000001" class="form-control" placeholder="Auto lookup"></div>
+                <div class="col-md-2"><label class="form-label">Tax mode</label><select name="tax_mode" class="form-select"><option value="exclusive" @selected(old('tax_mode', 'exclusive') === 'exclusive')>Exclusive</option><option value="inclusive" @selected(old('tax_mode') === 'inclusive')>Inclusive</option></select></div>
+            </div>
             <table class="table-sm table-bordered" width="100%" style="border-color: #ddd;">
                 <thead>
                     <tr>
@@ -91,6 +99,8 @@
                         <th>Product Name </th>
                         <th width="7%">PSC/KG</th>
                         <th width="10%">Unit Price </th> 
+                        <th>Batch/Lot</th>
+                        <th>Serial numbers</th>
                         <th width="15%">Total Price</th>
                         <th width="7%">Action</th> 
 
@@ -107,6 +117,12 @@
             <td>
             <input type="text" name="discount_amount" id="discount_amount" class="form-control estimated_amount" placeholder="Discount Amount"  >
             </td>
+        </tr>
+
+
+        <tr>
+            <td colspan="4">Promotion code</td>
+            <td><input type="text" name="promotion_code" class="form-control" placeholder="Optional coupon code"></td>
         </tr>
 
 
@@ -227,6 +243,9 @@
     <td>
         <input type="number" class="form-control unit_price text-right" name="unit_price[]" value=""> 
     </td>
+
+    <td><input type="text" class="form-control" name="batch_no[]" placeholder="Optional batch"></td>
+    <td><input type="text" class="form-control" name="serial_numbers[]" placeholder="Comma-separated serials"></td>
 
   
 
@@ -391,4 +410,6 @@
 
 
  
-@endsection 
+<script>document.addEventListener('DOMContentLoaded',function(){const taxMode=document.querySelector('select[name="tax_mode"]');if(taxMode && !@json(old('tax_mode'))) taxMode.value=@json($defaultTaxMode);});</script>
+<script>document.querySelector('form[action="{{ route('invoice.store') }}"]').addEventListener('submit',function(){const input=document.createElement('input');input.type='hidden';input.name='store_id';input.value=document.getElementById('invoice-store').value;this.appendChild(input);});</script>
+@endsection

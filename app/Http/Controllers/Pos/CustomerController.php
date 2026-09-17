@@ -39,11 +39,24 @@ class CustomerController extends Controller
             $save_url = 'upload/customer/'.$name_gen;
         }
 
-        Customer::insert([
+        Customer::create([
             'name' => $request->name,
+            'company_id' => Auth::user()->company_id,
             'mobile_no' => $request->mobile_no,
             'email' => $request->email,
             'address' => $request->address,
+            'tax_number' => $request->tax_number,
+            'tax_jurisdiction' => $request->tax_jurisdiction,
+            'tax_exempt' => $request->boolean('tax_exempt'),
+            'tax_exemption_number' => $request->tax_exemption_number,
+            'customer_group' => $request->customer_group,
+            'sales_channel' => $request->sales_channel,
+            'currency_code' => $request->currency_code ? strtoupper($request->currency_code) : null,
+            'is_active' => $request->boolean('is_active', true),
+            'credit_limit' => $request->credit_limit ?? 0,
+            'credit_days' => $request->credit_days ?? 0,
+            'credit_hold' => (bool) $request->credit_hold,
+            'credit_hold_after_days' => $request->credit_hold_after_days ?? 0,
             'customer_image' => $save_url ,
             'created_by' => Auth::user()->id,
             'created_at' => Carbon::now(),
@@ -76,6 +89,18 @@ class CustomerController extends Controller
             'mobile_no' => ['nullable', 'string', 'max:30'],
             'email' => ['nullable', 'email', 'max:255'],
             'address' => ['nullable', 'string', 'max:255'],
+            'tax_number' => ['nullable', 'string', 'max:100'],
+            'tax_jurisdiction' => ['nullable', 'string', 'max:100'],
+            'tax_exempt' => ['nullable', 'boolean'],
+            'tax_exemption_number' => ['required_if:tax_exempt,1', 'nullable', 'string', 'max:100'],
+            'customer_group' => ['nullable', 'string', 'max:100'],
+            'sales_channel' => ['nullable', 'string', 'max:50'],
+            'currency_code' => ['nullable', 'string', 'size:3'],
+            'is_active' => ['nullable', 'boolean'],
+            'credit_limit' => ['nullable', 'numeric', 'min:0'],
+            'credit_days' => ['nullable', 'integer', 'min:0', 'max:3650'],
+            'credit_hold' => ['nullable', 'boolean'],
+            'credit_hold_after_days' => ['nullable', 'integer', 'min:0', 'max:3650'],
             'customer_image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'],
         ]);
 
@@ -92,6 +117,18 @@ class CustomerController extends Controller
             'mobile_no' => $request->mobile_no,
             'email' => $request->email,
             'address' => $request->address,
+            'tax_number' => $request->tax_number,
+            'tax_jurisdiction' => $request->tax_jurisdiction,
+            'tax_exempt' => $request->boolean('tax_exempt'),
+            'tax_exemption_number' => $request->tax_exemption_number,
+            'customer_group' => $request->customer_group,
+            'sales_channel' => $request->sales_channel,
+            'currency_code' => $request->currency_code ? strtoupper($request->currency_code) : null,
+            'is_active' => $request->boolean('is_active', true),
+            'credit_limit' => $request->credit_limit ?? 0,
+            'credit_days' => $request->credit_days ?? 0,
+            'credit_hold' => (bool) $request->credit_hold,
+            'credit_hold_after_days' => $request->credit_hold_after_days ?? 0,
             'customer_image' => $save_url ,
             'updated_by' => Auth::user()->id,
             'updated_at' => Carbon::now(),
@@ -112,6 +149,18 @@ class CustomerController extends Controller
             'mobile_no' => $request->mobile_no,
             'email' => $request->email,
             'address' => $request->address, 
+            'tax_number' => $request->tax_number,
+            'tax_jurisdiction' => $request->tax_jurisdiction,
+            'tax_exempt' => $request->boolean('tax_exempt'),
+            'tax_exemption_number' => $request->tax_exemption_number,
+            'customer_group' => $request->customer_group,
+            'sales_channel' => $request->sales_channel,
+            'currency_code' => $request->currency_code ? strtoupper($request->currency_code) : null,
+            'is_active' => $request->boolean('is_active', true),
+            'credit_limit' => $request->credit_limit ?? 0,
+            'credit_days' => $request->credit_days ?? 0,
+            'credit_hold' => (bool) $request->credit_hold,
+            'credit_hold_after_days' => $request->credit_hold_after_days ?? 0,
             'updated_by' => Auth::user()->id,
             'updated_at' => Carbon::now(),
 
@@ -136,15 +185,8 @@ class CustomerController extends Controller
             return redirect()->back()->with(['message' => 'This customer cannot be deleted because payment history exists.', 'alert-type' => 'error']);
         }
 
-        $img = $customers->customer_image;
-        if ($img && $img !== 'upload/no_image.jpg') {
-            $imagePath = public_path($img);
-            if (is_file($imagePath)) {
-                unlink($imagePath);
-            }
-        }
-
-        Customer::findOrFail($id)->delete();
+        // Keep uploaded media recoverable while the record is soft-deleted.
+        $customers->delete();
 
         $notification = array(
             'message' => 'Customer Deleted Successfully', 

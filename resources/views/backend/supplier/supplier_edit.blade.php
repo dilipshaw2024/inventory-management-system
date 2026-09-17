@@ -27,6 +27,8 @@
             </div>
             <!-- end row -->
 
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Tax jurisdiction</label><div class="form-group col-sm-10"><input name="tax_jurisdiction" value="{{ $supplier->tax_jurisdiction }}" class="form-control" maxlength="100" placeholder="Domestic, state, export..."></div></div>
+
 
               <div class="row mb-3">
                 <label for="example-text-input" class="col-sm-2 col-form-label">Supplier Mobile </label>
@@ -53,6 +55,12 @@
                 </div>
             </div>
             <!-- end row -->
+
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Tax number</label><div class="form-group col-sm-10"><input name="tax_number" value="{{ $supplier->tax_number }}" class="form-control" maxlength="100"></div></div><div class="row mb-3"><label class="col-sm-2 col-form-label">Tax exemption</label><div class="form-group col-sm-10"><input name="tax_exempt" value="1" type="checkbox" class="form-check-input" @checked($supplier->tax_exempt)> Exempt <input name="tax_exemption_number" value="{{ $supplier->tax_exemption_number }}" class="form-control mt-2" maxlength="100" placeholder="Exemption certificate/reference"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Payment terms (days)</label><div class="form-group col-sm-10"><input name="payment_terms_days" type="number" min="0" max="3650" class="form-control" value="{{ $supplier->payment_terms_days }}"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Bank details</label><div class="form-group col-sm-10"><div class="row g-2"><div class="col-md-4"><input name="bank_name" value="{{ $supplier->bank_name }}" class="form-control" placeholder="Bank name"></div><div class="col-md-4"><input name="bank_account" value="{{ $supplier->bank_account }}" class="form-control" placeholder="Account number"></div><div class="col-md-4"><input name="bank_code" value="{{ $supplier->bank_code }}" class="form-control" placeholder="IFSC / routing code"></div></div></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Rating (0–5)</label><div class="form-group col-sm-10"><input name="rating" type="number" min="0" max="5" step="0.01" value="{{ $supplier->rating }}" class="form-control"></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Working days</label><div class="form-group col-sm-10"><input name="planning_weekend_days" class="form-control" value="{{ implode(',', $supplier->planning_calendar['weekend_days'] ?? []) }}" placeholder="0,6"><small class="text-muted">Weekend day numbers: 0 Sunday through 6 Saturday.</small><input name="planning_holidays" class="form-control mt-2" value="{{ implode(',', $supplier->planning_calendar['holidays'] ?? []) }}" placeholder="2026-12-25,2027-01-01"><small class="text-muted">Optional supplier holidays, YYYY-MM-DD comma-separated.</small></div></div>
  
  
 

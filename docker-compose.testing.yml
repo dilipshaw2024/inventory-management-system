@@ -1,0 +1,22 @@
+services:
+  mysql-test:
+    image: mysql:8.0
+    container_name: inventory-management-mysql-test
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: inventory_management_test
+      MYSQL_USER: inventory_test
+      MYSQL_PASSWORD: inventory_test_password
+      MYSQL_ROOT_PASSWORD: inventory_test_root_password
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uinventory_test", "-pinventory_test_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - inventory_management_mysql_test:/var/lib/mysql
+
+volumes:
+  inventory_management_mysql_test:

@@ -32,7 +32,7 @@
                         <thead>
                         <tr>
                             <th width="5%">Sl</th>
-                            <th>Name</th> 
+                            <th>Name</th><th>Code</th><th>Dimension</th><th>Precision</th>
                             <th width="20%">Action</th>
                             
                         </thead>
@@ -43,7 +43,7 @@
                         	@foreach($units as $key => $item)
                         <tr>
                             <td> {{ $key+1}} </td>
-                            <td> {{ $item->name }} </td>  
+                            <td> {{ $item->name }} </td><td>{{ $item->code ?: '—' }}</td><td>{{ $item->dimension ?? 'unit' }} @if($item->is_base)<span class="badge bg-success">Base</span>@endif</td><td>{{ $item->decimal_places ?? 3 }}</td>
                             <td>
    <a href="{{ route('unit.edit',$item->id) }}" class="btn btn-info sm" title="Edit Data">  <i class="fas fa-edit"></i> </a>
 

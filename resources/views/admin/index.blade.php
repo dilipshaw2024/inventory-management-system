@@ -16,12 +16,7 @@
         </div>
 
         <div class="row g-3 mb-4">
-            @foreach([
-                ['Sales overview', 'Ready', 'Invoice performance', 'ri-line-chart-line', 'primary', '78%'],
-                ['Inventory health', 'Live', 'Stock records available', 'ri-archive-stack-line', 'success', '86%'],
-                ['Pending approvals', 'Review', 'Purchases and invoices', 'ri-time-line', 'warning', '42%'],
-                ['Customer accounts', 'Managed', 'Payments and balances', 'ri-group-line', 'info', '64%'],
-            ] as $metric)
+            @foreach($metrics as $metric)
             <div class="col-xl-3 col-md-6">
                 <div class="card inventory-metric-card inventory-metric-{{ $metric[4] }} h-100">
                     <div class="card-body">

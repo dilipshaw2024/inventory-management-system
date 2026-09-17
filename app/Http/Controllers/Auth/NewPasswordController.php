@@ -8,7 +8,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Password;
 use Illuminate\Support\Str;
-use Illuminate\Validation\Rules;
+use App\Services\PasswordPolicyService;
 
 class NewPasswordController extends Controller
 {
@@ -36,7 +36,7 @@ class NewPasswordController extends Controller
         $request->validate([
             'token' => ['required'],
             'email' => ['required', 'email'],
-            'password' => ['required', 'confirmed', Rules\Password::defaults()],
+            'password' => app(PasswordPolicyService::class)->rules(),
         ]);
 
         // Here we will attempt to reset the user's password. If it is successful we
@@ -45,6 +45,8 @@ class NewPasswordController extends Controller
         $status = Password::reset(
             $request->only('email', 'password', 'password_confirmation', 'token'),
             function ($user) use ($request) {
+                app(\App\Services\PasswordPolicyService::class)->assertNotReused($user, $request->password);
+                app(\App\Services\PasswordPolicyService::class)->rememberCurrent($user);
                 $user->forceFill([
                     'password' => Hash::make($request->password),
                     'remember_token' => Str::random(60),

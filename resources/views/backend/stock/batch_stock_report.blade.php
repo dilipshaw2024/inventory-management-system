@@ -1,0 +1,4 @@
+@extends('admin.admin_master')
+@section('admin')
+<div class="page-content"><div class="container-fluid"><div class="page-title-box"><h4>Batch-wise Stock</h4><p class="text-muted">Ledger-derived balances by batch and location.</p></div><div class="card"><div class="card-body"><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>Product</th><th>Batch</th><th>Expiry</th><th>Location</th><th>Balance</th></tr></thead><tbody>@forelse($batches as $row)<tr><td>{{ $row->product->name }}</td><td>{{ $row->batch->batch_no }}{{ $row->batch->lot_no ? ' / '.$row->batch->lot_no : '' }}</td><td>{{ optional($row->batch->expiry_date)->format('Y-m-d') ?? '—' }}</td><td>{{ data_get($row, 'location.code', 'Unassigned') }}</td><td>{{ number_format((float) $row->balance, 6) }}</td></tr>@empty<tr><td colspan="5" class="text-center">No batch balances found.</td></tr>@endforelse</tbody></table></div>{{ $batches->links() }}</div></div></div></div>
+@endsection

@@ -33,6 +33,10 @@
                         <tr>
                             <th width="5%">Sl</th>
                             <th>Name</th> 
+                            <th>Code</th>
+                            <th>Parent</th>
+                            <th>Tax</th>
+                            <th>Status</th>
                             <th width="20%">Action</th>
                             
                         </thead>
@@ -44,6 +48,10 @@
                         <tr>
                             <td> {{ $key+1}} </td>
                             <td> {{ $item->name }} </td>  
+                            <td> {{ $item->code ?: '—' }} </td>
+                            <td> {{ $item->parent->name ?? 'Top level' }} </td>
+                            <td> {{ $item->tax_rate ?? '—' }}% </td>
+                            <td> {{ $item->is_active === false ? 'Inactive' : 'Active' }} </td>
                             <td>
    <a href="{{ route('category.edit',$item->id) }}" class="btn btn-info sm" title="Edit Data">  <i class="fas fa-edit"></i> </a>
 

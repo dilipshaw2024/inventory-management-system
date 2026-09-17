@@ -18,7 +18,7 @@ return new class extends Migration
             $table->string('invoice_no')->nullable();
             $table->date('date')->nullable();
             $table->text('description')->nullable(); 
-            $table->tinyInteger('status')->default('0')->comment('0=Pending, 1=Approved');
+            $table->tinyInteger('status')->default('0')->comment('0=Pending, 1=Approved, 2=Rejected');
             $table->integer('created_by')->nullable();
             $table->integer('updated_by')->nullable();
             $table->timestamps();
