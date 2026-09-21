@@ -90,6 +90,7 @@ class ReplenishmentPurchaseOrderService
             PurchaseOrderLine::create([
                 'purchase_order_id' => $order->id,
                 'product_id' => $product->id,
+                'location_id' => $locationId,
                 'ordered_qty' => $quantity,
                 'unit_price' => (float) ($proposal['unit_price'] ?? $product->purchase_price ?? 0),
             ]);

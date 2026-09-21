@@ -1108,7 +1108,7 @@ class InventoryIntegrationController extends Controller
 
     public function purchaseOrders(Request $request): JsonResponse
     {
-        $orders = $this->companyScope(PurchaseOrder::with(['supplier', 'lines.product']), $request->user()?->company_id)
+        $orders = $this->companyScope(PurchaseOrder::with(['supplier', 'lines.product', 'lines.location']), $request->user()?->company_id)
             ->when($request->input('status'), fn ($query, $status) => $query->where('status', $status))
             ->when($request->has('updated_since'), fn ($query) => $query->where('updated_at', '>=', $request->date('updated_since')))
             ->orderBy('updated_at')->orderBy('id');

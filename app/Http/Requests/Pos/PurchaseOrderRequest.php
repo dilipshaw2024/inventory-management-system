@@ -21,6 +21,8 @@ class PurchaseOrderRequest extends FormRequest
             'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'],
             'product_id' => ['required', 'array', 'min:1'],
             'product_id.*' => ['required', 'integer', $owned('products')],
+            'location_id' => ['nullable', 'array'],
+            'location_id.*' => ['nullable', 'integer', $owned('inventory_locations')],
             'uom_id' => ['nullable', 'array'],
             'uom_id.*' => ['nullable', 'integer', $owned('units')],
             'ordered_qty' => ['required', 'array', 'min:1'],

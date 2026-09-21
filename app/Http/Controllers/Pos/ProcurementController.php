@@ -74,7 +74,7 @@ class ProcurementController extends Controller
                 $unitPrice = $uomId ? (float) $request->unit_price[$index] / max($stockQty / $enteredQty, 0.000001) : (float) $request->unit_price[$index];
                 $priceAgreement = app(SupplierProductPriceService::class)->bestFor($order->supplier, $product, $stockQty, now()->toDateString(), $order->currency_code);
                 if ($priceAgreement && (float) $request->unit_price[$index] <= 0) $unitPrice = (float) $priceAgreement->unit_price;
-                PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $productId, 'uom_id' => $uomId, 'uom_quantity' => $enteredQty, 'ordered_qty' => $stockQty, 'unit_price' => $unitPrice]);
+                PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $productId, 'location_id' => $request->input('location_id.'.$index), 'uom_id' => $uomId, 'uom_quantity' => $enteredQty, 'ordered_qty' => $stockQty, 'unit_price' => $unitPrice]);
             }
             app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray());
             return $order;

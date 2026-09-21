@@ -69,7 +69,7 @@ class GeneratePurchaseOrders extends Command
                         'status' => 'draft',
                     ]);
                     foreach ($lines as $line) {
-                        PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $line['product']->id, 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price']]);
+                        PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $line['product']->id, 'location_id' => $line['location_id'] ?? null, 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price']]);
                     }
                     app(AuditService::class)->record('purchase_order.created_from_scheduled_replenishment', $order, null, $order->toArray());
                     return $order;

@@ -328,6 +328,10 @@ class ProcurementIntegrationController extends Controller
         if ($order->receipts()->where('status', 'approved')->where('discrepancy_status', 'open')->exists()) return response()->json(['message' => 'Resolve the existing goods-receipt discrepancy before receiving more against this purchase order.'], 422);
         if (!in_array($order->status, ['approved', 'partially_received'], true)) throw new \RuntimeException('Only approved or partially received purchase orders can receive stock.');
         $location = !empty($data['location_id']) ? InventoryLocation::findOrFail($data['location_id']) : null;
+        if (!$location) {
+            $targetLocations = $order->lines->whereIn('id', collect($data['lines'])->pluck('purchase_order_line_id'))->pluck('location_id')->filter()->unique()->values();
+            if ($targetLocations->count() === 1) $location = InventoryLocation::findOrFail((int) $targetLocations->first());
+        }
         $overReceiptTolerance = (float) app(\App\Services\ErpSettingService::class)->get('purchase_over_receipt_tolerance_percent', 0, $companyId);
         $receipt = DB::transaction(function () use ($data, $companyId, $order, $location, $request, $overReceiptTolerance): GoodsReceipt {
             $receipt = GoodsReceipt::create([
@@ -375,7 +379,7 @@ class ProcurementIntegrationController extends Controller
             'expected_date' => ['nullable', 'date', 'after_or_equal:date'], 'currency_code' => ['nullable', 'string', 'size:3'],
             'exchange_rate' => ['nullable', 'numeric', 'gt:0'], 'description' => ['nullable', 'string', 'max:2000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')],
-            'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
+            'lines.*.location_id' => ['nullable', 'integer', $owned('inventory_locations')], 'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
             'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'],
         ]);
         if (!empty($data['external_reference'])) {
@@ -403,7 +407,7 @@ class ProcurementIntegrationController extends Controller
                 $agreement = app(SupplierProductPriceService::class)->bestFor($supplier, $product, $stockQuantity, $order->date->toDateString(), $order->currency_code, $order->price_list_id);
                 if ($agreement && $unitPrice <= 0) $unitPrice = (float) $agreement->unit_price;
                 if ($uomId) $unitPrice /= max($stockQuantity / $enteredQuantity, 0.000001);
-                PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $product->id, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'ordered_qty' => $stockQuantity, 'unit_price' => $unitPrice]);
+                PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $product->id, 'location_id' => $line['location_id'] ?? null, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'ordered_qty' => $stockQuantity, 'unit_price' => $unitPrice]);
             }
             app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray());
             return $order;
