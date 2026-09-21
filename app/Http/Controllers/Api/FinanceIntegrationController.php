@@ -489,11 +489,13 @@ class FinanceIntegrationController extends Controller
 
     public function exchangeRates(Request $request): JsonResponse
     {
-        $data = $request->validate(['from_currency_id' => ['nullable', 'integer'], 'to_currency_id' => ['nullable', 'integer'], 'effective_date' => ['nullable', 'date'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['from_currency_id' => ['nullable', 'integer'], 'to_currency_id' => ['nullable', 'integer'], 'effective_date' => ['nullable', 'date'], 'source_type' => ['nullable', 'in:manual,provider,import'], 'is_active' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $rates = ExchangeRate::with(['fromCurrency', 'toCurrency'])
             ->when($data['from_currency_id'] ?? null, fn ($query, $id) => $query->where('from_currency_id', $id))
             ->when($data['to_currency_id'] ?? null, fn ($query, $id) => $query->where('to_currency_id', $id))
             ->when($data['effective_date'] ?? null, fn ($query, $date) => $query->whereDate('effective_date', $date))
+            ->when($data['source_type'] ?? null, fn ($query, $source) => $query->where('source_type', $source))
+            ->when(array_key_exists('is_active', $data), fn ($query) => $query->where('is_active', (bool) $data['is_active']))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($rates, $request, 'accounting.exchange-rates', (int) ($data['per_page'] ?? 50));
@@ -505,14 +507,28 @@ class FinanceIntegrationController extends Controller
         $data = $request->validate([
             'from_currency_id' => ['required', 'integer', Rule::exists('currencies', 'id')->where(fn ($query) => $query->where('is_active', true))],
             'to_currency_id' => ['required', 'integer', 'different:from_currency_id', Rule::exists('currencies', 'id')->where(fn ($query) => $query->where('is_active', true))],
-            'rate' => ['required', 'numeric', 'gt:0'], 'effective_date' => ['required', 'date'],
+            'rate' => ['required', 'numeric', 'gt:0'], 'effective_date' => ['required', 'date'], 'source_type' => ['nullable', 'in:manual,provider,import'], 'source_reference' => ['nullable', 'string', 'max:150'], 'retrieved_at' => ['nullable', 'date'],
         ]);
+        $data['source_type'] = $data['source_type'] ?? 'manual';
+        if ($data['source_type'] !== 'manual' && empty($data['source_reference'])) abort(422, 'A provider or import exchange rate requires a source reference.');
+        $data['retrieved_at'] = $data['retrieved_at'] ?? now();
         $rate = DB::transaction(function () use ($data): ExchangeRate {
-            $rate = ExchangeRate::create($data);
+            $rate = ExchangeRate::create($data + ['is_active' => true]);
             app(AuditService::class)->record('exchange_rate.created', $rate, null, $rate->toArray());
             return $rate;
         });
         return response()->json(['data' => $rate->load(['fromCurrency', 'toCurrency']), 'status' => 'created'], 201);
+    }
+
+    public function deactivateExchangeRate(int $id): JsonResponse
+    {
+        if (!request()->user()?->tokenCan('accounting:write') && !request()->user()?->tokenCan('integration:write')) abort(403, 'This token cannot modify exchange rates.');
+        $rate = ExchangeRate::findOrFail($id);
+        if (!$rate->is_active) return response()->json(['data' => $rate, 'status' => 'already_inactive']);
+        $before = $rate->only(['is_active']);
+        $rate->update(['is_active' => false]);
+        app(AuditService::class)->record('exchange_rate.deactivated', $rate, $before, ['is_active' => false]);
+        return response()->json(['data' => $rate->fresh()->load(['fromCurrency', 'toCurrency']), 'status' => 'deactivated']);
     }
 
     private function assertWriteAccess(Request $request): void

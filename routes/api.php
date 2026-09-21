@@ -80,6 +80,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
     Route::patch('/currencies/{id}', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'updateCurrency'])->middleware('ability:accounting:write,integration:write');
     Route::get('/exchange-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'exchangeRates'])->middleware('abilities:accounting:read');
     Route::post('/exchange-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'storeExchangeRate'])->middleware('ability:accounting:write,integration:write');
+    Route::post('/exchange-rates/{id}/deactivate', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'deactivateExchangeRate'])->middleware('ability:accounting:write,integration:write');
     Route::get('/tax-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxRates'])->middleware('abilities:accounting:read');
     Route::get('/tax-report', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxReport'])->middleware('abilities:accounting:read');
     Route::get('/trial-balance', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'trialBalance'])->middleware('abilities:accounting:read');

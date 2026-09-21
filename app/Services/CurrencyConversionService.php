@@ -16,9 +16,9 @@ class CurrencyConversionService
         $to = Currency::where('code', $toCode)->where('is_active', true)->first();
         if (!$from || !$to) throw new \RuntimeException("Currency pair {$fromCode}/{$toCode} is not configured.");
         $asOf = $date ?: now()->toDateString();
-        $direct = ExchangeRate::where('from_currency_id', $from->id)->where('to_currency_id', $to->id)->whereDate('effective_date', '<=', $asOf)->latest('effective_date')->first();
+        $direct = ExchangeRate::where('from_currency_id', $from->id)->where('to_currency_id', $to->id)->where('is_active', true)->whereDate('effective_date', '<=', $asOf)->latest('effective_date')->latest('id')->first();
         if ($direct && (float) $direct->rate > 0) return (float) $direct->rate;
-        $inverse = ExchangeRate::where('from_currency_id', $to->id)->where('to_currency_id', $from->id)->whereDate('effective_date', '<=', $asOf)->latest('effective_date')->first();
+        $inverse = ExchangeRate::where('from_currency_id', $to->id)->where('to_currency_id', $from->id)->where('is_active', true)->whereDate('effective_date', '<=', $asOf)->latest('effective_date')->latest('id')->first();
         if ($inverse && (float) $inverse->rate > 0) return 1 / (float) $inverse->rate;
         throw new \RuntimeException("No effective exchange rate is configured for {$fromCode}/{$toCode}.");
     }
