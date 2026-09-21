@@ -27,6 +27,8 @@ class ExchangeRateGovernanceTest extends TestCase
         $created = $this->postJson('/api/accounting/exchange-rates', $payload + ['source_reference' => 'ECB-2026-09-20', 'retrieved_at' => '2026-09-20 18:00:00'])
             ->assertCreated()->assertJsonPath('data.source_type', 'provider')->assertJsonPath('data.source_reference', 'ECB-2026-09-20');
         $rateId = (int) $created->json('data.id');
+        $this->postJson('/api/accounting/exchange-rates', $payload + ['source_reference' => 'ECB-2026-09-20', 'rate' => 1.11])
+            ->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $rateId);
 
         $this->getJson('/api/accounting/exchange-rates?source_type=provider&is_active=1')->assertOk()->assertJsonPath('data.0.id', $rateId);
         $this->postJson('/api/accounting/exchange-rates/'.$rateId.'/deactivate')->assertOk()->assertJsonPath('data.is_active', false)->assertJsonPath('status', 'deactivated');

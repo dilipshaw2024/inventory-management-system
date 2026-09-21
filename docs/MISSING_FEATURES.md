@@ -675,3 +675,7 @@ Latest verification override: the complete MySQL feature regression now passes w
 Latest implementation update (exchange-rate governance): migration `2026_09_21_000381` adds source type, source reference, retrieval timestamp, and active lifecycle metadata to exchange rates. Provider/import rates require provenance, feeds can filter source and active state, inactive rates are excluded from conversion lookup, and authorized accounting clients can deactivate rates with audit history; legacy/manual rates remain active by default.
 
 Latest verification override: the complete MySQL feature regression now passes with **186 tests**; the unit suite remains **75 tests and 143 assertions**. Focused exchange-rate governance coverage passes with **1 test**, including provenance validation, source filtering, deactivation, and conversion exclusion.
+
+Latest implementation update (replenishment target locations): migration `2026_09_21_000382` adds an optional target location to purchase-order lines. Browser/API purchase orders, scheduled replenishment, and suggestion-created orders now preserve the location that drove the demand proposal; purchase-order feeds expose it, and single-location goods receipts default to that target when no receipt location is supplied.
+
+Latest verification override: the complete MySQL feature regression now passes with **187 tests**; the unit suite remains **75 tests and 143 assertions**. Focused replenishment coverage passes with **2 tests**, including target-location persistence and integration-feed visibility.

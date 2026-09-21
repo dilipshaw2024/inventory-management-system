@@ -78,7 +78,7 @@ class ReplenishmentPurchaseOrderTest extends TestCase
         $prices->shouldReceive('bestFor')->andReturnNull();
         $this->app->instance(\App\Services\SupplierProductPriceService::class, $prices);
 
-        Sanctum::actingAs($user, ['inventory:write', 'inventory:read', 'integration:read']);
+        Sanctum::actingAs($user, ['inventory:write', 'inventory:read', 'integration:read', 'purchasing:read']);
         $created = $this->postJson('/api/inventory/replenishment/purchase-orders', ['product_id' => $product->id, 'location_id' => $location->id, 'external_reference' => 'LOCATED-REPLENISHMENT-PO'])->assertCreated();
         $orderId = (int) $created->json('data.id');
         $this->assertDatabaseHas('purchase_order_lines', ['purchase_order_id' => $orderId, 'location_id' => $location->id]);

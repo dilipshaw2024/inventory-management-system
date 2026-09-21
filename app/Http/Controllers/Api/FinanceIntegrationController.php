@@ -512,6 +512,14 @@ class FinanceIntegrationController extends Controller
         $data['source_type'] = $data['source_type'] ?? 'manual';
         if ($data['source_type'] !== 'manual' && empty($data['source_reference'])) abort(422, 'A provider or import exchange rate requires a source reference.');
         $data['retrieved_at'] = $data['retrieved_at'] ?? now();
+        if ($data['source_type'] !== 'manual') {
+            $existing = ExchangeRate::where('from_currency_id', $data['from_currency_id'])
+                ->where('to_currency_id', $data['to_currency_id'])
+                ->where('source_type', $data['source_type'])
+                ->where('source_reference', $data['source_reference'])
+                ->first();
+            if ($existing) return response()->json(['data' => $existing->load(['fromCurrency', 'toCurrency']), 'status' => 'duplicate_ignored'], 200);
+        }
         $rate = DB::transaction(function () use ($data): ExchangeRate {
             $rate = ExchangeRate::create($data + ['is_active' => true]);
             app(AuditService::class)->record('exchange_rate.created', $rate, null, $rate->toArray());
