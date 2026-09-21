@@ -6,6 +6,7 @@ use App\Models\ApprovalPolicy;
 use App\Models\ApprovalAction;
 use Illuminate\Database\Eloquent\Model;
 use App\Models\ApprovalDelegation;
+use App\Models\ApprovalOverride;
 use App\Models\User;
 
 class ApprovalGuard
@@ -15,11 +16,11 @@ class ApprovalGuard
      * transaction. This keeps the step durable when the caller intentionally
      * aborts with a "next approver required" exception.
      */
-    public function assertBeforeTransaction(string $modelClass, int $id): void
+    public function assertBeforeTransaction(string $modelClass, int $id, ?int $companyId = null, ?int $actorId = null): void
     {
-        $document = $this->companyScope($modelClass::query())->findOrFail($id);
+        $document = $this->companyScope($modelClass::query(), $companyId)->findOrFail($id);
         $amount = $this->amountOf($document);
-        $policies = $this->matchingPolicies($document, $amount);
+        $policies = $this->matchingPolicies($document, $amount, $companyId);
         if ($policies->isEmpty()) return;
         $steps = $policies->groupBy('approval_step')->sortKeys();
         if ($steps->count() < 2) return;
@@ -29,17 +30,17 @@ class ApprovalGuard
             ->pluck('approval_step')->map(fn ($step): int => (int) $step)->all();
         $currentStep = $steps->keys()->first(fn ($step): bool => !in_array((int) $step, $completed, true));
         if ($currentStep !== null && (int) $currentStep !== (int) $steps->keys()->last()) {
-            $this->assertDifferent($document);
+            $this->assertDifferent($document, $actorId, $companyId);
         }
     }
 
-    public function assertDifferent(Model $document): void
+    public function assertDifferent(Model $document, ?int $actorId = null, ?int $companyId = null): void
     {
         $creatorId = $document->getAttribute('created_by');
-        $approverId = request()->user()?->id ?? auth()->id();
+        $approverId = $actorId ?? request()->user()?->id ?? auth()->id();
         if ($creatorId && $approverId && (int) $creatorId === (int) $approverId) throw new \RuntimeException('Maker-checker control: the creator cannot approve this transaction.');
 
-        $this->assertPolicy($document);
+        $this->assertPolicy($document, $actorId, $companyId);
     }
 
     /** Return the active policy for the next approval step, if any. */
@@ -56,10 +57,10 @@ class ApprovalGuard
         return $currentStep === null ? null : $steps->get($currentStep)->first();
     }
 
-    private function assertPolicy(Model $document): void
+    private function assertPolicy(Model $document, ?int $actorId = null, ?int $companyId = null): void
     {
         $amount = $this->amountOf($document);
-        $policies = $this->matchingPolicies($document, $amount);
+        $policies = $this->matchingPolicies($document, $amount, $companyId);
 
         if ($policies->isEmpty()) return;
 
@@ -76,8 +77,10 @@ class ApprovalGuard
         if ($currentStep === null) return;
         $policy = $steps->get($currentStep)->first();
 
-        if ($policy && $policy->required_permission && !$this->hasPermissionOrDelegation($policy->required_permission, $document->getMorphClass(), $document->getAttribute('company_id'))) {
-            throw new \RuntimeException('Approval policy requires permission: '.$policy->required_permission.'.');
+        $override = null;
+        if ($policy && $policy->required_permission && !$this->hasPermissionOrDelegation($policy->required_permission, $document->getMorphClass(), $document->getAttribute('company_id'), $actorId)) {
+            $override = $this->approvedOverride($document, (int) $currentStep);
+            if (!$override) throw new \RuntimeException('Approval policy requires permission: '.$policy->required_permission.'.');
         }
 
         ApprovalAction::firstOrCreate([
@@ -85,19 +88,31 @@ class ApprovalGuard
             'document_type' => $document->getMorphClass(),
             'document_id' => $document->getKey(),
             'approval_step' => (int) $currentStep,
-        ], ['acted_by' => auth()->id(), 'approved_at' => now()]);
+        ], ['acted_by' => $actorId ?? auth()->id(), 'approved_at' => now()]);
+        if ($override) $override->update(['consumed_at' => now(), 'consumed_by' => $actorId ?? auth()->id()]);
 
         if ($steps->count() > 1 && (int) $currentStep !== (int) $steps->keys()->last()) {
             throw new \RuntimeException('Approval step '.$currentStep.' recorded. The next approval step is required before posting.');
         }
     }
 
-    private function hasPermissionOrDelegation(string $permission, string $documentType, ?int $companyId = null): bool
+    private function approvedOverride(Model $document, int $step): ?ApprovalOverride
     {
-        if (auth()->user()?->hasPermission($permission)) return true;
+        return ApprovalOverride::withoutGlobalScopes()
+            ->where('company_id', $document->getAttribute('company_id'))
+            ->where('document_type', $document->getMorphClass())
+            ->where('document_id', $document->getKey())
+            ->where('approval_step', $step)->where('status', 'approved')
+            ->whereNull('consumed_at')->latest('id')->first();
+    }
+
+    private function hasPermissionOrDelegation(string $permission, string $documentType, ?int $companyId = null, ?int $actorId = null): bool
+    {
+        if ($actorId === null && auth()->user()?->hasPermission($permission)) return true;
+        if ($actorId !== null && User::find($actorId)?->hasPermission($permission)) return true;
         $now = now();
         return $this->companyScope(ApprovalDelegation::query(), $companyId)
-            ->where('delegate_id', auth()->id())
+            ->where('delegate_id', $actorId ?? auth()->id())
             ->where('is_active', true)
             ->where('starts_at', '<=', $now)
             ->where('ends_at', '>=', $now)
@@ -121,7 +136,7 @@ class ApprovalGuard
         return 0.0;
     }
 
-    private function matchingPolicies(Model $document, float $amount)
+    private function matchingPolicies(Model $document, float $amount, ?int $companyId = null)
     {
         $branchId = $document->getAttribute('branch_id');
         $categoryIds = [];
@@ -133,7 +148,7 @@ class ApprovalGuard
             }
         }
         $categoryIds = array_values(array_unique($categoryIds));
-        return $this->companyScope(ApprovalPolicy::query(), $document->getAttribute('company_id'))
+        return $this->companyScope(ApprovalPolicy::query(), $companyId ?? $document->getAttribute('company_id'))
             ->where('document_type', $document->getMorphClass())
             ->where('is_active', true)
             ->where(fn ($query) => $query->whereNull('min_amount')->orWhere('min_amount', '<=', $amount))

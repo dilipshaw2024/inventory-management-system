@@ -87,9 +87,14 @@ class IntegrationCursorService
 
     private function decode(string $cursor, ?int $companyId = null, ?string $principal = null): ?array
     {
-        $decoded = base64_decode(strtr($cursor, '-_', '+/'), true);
+        $encoded = strtr($cursor, '-_', '+/');
+        $encoded .= str_repeat('=', (4 - strlen($encoded) % 4) % 4);
+        $decoded = base64_decode($encoded, true);
         if ($decoded === false || !str_contains($decoded, '.')) return null;
-        [$payload, $signature] = explode('.', $decoded, 2);
+        $separator = strrpos($decoded, '.');
+        if ($separator === false) return null;
+        $payload = substr($decoded, 0, $separator);
+        $signature = substr($decoded, $separator + 1);
         if (!hash_equals(hash_hmac('sha256', $payload, (string) config('app.key')), $signature)) return null;
         try { $state = json_decode($payload, true, 512, JSON_THROW_ON_ERROR); } catch (\Throwable) { return null; }
         if (!is_array($state) || !isset($state['feed'], $state['updated_at'], $state['id'], $state['company_id'], $state['principal_key']) || !is_string($state['feed']) || !is_numeric($state['id']) || (int) $state['company_id'] !== (int) $companyId || (string) $state['principal_key'] !== (string) $principal) return null;

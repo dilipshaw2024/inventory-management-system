@@ -25,19 +25,37 @@ use Illuminate\Http\Request;
 
 class ProcurementController extends Controller
 {
+    private function companyId(): int
+    {
+        $companyId = (int) (auth()->user()?->company_id ?? 0);
+        abort_unless($companyId, 422, 'A company is required for procurement.');
+        return $companyId;
+    }
+
+    private function companyOrder(int $id): PurchaseOrder
+    {
+        return PurchaseOrder::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
+    private function companyReceipt(int $id): GoodsReceipt
+    {
+        return GoodsReceipt::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
     public function orders()
     {
-        $orders = PurchaseOrder::with('supplier')->latest()->paginate(30);
+        $orders = PurchaseOrder::where('company_id', $this->companyId())->with('supplier')->latest()->paginate(30);
         return view('backend.purchase.order_all', compact('orders'));
     }
 
     public function createOrder(Request $request)
     {
-        $suppliers = Supplier::where('status', 1)->orderBy('name')->get();
-        $products = Product::where('status', 1)->orderBy('name')->get();
+        $companyId = $this->companyId();
+        $suppliers = Supplier::where('status', 1)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('name')->get();
+        $products = Product::where('status', 1)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('name')->get();
         $units = Unit::where('status', 1)->orderBy('name')->get();
-        $selectedProductId = $request->integer('product_id') ?: null;
-        $selectedSupplierId = $request->integer('supplier_id') ?: null;
+        $selectedProductId = (int) $request->input('product_id') ?: null;
+        $selectedSupplierId = (int) $request->input('supplier_id') ?: null;
         $suggestedQuantity = $request->input('quantity');
         $suggestedPrice = $request->input('price');
         return view('backend.purchase.order_add', compact('suppliers', 'products', 'units', 'selectedProductId', 'selectedSupplierId', 'suggestedQuantity', 'suggestedPrice'));
@@ -45,10 +63,11 @@ class ProcurementController extends Controller
 
     public function storeOrder(PurchaseOrderRequest $request)
     {
-        $order = DB::transaction(function () use ($request): PurchaseOrder {
-            $order = PurchaseOrder::create($request->only(['supplier_id', 'date', 'expected_date', 'description']) + ['company_id' => auth()->user()?->company_id, 'currency_code' => strtoupper($request->currency_code ?: (auth()->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $request->exchange_rate ?: 1, 'po_no' => $request->po_no ?: app(NumberingSequenceService::class)->nextOrFallback('purchase_order', 'PO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'created_by' => auth()->id(), 'status' => 'submitted']);
+        $companyId = $this->companyId();
+        $order = DB::transaction(function () use ($request, $companyId): PurchaseOrder {
+            $order = PurchaseOrder::create($request->only(['supplier_id', 'date', 'expected_date', 'description']) + ['company_id' => $companyId, 'currency_code' => strtoupper($request->currency_code ?: (auth()->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $request->exchange_rate ?: 1, 'po_no' => $request->po_no ?: app(NumberingSequenceService::class)->nextOrFallback('purchase_order', 'PO-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, auth()->user()?->branch_id), 'created_by' => auth()->id(), 'status' => 'submitted']);
             foreach ($request->product_id as $index => $productId) {
-                $product = Product::findOrFail($productId);
+                $product = Product::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($productId);
                 $uomId = $request->uom_id[$index] ?? null;
                 $enteredQty = (float) $request->ordered_qty[$index];
                 $stockQty = app(UomConversionService::class)->toStock($product, $enteredQty, $uomId ? (int) $uomId : null, 'purchase');
@@ -66,7 +85,7 @@ class ProcurementController extends Controller
     public function approveOrder(int $id)
     {
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(PurchaseOrder::class, $id);
-        $order = PurchaseOrder::findOrFail($id);
+        $order = $this->companyOrder($id);
         if ($order->status !== 'submitted') return back()->with(['message' => 'Only submitted orders can be approved.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($order); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $order->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);
@@ -77,7 +96,7 @@ class ProcurementController extends Controller
     public function cancelOrder(Request $request, int $id)
     {
         $data = $request->validate(['cancellation_reason' => ['required', 'string', 'max:2000']]);
-        $order = PurchaseOrder::withCount(['receipts as posted_receipts_count' => fn ($query) => $query->where('status', 'approved')])->findOrFail($id);
+        $order = PurchaseOrder::where('company_id', $this->companyId())->withCount(['receipts as posted_receipts_count' => fn ($query) => $query->where('status', 'approved')])->findOrFail($id);
         if (!in_array($order->status, ['submitted', 'approved'], true)) return back()->with(['message' => 'Only submitted or approved purchase orders can be cancelled.', 'alert-type' => 'error']);
         if ($order->posted_receipts_count > 0 || (float) $order->lines()->sum('received_qty') > 0) return back()->with(['message' => 'A purchase order with posted receipts cannot be cancelled.', 'alert-type' => 'error']);
         $before = $order->only(['status', 'cancellation_reason', 'cancelled_by', 'cancelled_at']);
@@ -89,7 +108,7 @@ class ProcurementController extends Controller
     public function rejectOrder(Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $order = PurchaseOrder::findOrFail($id);
+        $order = $this->companyOrder($id);
         if ($order->status !== 'submitted') return back()->with(['message' => 'Only submitted purchase orders can be rejected.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($order); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $before = $order->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);
@@ -100,14 +119,15 @@ class ProcurementController extends Controller
 
     public function receipts()
     {
-        $receipts = GoodsReceipt::with('purchaseOrder.supplier')->latest()->paginate(30);
+        $receipts = GoodsReceipt::where('company_id', $this->companyId())->with('purchaseOrder.supplier')->latest()->paginate(30);
         return view('backend.purchase.receipt_all', compact('receipts'));
     }
 
     public function createReceipt()
     {
-        $orders = PurchaseOrder::whereIn('status', ['approved', 'partially_received'])->with(['supplier', 'lines.product'])->latest()->get();
-        $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
+        $companyId = $this->companyId();
+        $orders = PurchaseOrder::where('company_id', $companyId)->whereIn('status', ['approved', 'partially_received'])->with(['supplier', 'lines.product'])->latest()->get();
+        $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('code')->get();
         $units = Unit::where('status', 1)->orderBy('name')->get(['id', 'name']);
         return view('backend.purchase.receipt_add', compact('orders', 'locations', 'units'));
     }
@@ -115,7 +135,7 @@ class ProcurementController extends Controller
     public function storeReceipt(GoodsReceiptRequest $request)
     {
             $receipt = DB::transaction(function () use ($request): GoodsReceipt {
-            $order = PurchaseOrder::whereIn('status', ['approved', 'partially_received'])->findOrFail($request->purchase_order_id);
+            $order = PurchaseOrder::where('company_id', $this->companyId())->whereIn('status', ['approved', 'partially_received'])->findOrFail($request->purchase_order_id);
             $receipt = GoodsReceipt::create(['company_id' => $order->company_id ?: auth()->user()?->company_id, 'grn_no' => $request->grn_no ?: app(NumberingSequenceService::class)->nextOrFallback('goods_receipt', 'GRN-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'purchase_order_id' => $order->id, 'location_id' => $request->location_id, 'date' => $request->date, 'description' => $request->description, 'inspection_status' => $request->boolean('inspection_required') ? 'pending' : 'not_required', 'created_by' => auth()->id()]);
             foreach ($request->line_id as $index => $lineId) {
                 $line = $order->lines()->whereKey($lineId)->firstOrFail();
@@ -138,7 +158,7 @@ class ProcurementController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(GoodsReceipt::class, $id);
         try {
             DB::transaction(function () use ($id): void {
-                $receipt = GoodsReceipt::with(['lines.purchaseOrderLine', 'lines.product', 'purchaseOrder'])->lockForUpdate()->findOrFail($id);
+                $receipt = GoodsReceipt::where('company_id', $this->companyId())->with(['lines.purchaseOrderLine', 'lines.product', 'purchaseOrder'])->lockForUpdate()->findOrFail($id);
                 if ($receipt->status !== 'pending') throw new \RuntimeException('This receipt has already been processed.');
                 if ($receipt->inspection_status !== 'not_required' && $receipt->inspection_status !== 'passed') throw new \RuntimeException('This receipt must pass inspection before stock can be posted.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($receipt);
@@ -170,7 +190,7 @@ class ProcurementController extends Controller
                     }
                 }
                 $receipt->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);
-                $order = PurchaseOrder::with('lines')->findOrFail($receipt->purchase_order_id);
+                $order = PurchaseOrder::where('company_id', $this->companyId())->with('lines')->findOrFail($receipt->purchase_order_id);
                 $order->update(['status' => $order->lines->every(fn ($line) => (float) $line->received_qty >= (float) $line->ordered_qty) ? 'received' : 'partially_received']);
                 app(AuditService::class)->record('goods_receipt.approved', $receipt, ['status' => 'pending'], ['status' => 'approved']);
             });
@@ -185,7 +205,7 @@ class ProcurementController extends Controller
         $data = $request->validate(['inspection_status' => ['required', 'in:passed,failed'], 'inspection_notes' => ['required', 'string', 'max:3000']]);
         try {
             DB::transaction(function () use ($data, $id): void {
-                $receipt = GoodsReceipt::lockForUpdate()->findOrFail($id);
+                $receipt = GoodsReceipt::where('company_id', $this->companyId())->lockForUpdate()->findOrFail($id);
                 if ($receipt->status !== 'pending' || $receipt->inspection_status !== 'pending') throw new \RuntimeException('Only pending inspection receipts can be inspected.');
                 $before = $receipt->only(['inspection_status', 'inspection_notes', 'inspected_by', 'inspected_at']);
                 $receipt->update(['inspection_status' => $data['inspection_status'], 'inspection_notes' => $data['inspection_notes'], 'inspected_by' => auth()->id(), 'inspected_at' => now()]);
@@ -198,7 +218,7 @@ class ProcurementController extends Controller
     public function rejectReceipt(Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $receipt = GoodsReceipt::findOrFail($id);
+        $receipt = $this->companyReceipt($id);
         if ($receipt->status !== 'pending') return back()->with(['message' => 'Only pending goods receipts can be rejected.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($receipt); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $before = $receipt->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);

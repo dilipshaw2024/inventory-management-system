@@ -47,7 +47,7 @@ class AnalyticsIntegrationController extends Controller
             if ($existing === false) $rows->push($row); else $rows->put($existing, $row);
         });
         $rows = $rows->sortByDesc('revenue')->values();
-        $page = max(1, $request->integer('page', 1)); $perPage = (int) ($data['per_page'] ?? 50);
+        $page = max(1, (int) $request->input('page', 1)); $perPage = (int) ($data['per_page'] ?? 50);
         return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'summary' => ['documents' => $lines->pluck('invoice_id')->unique()->count(), 'return_documents' => $returns->count(), 'quantity' => (float) $rows->sum('quantity'), 'revenue' => (float) $rows->sum('revenue'), 'tax' => (float) $rows->sum('tax'), 'cogs' => (float) $rows->sum('cogs'), 'gross_profit' => (float) $rows->sum('gross_profit')], 'meta' => ['from' => $from, 'to' => $to, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
     }
 
@@ -56,7 +56,7 @@ class AnalyticsIntegrationController extends Controller
         $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'product_id' => ['nullable', 'integer'], 'category_id' => ['nullable', 'integer'], 'abc_basis' => ['nullable', 'in:revenue,movement,value'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $companyId = $request->user()?->company_id; abort_unless($companyId, 403, 'A company is required for inventory analytics.');
         $from = $data['from'] ?? now()->subYear()->toDateString(); $to = $data['to'] ?? now()->toDateString(); $abcBasis = $data['abc_basis'] ?? 'revenue'; $rows = app(InventoryAnalyticsService::class)->rowsForCompany((int) $companyId, $from, $to, $data['product_id'] ?? null, $abcBasis, $data['category_id'] ?? null);
-        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, $request->integer('page', 1)); $paged = $rows->forPage($page, $perPage)->values();
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1)); $paged = $rows->forPage($page, $perPage)->values();
         $summaryQuantity = (float) $rows->sum('quantity_sold'); $summaryAverageStock = (float) $rows->sum('average_stock'); $periodDays = max(1, \Carbon\Carbon::parse($from)->diffInDays(\Carbon\Carbon::parse($to)) + 1);
         $summary = ['revenue' => (float) $rows->sum('revenue'), 'cogs' => (float) $rows->sum('cogs'), 'gross_profit' => (float) $rows->sum('gross_profit'), 'quantity_sold' => $summaryQuantity, 'inventory_value' => (float) $rows->sum('inventory_value'), 'turnover' => $summaryAverageStock > 0 ? $summaryQuantity / $summaryAverageStock : 0, 'days_of_inventory' => $summaryQuantity > 0 ? $summaryAverageStock / ($summaryQuantity / $periodDays) : null];
         $categorySummary = $rows->groupBy(fn (array $row) => $row['product']->category_id ?: 0)->map(function ($categoryRows, $categoryId) use ($periodDays): array {

@@ -29,11 +29,12 @@ class WebhookSubscriptionController extends Controller
     public function deliveries(Request $request)
     {
         $companyId = $this->companyId();
-        $data = $request->validate(['status' => ['nullable', 'in:pending,failed,sent,cancelled'], 'event_type' => ['nullable', 'string', 'max:150'], 'subscription_id' => ['nullable', 'integer'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['status' => ['nullable', 'in:pending,failed,dead_letter,sent,cancelled'], 'event_type' => ['nullable', 'string', 'max:150'], 'event_id' => ['nullable', 'string', 'max:191'], 'subscription_id' => ['nullable', 'integer'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $deliveries = IntegrationWebhookDelivery::with('subscription:id,name')
             ->where('company_id', $companyId)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['event_type'] ?? null, fn ($query, $event) => $query->where('event_type', $event))
+            ->when($data['event_id'] ?? null, fn ($query, $eventId) => $query->where('event_id', $eventId))
             ->when($data['subscription_id'] ?? null, fn ($query, $id) => $query->where('subscription_id', $id))
             ->latest('id')->paginate((int) ($data['per_page'] ?? 50))->withQueryString();
         return response()->json($deliveries);
@@ -42,9 +43,11 @@ class WebhookSubscriptionController extends Controller
     public function retry(int $id)
     {
         $delivery = IntegrationWebhookDelivery::with('subscription')->where('company_id', $this->companyId())->findOrFail($id);
-        if ($delivery->status !== 'failed') return response()->json(['message' => 'Only failed webhook deliveries can be retried manually.'], 422);
+        if (!in_array($delivery->status, ['failed', 'dead_letter'], true)) return response()->json(['message' => 'Only failed or dead-letter webhook deliveries can be retried manually.'], 422);
         if (!$delivery->subscription?->is_active) return response()->json(['message' => 'The webhook subscription is inactive.'], 422);
-        $delivery->update(['status' => 'pending', 'attempts' => 0, 'next_attempt_at' => null, 'last_error' => null, 'response_code' => null]);
+        $before = ['status' => $delivery->status, 'attempts' => (int) $delivery->attempts, 'dead_lettered_at' => optional($delivery->dead_lettered_at)->toISOString()];
+        $delivery->update(['status' => 'pending', 'attempts' => 0, 'next_attempt_at' => null, 'dead_lettered_at' => null, 'last_error' => null, 'response_code' => null]);
+        app(AuditService::class)->record('integration_webhook.requeued', $delivery, $before, ['status' => 'pending', 'attempts' => 0, 'dead_lettered_at' => null]);
         return response()->json(['data' => $delivery->fresh('subscription:id,name'), 'status' => 'pending']);
     }
 
@@ -58,6 +61,23 @@ class WebhookSubscriptionController extends Controller
         return response()->json(['data' => $subscription, 'status' => 'inactive', 'cancelled_deliveries' => $cancelled]);
     }
 
+    public function update(Request $request, int $id)
+    {
+        $data = $request->validate([
+            'name' => ['sometimes', 'required', 'string', 'max:120'],
+            'endpoint_url' => ['sometimes', 'required', 'url', 'regex:/^https?:\/\//i', 'max:2048'],
+            'event_types' => ['sometimes', 'required', 'array', 'min:1'],
+            'event_types.*' => ['required', 'string', 'max:150'],
+        ]);
+        if ($data === []) return response()->json(['message' => 'At least one subscription field is required.'], 422);
+        $subscription = IntegrationWebhookSubscription::where('company_id', $this->companyId())->findOrFail($id);
+        $before = $subscription->only(['name', 'endpoint_url', 'event_types', 'is_active']);
+        if (array_key_exists('event_types', $data)) $data['event_types'] = array_values(array_unique($data['event_types']));
+        $subscription->update($data);
+        app(AuditService::class)->record('integration_webhook.updated', $subscription, $before, $subscription->fresh()->only(['name', 'endpoint_url', 'event_types', 'is_active']));
+        return response()->json(['data' => $subscription->fresh(), 'status' => 'updated']);
+    }
+
     public function activate(int $id)
     {
         $subscription = IntegrationWebhookSubscription::where('company_id', $this->companyId())->findOrFail($id);
@@ -65,6 +85,16 @@ class WebhookSubscriptionController extends Controller
         $subscription->update(['is_active' => true]);
         app(AuditService::class)->record('integration_webhook.activated', $subscription, ['is_active' => false], ['is_active' => true]);
         return response()->json(['data' => $subscription, 'status' => 'active']);
+    }
+
+    public function rotateSecret(Request $request, int $id)
+    {
+        $data = $request->validate(['secret' => ['nullable', 'string', 'min:16', 'max:255']]);
+        $subscription = IntegrationWebhookSubscription::where('company_id', $this->companyId())->findOrFail($id);
+        $secret = $data['secret'] ?? bin2hex(random_bytes(32));
+        $subscription->update(['secret' => $secret]);
+        app(AuditService::class)->record('integration_webhook.secret_rotated', $subscription, ['secret_rotated' => true], ['secret_rotated' => true]);
+        return response()->json(['data' => $subscription->fresh(), 'secret' => $secret, 'status' => 'rotated']);
     }
 
     private function companyId(): int

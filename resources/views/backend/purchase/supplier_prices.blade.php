@@ -23,15 +23,15 @@
         </div></div>
         <div class="card"><div class="card-body"><div class="table-responsive">
             <table class="table table-bordered">
-                <thead><tr><th>Supplier</th><th>Product</th><th>Min qty</th><th>Price</th><th>Currency</th><th>Lead time</th><th>Validity</th><th>Status</th><th>Supplier SKU</th><th></th></tr></thead>
+                <thead><tr><th>Supplier</th><th>Product</th><th>Min qty</th><th>Price</th><th>Currency</th><th>Lead time</th><th>Validity</th><th>Status</th><th>Supplier SKU</th><th>Approval</th><th></th></tr></thead>
                 <tbody>
                 @forelse($prices as $price)
                     <tr>
-                        <td>{{ data_get($price, 'supplier.name', 'N/A') }}</td><td>{{ data_get($price, 'product.name', 'N/A') }}</td><td>{{ $price->minimum_quantity }}</td><td>{{ $price->unit_price }}</td><td>{{ $price->currency_code }}</td><td>{{ $price->lead_time_days !== null ? $price->lead_time_days.' days' : '—' }}</td><td>{{ optional($price->starts_on)->format('d-m-Y') ?: 'Any' }} — {{ optional($price->ends_on)->format('d-m-Y') ?: 'Open' }}</td><td>{{ $price->is_active ? 'Active' : 'Inactive' }}</td><td>{{ $price->supplier_sku ?: '—' }}</td>
-                        <td>@if($price->is_active)<form method="POST" action="{{ route('procurement.supplier.prices.deactivate', $price->id) }}">@csrf<button class="btn btn-sm btn-outline-danger">Deactivate</button></form>@endif</td>
+                        <td>{{ data_get($price, 'supplier.name', 'N/A') }}</td><td>{{ data_get($price, 'product.name', 'N/A') }}</td><td>{{ $price->minimum_quantity }}</td><td>{{ $price->unit_price }}</td><td>{{ $price->currency_code }}</td><td>{{ $price->lead_time_days !== null ? $price->lead_time_days.' days' : '—' }}</td><td>{{ optional($price->starts_on)->format('d-m-Y') ?: 'Any' }} — {{ optional($price->ends_on)->format('d-m-Y') ?: 'Open' }}</td><td>{{ $price->is_active ? 'Active' : 'Inactive' }}</td><td>{{ $price->supplier_sku ?: '—' }}</td><td>{{ ucfirst($price->approval_status ?? 'approved') }} @if($price->rejection_reason)<small class="text-danger d-block">{{ $price->rejection_reason }}</small>@endif</td>
+                        <td>@if(($price->approval_status ?? 'approved') === 'pending')<form method="POST" action="{{ route('procurement.supplier.prices.approve', $price->id) }}" class="d-inline">@csrf<button class="btn btn-sm btn-outline-success">Approve</button></form><form method="POST" action="{{ route('procurement.supplier.prices.reject', $price->id) }}" class="d-inline">@csrf<input type="hidden" name="reason" value="Rejected from supplier pricing screen"><button class="btn btn-sm btn-outline-warning">Reject</button></form>@endif @if($price->is_active)<form method="POST" action="{{ route('procurement.supplier.prices.deactivate', $price->id) }}" class="d-inline">@csrf<button class="btn btn-sm btn-outline-danger">Deactivate</button></form>@endif</td>
                     </tr>
                 @empty
-                    <tr><td colspan="10" class="text-center">No supplier price agreements found.</td></tr>
+                    <tr><td colspan="11" class="text-center">No supplier price agreements found.</td></tr>
                 @endforelse
                 </tbody>
             </table>

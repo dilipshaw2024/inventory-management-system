@@ -44,7 +44,7 @@ class SecurityRoleController extends Controller
         $data = $request->validate(['role_id' => ['required', 'exists:roles,id'], 'conflicting_role_id' => ['required', 'exists:roles,id', 'different:role_id'], 'reason' => ['nullable', 'string', 'max:500']]);
         $pair = [min((int) $data['role_id'], (int) $data['conflicting_role_id']), max((int) $data['role_id'], (int) $data['conflicting_role_id'])];
         if (RoleConflict::where(['role_id' => $pair[0], 'conflicting_role_id' => $pair[1]])->orWhere(fn ($query) => $query->where('role_id', $pair[1])->where('conflicting_role_id', $pair[0]))->exists()) return back()->withErrors(['conflicting_role_id' => 'This role conflict already exists.'])->withInput();
-        $conflict = RoleConflict::create(['role_id' => $pair[0], 'conflicting_role_id' => $pair[1], 'reason' => $data['reason'] ?? null, 'created_by' => auth()->id()]);
+        $conflict = RoleConflict::create(['company_id' => auth()->user()?->company_id, 'role_id' => $pair[0], 'conflicting_role_id' => $pair[1], 'reason' => $data['reason'] ?? null, 'is_active' => true, 'created_by' => auth()->id()]);
         app(AuditService::class)->record('security.role_conflict.created', $conflict, null, $conflict->toArray());
         return back()->with(['message' => 'Role conflict rule created.', 'alert-type' => 'success']);
     }

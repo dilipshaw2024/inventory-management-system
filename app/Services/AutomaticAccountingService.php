@@ -12,17 +12,47 @@ use App\Models\InventoryTransfer;
 use App\Models\LandedCost;
 use App\Models\SupplierClaim;
 use App\Models\SupplierCreditNote;
+use App\Models\CustomerCreditNote;
+use App\Models\ProductionScrapRecord;
+use App\Models\InventoryStatusTransfer;
+use App\Models\InventoryCostRevaluationRun;
+use App\Models\CustomerPaymentAllocation;
+use App\Models\SupplierPaymentAllocation;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 
 class AutomaticAccountingService
 {
+    public function postInventoryRevaluation(InventoryCostRevaluationRun $run): ?\App\Models\JournalEntry
+    {
+        $amount = abs((float) $run->total_variance);
+        if ($amount <= 0.000001) return null;
+        $companyId = $run->company_id ?: auth()->user()?->company_id;
+        $inventory = $this->account('inventory', $companyId);
+        $varianceKey = (float) $run->total_variance >= 0 ? 'inventory_revaluation_gain' : 'inventory_revaluation_loss';
+        $variance = $this->account($varianceKey, $companyId);
+        if (!$inventory || !$variance) return null;
+        $currency = $this->currency($companyId);
+        $lines = (float) $run->total_variance >= 0
+            ? [['account_id' => $inventory, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1], ['account_id' => $variance, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1]]
+            : [['account_id' => $variance, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1], ['account_id' => $inventory, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1]];
+        return app(AccountingService::class)->post([
+            'company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
+            'date' => $run->as_of_date->toDateString(), 'description' => 'Inventory cost revaluation '.$run->id,
+        ], $lines, $run);
+    }
+
     public function postInventoryMovement(InventoryMovement $movement, float $totalCost, ?Model $source = null): void
     {
         $internalTransfer = $source instanceof InventoryTransfer;
         $salesReturn = $movement->movement_type === 'return_in' && $source instanceof InventoryReturn && $source->return_type === 'sales';
         $purchaseReturn = $movement->movement_type === 'return_out' && $source instanceof InventoryReturn && $source->return_type === 'purchase';
-        $operation = $internalTransfer && $movement->movement_type === 'transfer_in'
+        $recoveryReceipt = $movement->movement_type === 'receipt'
+            && ($source instanceof ProductionScrapRecord || $source instanceof InventoryStatusTransfer)
+            && $source->getAttribute('recovery_product_id');
+        $operation = $recoveryReceipt
+            ? ['debit' => 'inventory', 'credit' => 'inventory_loss']
+            : ($internalTransfer && $movement->movement_type === 'transfer_in'
             ? ['debit' => 'inventory', 'credit' => 'inventory_in_transit']
             : ($internalTransfer && $movement->movement_type === 'transfer_out'
                 ? ['debit' => 'inventory_in_transit', 'credit' => 'inventory']
@@ -33,7 +63,7 @@ class AutomaticAccountingService
                     'adjustment_out', 'scrap' => ['debit' => 'inventory_loss', 'credit' => 'inventory'],
                     'return_out' => $purchaseReturn ? ['debit' => 'accounts_payable', 'credit' => 'inventory'] : ['debit' => 'inventory_loss', 'credit' => 'inventory'],
                     default => null,
-                });
+                }));
         if (!$operation || $totalCost <= 0) return;
         $companyId = $source?->getAttribute('company_id') ?: $movement->getAttribute('company_id') ?: auth()->user()?->company_id;
         $currency = $this->currency($companyId);
@@ -173,6 +203,100 @@ class AutomaticAccountingService
         ], $note);
     }
 
+    public function postCarrierSettlement(Delivery $delivery, float $baseAmount, string $reference): ?\App\Models\JournalEntry
+    {
+        if ($baseAmount <= 0) return null;
+        $companyId = $delivery->company_id ?: auth()->user()?->company_id;
+        $expense = $this->account('freight_expense', $companyId);
+        $payable = $this->account('accounts_payable', $companyId);
+        if (!$expense || !$payable) return null;
+        $currency = $this->currency($companyId);
+        return app(AccountingService::class)->post([
+            'company_id' => $companyId,
+            'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
+            'date' => now()->toDateString(),
+            'description' => 'Carrier settlement '.$reference,
+        ], [
+            ['account_id' => $expense, 'debit' => $baseAmount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1],
+            ['account_id' => $payable, 'debit' => 0, 'credit' => $baseAmount, 'currency_code' => $currency, 'exchange_rate' => 1],
+        ], $delivery);
+    }
+
+    public function postCustomerRealizedFx(CustomerPaymentAllocation $allocation): ?\App\Models\JournalEntry
+    {
+        $allocation->loadMissing('payment', 'invoice');
+        $difference = round(((float) $allocation->payment_amount * (float) ($allocation->payment?->exchange_rate ?: 1))
+            - ((float) $allocation->amount * (float) ($allocation->invoice?->exchange_rate ?: 1)), 6);
+        if (abs($difference) <= 0.000001) return null;
+        $companyId = $allocation->company_id ?: $allocation->payment?->company_id ?: auth()->user()?->company_id;
+        $receivable = $this->account('accounts_receivable', $companyId);
+        $gain = $this->account('fx_gain', $companyId);
+        $loss = $this->account('fx_loss', $companyId);
+        if (!$receivable || !$gain || !$loss) return null;
+        $base = $this->currency($companyId);
+        $amount = abs($difference);
+        $lines = $difference > 0
+            ? [['account_id' => $receivable, 'debit' => $amount, 'credit' => 0], ['account_id' => $gain, 'debit' => 0, 'credit' => $amount]]
+            : [['account_id' => $loss, 'debit' => $amount, 'credit' => 0], ['account_id' => $receivable, 'debit' => 0, 'credit' => $amount]];
+        $lines = array_map(fn (array $line): array => $line + ['currency_code' => $base, 'exchange_rate' => 1], $lines);
+        return app(AccountingService::class)->post([
+            'company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
+            'external_reference' => 'FX-CUSTOMER-SETTLEMENT-'.$allocation->id,
+            'date' => optional($allocation->allocated_at)->toDateString() ?: now()->toDateString(),
+            'description' => 'Realized FX on customer payment allocation '.$allocation->id,
+        ], $lines, $allocation);
+    }
+
+    public function postSupplierRealizedFx(SupplierPaymentAllocation $allocation): ?\App\Models\JournalEntry
+    {
+        $allocation->loadMissing('payment', 'invoice');
+        $difference = round(((float) $allocation->payment_amount * (float) ($allocation->payment?->exchange_rate ?: 1))
+            - ((float) $allocation->amount * (float) ($allocation->invoice?->exchange_rate ?: 1)), 6);
+        if (abs($difference) <= 0.000001) return null;
+        $companyId = $allocation->company_id ?: $allocation->payment?->company_id ?: auth()->user()?->company_id;
+        $payable = $this->account('accounts_payable', $companyId);
+        $gain = $this->account('fx_gain', $companyId);
+        $loss = $this->account('fx_loss', $companyId);
+        if (!$payable || !$gain || !$loss) return null;
+        $base = $this->currency($companyId);
+        $amount = abs($difference);
+        $lines = $difference > 0
+            ? [['account_id' => $loss, 'debit' => $amount, 'credit' => 0], ['account_id' => $payable, 'debit' => 0, 'credit' => $amount]]
+            : [['account_id' => $payable, 'debit' => $amount, 'credit' => 0], ['account_id' => $gain, 'debit' => 0, 'credit' => $amount]];
+        $lines = array_map(fn (array $line): array => $line + ['currency_code' => $base, 'exchange_rate' => 1], $lines);
+        return app(AccountingService::class)->post([
+            'company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
+            'external_reference' => 'FX-SUPPLIER-SETTLEMENT-'.$allocation->id,
+            'date' => optional($allocation->allocated_at)->toDateString() ?: now()->toDateString(),
+            'description' => 'Realized FX on supplier payment allocation '.$allocation->id,
+        ], $lines, $allocation);
+    }
+
+    public function reverseRealizedFx(Model $allocation, string $reason): ?\App\Models\JournalEntry
+    {
+        $journal = \App\Models\JournalEntry::where('source_type', $allocation->getMorphClass())->where('source_id', $allocation->getKey())->where('status', 'posted')->first();
+        return $journal ? app(AccountingService::class)->reverse($journal, $reason) : null;
+    }
+
+    public function postCustomerCreditNote(CustomerCreditNote $note, float $amount)
+    {
+        if ($amount <= 0) return null;
+        $companyId = $note->company_id ?: auth()->user()?->company_id;
+        $receivable = $this->account('accounts_receivable', $companyId);
+        $returns = $this->account('sales_returns', $companyId) ?? $this->account('sales_revenue', $companyId);
+        $tax = (float) $note->tax_amount > 0 ? ($this->account('tax_payable', $companyId) ?? $this->account('sales_tax', $companyId)) : null;
+        if (!$receivable || !$returns || ((float) $note->tax_amount > 0 && !$tax)) return null;
+        $currency = $this->currency($companyId);
+        $lines = [['account_id' => $returns, 'debit' => (float) $note->subtotal_amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1]];
+        if ((float) $note->tax_amount > 0) $lines[] = ['account_id' => $tax, 'debit' => (float) $note->tax_amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1];
+        $lines[] = ['account_id' => $receivable, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1];
+        return app(AccountingService::class)->post([
+            'company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
+            'date' => $note->credit_date?->toDateString() ?: now()->toDateString(),
+            'description' => 'Customer credit note '.$note->credit_no,
+        ], $lines, $note);
+    }
+
     public function postSalesInvoice(Invoice $invoice): void
     {
         $companyId = auth()->user()?->company_id;
@@ -202,7 +326,7 @@ class AutomaticAccountingService
         $cash = $this->account('cash_bank', $companyId);
         $receivable = $this->account('accounts_receivable', $companyId);
         if (!$cash || !$receivable) return;
-        app(AccountingService::class)->post(['company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))), 'date' => Carbon::parse($payment->created_at ?? now())->toDateString(), 'description' => 'Customer payment for invoice '.$payment->invoice_id], [
+            app(AccountingService::class)->post(['company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))), 'date' => Carbon::parse($payment->payment_date ?? $payment->created_at ?? now())->toDateString(), 'description' => 'Customer payment for invoice '.$payment->invoice_id], [
             ['account_id' => $cash, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1],
             ['account_id' => $receivable, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1],
         ], $payment);

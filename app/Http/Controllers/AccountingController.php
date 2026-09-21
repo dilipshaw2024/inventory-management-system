@@ -383,7 +383,7 @@ class AccountingController extends Controller
 
     public function storeMapping(Request $request)
     {
-        $data = $request->validate(['company_id' => ['nullable', 'integer', 'exists:companies,id'], 'mapping_key' => ['required', 'in:inventory,grni,cogs,inventory_loss,supplier_claim_recovery,landed_cost_clearing,accounts_payable,accounts_receivable,sales_revenue,sales_tax,cash_bank,cash,bank,fx_gain,fx_loss,payroll_expense,payroll_payable,payroll_deductions'], 'account_id' => ['required', 'integer', $this->companyExists('chart_of_accounts')]]);
+        $data = $request->validate(['company_id' => ['nullable', 'integer', 'exists:companies,id'], 'mapping_key' => ['required', 'in:inventory,grni,cogs,inventory_loss,supplier_claim_recovery,landed_cost_clearing,freight_expense,accounts_payable,accounts_receivable,sales_revenue,sales_tax,cash_bank,cash,bank,fx_gain,fx_loss,payroll_expense,payroll_payable,payroll_deductions'], 'account_id' => ['required', 'integer', $this->companyExists('chart_of_accounts')]]);
         $userCompanyId = auth()->user()?->company_id;
         if ($userCompanyId && isset($data['company_id']) && (int) $data['company_id'] !== (int) $userCompanyId) abort(403, 'A mapping can only be changed for the current company.');
         $companyId = $userCompanyId ?: ($data['company_id'] ?? null);

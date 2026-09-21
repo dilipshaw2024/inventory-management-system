@@ -7,14 +7,45 @@ use App\Models\ProductionOrder;
 use App\Models\WorkCenter;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Collection;
 
 class ProductionSchedulingService
 {
+    public function scheduleMany(iterable $orders, CarbonImmutable|string|null $start = null, string $dispatchRule = 'planned_date'): Collection
+    {
+        if (!in_array($dispatchRule, ['planned_date', 'shortest_processing_time', 'critical_ratio'], true)) {
+            throw new \InvalidArgumentException('Unsupported production dispatch rule.');
+        }
+        return DB::transaction(function () use ($orders, $start, $dispatchRule): Collection {
+            $ordered = collect($orders)->values();
+            if ($ordered->isEmpty()) return collect();
+            $base = $start ?: CarbonImmutable::parse($ordered->first()->planned_date?->toDateString() ?: now()->toDateString())->startOfDay();
+            $ordered->each(function (ProductionOrder $order): void {
+                $order->loadMissing('operations.routingOperation');
+                if ($order->operations->isEmpty()) {
+                    app(ProductionOperationService::class)->initialize($order);
+                    $order->load('operations.routingOperation');
+                }
+            });
+            $ordered = $ordered->sortBy(function (ProductionOrder $order) use ($base, $dispatchRule): array {
+                $date = $order->planned_date?->toDateString() ?? '9999-12-31';
+                $duration = max(0.000001, $order->operations->sum(fn ($operation): float => $this->durationMinutes($operation)));
+                $priority = match ($dispatchRule) {
+                    'shortest_processing_time' => $duration,
+                    'critical_ratio' => max(0.0, $base->diffInMinutes(CarbonImmutable::parse($date), false)) / $duration,
+                    default => 0.0,
+                };
+                return [$priority, $date, str_pad((string) $order->id, 12, '0', STR_PAD_LEFT)];
+            })->values();
+            return $ordered->map(fn (ProductionOrder $order): ProductionOrder => $this->schedule($order, $base))->values();
+        });
+    }
+
     public function schedule(ProductionOrder $order, CarbonImmutable|string|null $start = null): ProductionOrder
     {
         return DB::transaction(function () use ($order, $start): ProductionOrder {
             $order = ProductionOrder::with('operations.routingOperation')->lockForUpdate()->findOrFail($order->getKey());
-            if (in_array($order->status, ['completed', 'cancelled'], true)) throw new \RuntimeException('Completed or cancelled production orders cannot be scheduled.');
+            if (in_array($order->status, ['completed', 'closed', 'cancelled', 'paused'], true)) throw new \RuntimeException('Completed, closed, cancelled, or paused production orders cannot be scheduled.');
             if ($order->operations->isEmpty()) {
                 app(ProductionOperationService::class)->initialize($order);
                 $order->load('operations.routingOperation');

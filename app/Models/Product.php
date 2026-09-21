@@ -33,6 +33,10 @@ class Product extends Model
         return $this->belongsTo(TaxRate::class, 'tax_rate_id');
     }
 
+    public function classification(){
+        return $this->belongsTo(ProductClassification::class, 'classification_id');
+    }
+
     public function purchases(){
         return $this->hasMany(Purchase::class, 'product_id');
     }

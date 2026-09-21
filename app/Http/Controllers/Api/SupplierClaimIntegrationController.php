@@ -14,6 +14,7 @@ use App\Services\NumberingSequenceService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Database\QueryException;
 use Illuminate\Validation\Rule;
 
 class SupplierClaimIntegrationController extends Controller
@@ -41,7 +42,7 @@ class SupplierClaimIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
             'claim_no' => ['nullable', 'string', 'max:80', Rule::unique('supplier_claims', 'claim_no')->where(fn ($query) => $query->where('company_id', $companyId))],
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('supplier_claims', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'purchase_invoice_id' => ['nullable', 'integer', Rule::exists('purchase_invoices', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'goods_receipt_id' => ['nullable', 'integer', Rule::exists('goods_receipts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
@@ -86,8 +87,17 @@ class SupplierClaimIntegrationController extends Controller
         $data = $request->validate(['status' => ['required', 'in:submitted,accepted,rejected,partially_settled,settled'], 'resolution_notes' => ['nullable', 'string', 'max:3000'], 'settled_amount' => ['nullable', 'numeric', 'gt:0'], 'settlement_reference' => ['nullable', 'string', 'max:150']]);
         if (in_array($data['status'], ['rejected', 'accepted', 'settled'], true) && empty($data['resolution_notes'])) abort(422, 'Resolution notes are required for this claim status.');
         if (in_array($data['status'], ['partially_settled', 'settled'], true) && (empty($data['settled_amount']) || empty($data['settlement_reference']))) abort(422, 'Settlement amount and reference are required for settlement.');
-        $claim = DB::transaction(function () use ($data, $id, $request): SupplierClaim {
-            $claim = SupplierClaim::where(function ($query) use ($request): void { $query->where('company_id', $request->user()?->company_id)->orWhereNull('company_id'); })->lockForUpdate()->findOrFail($id);
+        $companyId = $request->user()?->company_id;
+        $existing = SupplierClaim::where(function ($query) use ($companyId): void { $query->where('company_id', $companyId)->orWhereNull('company_id'); })->findOrFail($id);
+        if (in_array($data['status'], ['partially_settled', 'settled'], true)
+            && $existing->status === $data['status']
+            && $existing->settlement_reference === $data['settlement_reference']
+            && abs((float) $existing->settled_amount - (float) $data['settled_amount']) <= 0.000001) {
+            return response()->json(['data' => $existing->load(['supplier', 'purchaseInvoice', 'goodsReceipt', 'inventoryReturn']), 'status' => $existing->status, 'idempotent' => true]);
+        }
+        try {
+            $claim = DB::transaction(function () use ($data, $id, $request): SupplierClaim {
+                $claim = SupplierClaim::where(function ($query) use ($request): void { $query->where('company_id', $request->user()?->company_id)->orWhereNull('company_id'); })->lockForUpdate()->findOrFail($id);
             if (in_array($claim->status, ['rejected', 'settled'], true)) throw new \RuntimeException('Closed supplier claims cannot be changed.');
             $allowed = ['open' => ['submitted'], 'submitted' => ['accepted', 'rejected'], 'accepted' => ['partially_settled', 'settled'], 'partially_settled' => ['settled']];
             if (!in_array($data['status'], $allowed[$claim->status] ?? [], true)) throw new \RuntimeException('Invalid supplier claim status transition.');
@@ -111,7 +121,12 @@ class SupplierClaimIntegrationController extends Controller
             $claim->update($updates);
             app(AuditService::class)->record('supplier_claim.status_changed', $claim, $before, $claim->fresh()->only(array_keys($before)) + ['api' => true]);
             return $claim->fresh();
-        });
-        return response()->json(['data' => $claim->load(['supplier', 'purchaseInvoice', 'goodsReceipt', 'inventoryReturn']), 'status' => $claim->status]);
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        } catch (QueryException $exception) {
+            return response()->json(['message' => 'The supplier-claim settlement reference is already used by another claim.'], 422);
+        }
+        return response()->json(['data' => $claim->load(['supplier', 'purchaseInvoice', 'goodsReceipt', 'inventoryReturn']), 'status' => $claim->status, 'idempotent' => false]);
     }
 }

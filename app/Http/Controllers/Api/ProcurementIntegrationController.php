@@ -13,6 +13,7 @@ use App\Models\Product;
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseOrderLine;
 use App\Models\Supplier;
+use App\Models\PriceList;
 use App\Services\AuditService;
 use App\Services\CurrencyConversionService;
 use App\Services\InventoryLedgerService;
@@ -22,6 +23,7 @@ use App\Services\PurchaseInvoiceService;
 use App\Models\PurchaseInvoice;
 use App\Models\PurchaseInvoiceLine;
 use App\Models\LandedCost;
+use App\Models\SupplierCorrectiveAction;
 use App\Services\TaxCalculationService;
 use App\Services\TaxRateResolver;
 use App\Services\UomConversionService;
@@ -33,12 +35,65 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use Carbon\Carbon;
+use Carbon\CarbonPeriod;
 
 class ProcurementIntegrationController extends Controller
 {
+    public function purchasePriceVariances(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'supplier_id' => ['nullable', 'integer'], 'status' => ['nullable', 'in:pending,approved,rejected'],
+            'minimum_percent' => ['nullable', 'numeric', 'min:0', 'max:1000'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for purchase price variances.');
+        $from = $data['from'] ?? now()->subYear()->toDateString();
+        $to = $data['to'] ?? now()->toDateString();
+        $tolerance = (float) app(\App\Services\ErpSettingService::class)->get('purchase_price_variance_percent', 0, $companyId);
+        $invoices = PurchaseInvoice::with(['supplier:id,name', 'lines.product:id,name,sku', 'lines.purchaseOrderLine:id,unit_price', 'lines.goodsReceiptLine:id,unit_cost'])
+            ->where('company_id', $companyId)->whereBetween('invoice_date', [$from, $to])
+            ->when($data['supplier_id'] ?? null, fn ($query, $supplierId) => $query->where('supplier_id', $supplierId))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->orderBy('invoice_date')->orderBy('id')->get();
+        $minimum = (float) ($data['minimum_percent'] ?? 0);
+        $rows = collect();
+        foreach ($invoices as $invoice) {
+            foreach ($invoice->lines as $line) {
+                $baseline = $line->goodsReceiptLine?->unit_cost !== null
+                    ? (float) $line->goodsReceiptLine->unit_cost
+                    : (float) ($line->purchaseOrderLine?->unit_price ?? 0);
+                if ($baseline <= 0) continue;
+                $unitPrice = (float) $line->unit_price;
+                $variancePercent = (($unitPrice - $baseline) / $baseline) * 100;
+                if (abs($variancePercent) + 0.000001 < $minimum) continue;
+                $varianceAmount = ($unitPrice - $baseline) * (float) $line->quantity;
+                $rows->push([
+                    'purchase_invoice_id' => (int) $invoice->id, 'invoice_no' => $invoice->invoice_no,
+                    'invoice_date' => $invoice->invoice_date?->toDateString(), 'invoice_status' => $invoice->status,
+                    'supplier_id' => (int) $invoice->supplier_id, 'supplier_name' => $invoice->supplier?->name,
+                    'product_id' => (int) $line->product_id, 'product_name' => $line->product?->name, 'sku' => $line->product?->sku,
+                    'quantity' => (float) $line->quantity, 'invoiced_unit_price' => $unitPrice, 'baseline_unit_price' => $baseline,
+                    'baseline_source' => $line->goodsReceiptLine?->unit_cost !== null ? 'approved_receipt' : 'purchase_order',
+                    'variance_percent' => round($variancePercent, 6), 'variance_amount' => round($varianceAmount, 6),
+                    'tolerance_percent' => $tolerance, 'reconciliation_status' => abs($variancePercent) > $tolerance + 0.000001 ? 'exceeds_tolerance' : 'within_tolerance',
+                ]);
+            }
+        }
+        $page = max(1, (int) $request->input('page', 1));
+        $perPage = (int) ($data['per_page'] ?? 50);
+        return response()->json([
+            'data' => $rows->forPage($page, $perPage)->values(),
+            'summary' => ['line_count' => $rows->count(), 'variance_amount' => round((float) $rows->sum('variance_amount'), 6), 'exceeds_tolerance_count' => $rows->where('reconciliation_status', 'exceeds_tolerance')->count(), 'tolerance_percent' => $tolerance],
+            'meta' => ['from' => $from, 'to' => $to, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))],
+        ]);
+    }
+
     public function supplierPerformance(Request $request): JsonResponse
     {
-        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'supplier_id' => ['nullable', 'integer'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'supplier_id' => ['nullable', 'integer'], 'include_trend' => ['nullable', 'boolean'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         abort_unless($request->user()?->company_id, 403, 'A company is required for supplier performance.');
         $from = $data['from'] ?? now()->subYear()->toDateString(); $to = $data['to'] ?? now()->toDateString();
         $orders = PurchaseOrder::with(['supplier', 'lines', 'receipts.lines', 'receipts.purchaseOrder'])->whereIn('status', ['approved', 'partially_received', 'received'])->whereBetween('date', [$from, $to])->when($data['supplier_id'] ?? null, fn ($q, $id) => $q->where('supplier_id', $id))->get();
@@ -53,16 +108,133 @@ class ProcurementIntegrationController extends Controller
             $row['supplier_score'] = app(\App\Services\SupplierPerformanceScoringService::class)->score($row);
             return $row;
         });
-        $page = max(1, $request->integer('page', 1)); $perPage = (int) ($data['per_page'] ?? 50);
+        $trend = [];
+        if ($request->boolean('include_trend')) {
+            $trendOrders = $orders->groupBy(fn ($order): string => $order->date->format('Y-m'));
+            $period = CarbonPeriod::create(Carbon::parse($from)->startOfMonth(), '1 month', Carbon::parse($to)->startOfMonth());
+            foreach ($period as $month) {
+                $monthKey = $month->format('Y-m');
+                $monthOrders = $trendOrders->get($monthKey, collect());
+                $monthReceipts = $monthOrders->flatMap->receipts;
+                $ordered = (float) $monthOrders->sum(fn ($order) => $order->lines->sum('ordered_qty'));
+                $received = (float) $monthOrders->sum(fn ($order) => $order->lines->sum('received_qty'));
+                $onTime = $monthReceipts->filter(fn ($receipt) => !$receipt->purchaseOrder?->expected_date || $receipt->date <= $receipt->purchaseOrder->expected_date)->count();
+                $inspected = $monthReceipts->filter(fn ($receipt) => in_array($receipt->inspection_status, ['passed', 'failed'], true));
+                $failed = $inspected->where('inspection_status', 'failed');
+                $rejected = (float) $failed->sum(fn ($receipt) => $receipt->lines->sum('received_qty'));
+                $orderedValue = (float) $monthOrders->sum(fn ($order) => $order->lines->sum(fn ($line) => (float) $line->ordered_qty * (float) $line->unit_price));
+                $trend[] = [
+                    'month' => $monthKey, 'orders' => $monthOrders->count(), 'ordered' => $ordered, 'received' => $received,
+                    'fill_rate' => $ordered > 0 ? round(($received / $ordered) * 100, 6) : 0,
+                    'receipts' => $monthReceipts->count(), 'on_time_rate' => $monthReceipts->count() > 0 ? round(($onTime / $monthReceipts->count()) * 100, 6) : null,
+                    'inspected_receipts' => $inspected->count(), 'failed_receipts' => $failed->count(),
+                    'quality_rejection_rate' => $received > 0 ? round(($rejected / $received) * 100, 6) : 0,
+                    'ordered_value' => $orderedValue,
+                ];
+            }
+        }
+        $page = max(1, (int) $request->input('page', 1)); $perPage = (int) ($data['per_page'] ?? 50);
         $inspected = (int) $rows->sum('inspected_receipts'); $failed = (int) $rows->sum('failed_receipts'); $received = (float) $rows->sum('received'); $rejected = (float) $rows->sum('rejected_quantity');
-        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'summary' => ['orders' => (int) $rows->sum('orders'), 'ordered' => (float) $rows->sum('ordered'), 'received' => $received, 'ordered_value' => (float) $rows->sum('ordered_value'), 'invoiced_value' => (float) $rows->sum('invoiced_value'), 'inspected_receipts' => $inspected, 'failed_receipts' => $failed, 'quality_pass_rate' => $inspected > 0 ? (($inspected - $failed) / $inspected) * 100 : null, 'rejected_quantity' => $rejected, 'quality_rejection_rate' => $received > 0 ? ($rejected / $received) * 100 : 0, 'supplier_score' => $rows->count() > 0 ? round((float) $rows->avg('supplier_score'), 2) : null], 'meta' => ['from' => $from, 'to' => $to, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
+        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'summary' => ['orders' => (int) $rows->sum('orders'), 'ordered' => (float) $rows->sum('ordered'), 'received' => $received, 'ordered_value' => (float) $rows->sum('ordered_value'), 'invoiced_value' => (float) $rows->sum('invoiced_value'), 'inspected_receipts' => $inspected, 'failed_receipts' => $failed, 'quality_pass_rate' => $inspected > 0 ? (($inspected - $failed) / $inspected) * 100 : null, 'rejected_quantity' => $rejected, 'quality_rejection_rate' => $received > 0 ? ($rejected / $received) * 100 : 0, 'supplier_score' => $rows->count() > 0 ? round((float) $rows->avg('supplier_score'), 2) : null], 'trend' => $trend, 'meta' => ['from' => $from, 'to' => $to, 'trend_granularity' => $request->boolean('include_trend') ? 'month' : null, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
+    }
+
+    public function supplierCorrectiveActions(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'supplier_id' => ['nullable', 'integer'], 'status' => ['nullable', 'in:open,in_progress,resolved,closed'],
+            'severity' => ['nullable', 'in:low,medium,high,critical'], 'updated_since' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for supplier corrective actions.');
+        $actions = SupplierCorrectiveAction::with(['supplier:id,name', 'owner:id,name,email', 'creator:id,name'])
+            ->where('company_id', $companyId)
+            ->when($data['supplier_id'] ?? null, fn ($query, $id) => $query->where('supplier_id', $id))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['severity'] ?? null, fn ($query, $severity) => $query->where('severity', $severity))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($actions, $request, 'procurement.supplier-corrective-actions', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function supplierCorrectiveActionSummary(Request $request): JsonResponse
+    {
+        $data = $request->validate(['supplier_id' => ['nullable', 'integer'], 'as_of' => ['nullable', 'date'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'include_trend' => ['nullable', 'boolean']]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for supplier corrective actions.');
+        $asOf = $data['as_of'] ?? now()->toDateString();
+        $actions = SupplierCorrectiveAction::where('company_id', $companyId)
+            ->when($data['supplier_id'] ?? null, fn ($query, $id) => $query->where('supplier_id', $id))->get();
+        $active = $actions->whereIn('status', ['open', 'in_progress', 'resolved']);
+        $overdue = $active->filter(fn (SupplierCorrectiveAction $action): bool => $action->due_date !== null && $action->due_date->toDateString() < $asOf);
+        $group = fn (string $field): array => $actions->groupBy($field)->map(fn ($rows, $value): array => ['value' => $value, 'count' => $rows->count()])->values()->all();
+        $trend = [];
+        if ($request->boolean('include_trend')) {
+            $trendFrom = Carbon::parse($data['from'] ?? Carbon::parse($asOf)->subYear()->toDateString())->startOfMonth();
+            $trendTo = Carbon::parse($data['to'] ?? $asOf)->startOfMonth();
+            $trendActions = $actions->filter(fn (SupplierCorrectiveAction $action): bool => $action->created_at && $action->created_at->greaterThanOrEqualTo($trendFrom) && $action->created_at->lessThanOrEqualTo($trendTo->copy()->endOfMonth()));
+            $byMonth = $trendActions->groupBy(fn (SupplierCorrectiveAction $action): string => $action->created_at->format('Y-m'));
+            foreach (CarbonPeriod::create($trendFrom, '1 month', $trendTo) as $month) {
+                $monthActions = $byMonth->get($month->format('Y-m'), collect());
+                $trend[] = ['month' => $month->format('Y-m'), 'total' => $monthActions->count(), 'open' => $monthActions->where('status', 'open')->count(), 'in_progress' => $monthActions->where('status', 'in_progress')->count(), 'resolved' => $monthActions->where('status', 'resolved')->count(), 'closed' => $monthActions->where('status', 'closed')->count(), 'critical' => $monthActions->where('severity', 'critical')->count(), 'high' => $monthActions->where('severity', 'high')->count()];
+            }
+        }
+        return response()->json(['data' => ['as_of' => $asOf, 'total' => $actions->count(), 'open' => $actions->where('status', 'open')->count(), 'in_progress' => $actions->where('status', 'in_progress')->count(), 'resolved' => $actions->where('status', 'resolved')->count(), 'closed' => $actions->where('status', 'closed')->count(), 'overdue' => $overdue->count(), 'by_status' => $group('status'), 'by_severity' => $group('severity'), 'overdue_actions' => $overdue->sortBy('due_date')->values()->map(fn (SupplierCorrectiveAction $action): array => ['id' => $action->id, 'supplier_id' => $action->supplier_id, 'title' => $action->title, 'severity' => $action->severity, 'status' => $action->status, 'due_date' => $action->due_date?->toDateString()])->all(), 'trend' => $trend]]);
+    }
+
+    public function storeSupplierCorrectiveAction(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for supplier corrective actions.');
+        $data = $request->validate([
+            'external_reference' => ['nullable', 'string', 'max:150'],
+            'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'title' => ['required', 'string', 'max:200'], 'issue_type' => ['required', 'string', 'max:60'],
+            'severity' => ['required', 'in:low,medium,high,critical'], 'due_date' => ['nullable', 'date'],
+            'owner_id' => ['nullable', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'description' => ['nullable', 'string', 'max:10000'],
+        ]);
+        if (!empty($data['external_reference'])) {
+            $existing = SupplierCorrectiveAction::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing->load('supplier', 'owner', 'creator'), 'status' => 'duplicate_ignored']);
+        }
+        $action = DB::transaction(function () use ($data, $companyId, $request): SupplierCorrectiveAction {
+            $action = SupplierCorrectiveAction::create($data + ['company_id' => $companyId, 'created_by' => $request->user()?->id, 'status' => 'open']);
+            app(AuditService::class)->record('supplier_corrective_action.created', $action, null, $action->toArray());
+            return $action;
+        });
+        return response()->json(['data' => $action->load('supplier', 'owner', 'creator'), 'status' => 'created'], 201);
+    }
+
+    public function updateSupplierCorrectiveAction(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $action = SupplierCorrectiveAction::where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+        $data = $request->validate([
+            'title' => ['sometimes', 'string', 'max:200'], 'issue_type' => ['sometimes', 'string', 'max:60'],
+            'severity' => ['sometimes', 'in:low,medium,high,critical'], 'status' => ['sometimes', 'in:open,in_progress,resolved,closed'],
+            'due_date' => ['sometimes', 'nullable', 'date'],
+            'owner_id' => ['sometimes', 'nullable', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'description' => ['sometimes', 'nullable', 'string', 'max:10000'], 'resolution' => ['sometimes', 'nullable', 'string', 'max:10000'],
+        ]);
+        $status = $data['status'] ?? $action->status;
+        if ($status === 'closed' && trim((string) ($data['resolution'] ?? $action->resolution)) === '') abort(422, 'A resolution is required before closing a corrective action.');
+        $beforeFields = array_values(array_unique(array_merge(array_keys($data), ['status', 'closed_at', 'closed_by'])));
+        $before = $action->only($beforeFields);
+        $updates = $data;
+        if ($status === 'closed' && $action->status !== 'closed') $updates += ['closed_at' => now(), 'closed_by' => $request->user()?->id];
+        if ($status !== 'closed' && $action->status === 'closed') $updates += ['closed_at' => null, 'closed_by' => null];
+        $action->update($updates);
+        $afterFields = array_values(array_unique(array_merge(array_keys($updates), ['status', 'closed_at', 'closed_by'])));
+        app(AuditService::class)->record('supplier_corrective_action.updated', $action, $before, $action->fresh()->only($afterFields));
+        return response()->json(['data' => $action->fresh()->load('supplier', 'owner', 'creator', 'closer'), 'status' => 'updated']);
     }
 
     public function createInvoice(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('purchase_invoices', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'purchase_order_id' => ['required', 'integer', Rule::exists('purchase_orders', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'invoice_date' => ['required', 'date'], 'due_date' => ['nullable', 'date', 'after_or_equal:invoice_date'],
             'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'],
@@ -135,10 +307,10 @@ class ProcurementIntegrationController extends Controller
         $locationScope = \App\Services\InventoryLocationRuleService::existsForCompany($companyId);
         $orderLineScope = Rule::exists('purchase_order_lines', 'id')->where('purchase_order_id', $request->input('purchase_order_id'));
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('goods_receipts', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'purchase_order_id' => ['required', 'integer', $owned('purchase_orders')],
             'location_id' => ['nullable', 'integer', $locationScope], 'date' => ['required', 'date'],
-            'description' => ['nullable', 'string', 'max:2000'], 'inspection_required' => ['nullable', 'boolean'], 'is_final_delivery' => ['nullable', 'boolean'], 'discrepancy_reason' => ['nullable', 'string', 'max:3000', 'required_if:is_final_delivery,1'],
+            'description' => ['nullable', 'string', 'max:2000'], 'inspection_required' => ['nullable', 'boolean'], 'is_final_delivery' => ['nullable', 'boolean'], 'discrepancy_reason' => ['nullable', 'string', 'max:3000', 'required_if:is_final_delivery,1'], 'over_receipt_reason' => ['nullable', 'string', 'max:3000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.purchase_order_line_id' => ['required', 'integer', $orderLineScope],
             'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_cost' => ['required', 'numeric', 'min:0'],
             'lines.*.uom_id' => ['nullable', 'integer', $owned('units')],
@@ -153,14 +325,16 @@ class ProcurementIntegrationController extends Controller
         }
         $order = PurchaseOrder::with('lines.product')->findOrFail($data['purchase_order_id']);
         if ($order->receiving_closed) return response()->json(['message' => 'Receiving is closed for this purchase order.'], 422);
+        if ($order->receipts()->where('status', 'approved')->where('discrepancy_status', 'open')->exists()) return response()->json(['message' => 'Resolve the existing goods-receipt discrepancy before receiving more against this purchase order.'], 422);
         if (!in_array($order->status, ['approved', 'partially_received'], true)) throw new \RuntimeException('Only approved or partially received purchase orders can receive stock.');
         $location = !empty($data['location_id']) ? InventoryLocation::findOrFail($data['location_id']) : null;
-        $receipt = DB::transaction(function () use ($data, $companyId, $order, $location, $request): GoodsReceipt {
+        $overReceiptTolerance = (float) app(\App\Services\ErpSettingService::class)->get('purchase_over_receipt_tolerance_percent', 0, $companyId);
+        $receipt = DB::transaction(function () use ($data, $companyId, $order, $location, $request, $overReceiptTolerance): GoodsReceipt {
             $receipt = GoodsReceipt::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
                 'grn_no' => app(NumberingSequenceService::class)->nextOrFallback('goods_receipt', 'GRN-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
                 'purchase_order_id' => $order->id, 'location_id' => $location?->id, 'date' => $data['date'],
-                'description' => $data['description'] ?? null, 'inspection_status' => !empty($data['inspection_required']) ? 'pending' : 'not_required', 'is_final_delivery' => (bool) ($data['is_final_delivery'] ?? false), 'discrepancy_reason' => $data['discrepancy_reason'] ?? null,
+                'description' => $data['description'] ?? null, 'inspection_status' => !empty($data['inspection_required']) ? 'pending' : 'not_required', 'is_final_delivery' => (bool) ($data['is_final_delivery'] ?? false), 'discrepancy_reason' => $data['discrepancy_reason'] ?? ($data['over_receipt_reason'] ?? null),
                 'created_by' => $request->user()?->id,
             ]);
             foreach ($data['lines'] as $input) {
@@ -169,7 +343,11 @@ class ProcurementIntegrationController extends Controller
                 $product = $line->product; $enteredQuantity = (float) $input['quantity']; $uomId = $input['uom_id'] ?? null;
                 $receivedQuantity = app(UomConversionService::class)->toStock($product, $enteredQuantity, $uomId ? (int) $uomId : null, 'purchase');
                 $remaining = (float) $line->ordered_qty - (float) $line->received_qty;
-                if ($receivedQuantity > $remaining) throw new \RuntimeException('Receipt exceeds remaining quantity for '.$product->name.'.');
+                if ($receivedQuantity > $remaining + 0.000001) {
+                    $overage = $receivedQuantity - max(0, $remaining);
+                    $allowed = max(0, (float) $line->ordered_qty) * ($overReceiptTolerance / 100);
+                    if ($overReceiptTolerance <= 0 || $overage > $allowed + 0.000001 || empty($data['over_receipt_reason'])) abort(422, 'Receipt exceeds remaining quantity for '.$product->name.'; configure an over-receipt tolerance and provide a reason.');
+                }
                 $conversion = $receivedQuantity / $enteredQuantity;
                 GoodsReceiptLine::create([
                     'goods_receipt_id' => $receipt->id, 'purchase_order_line_id' => $line->id, 'product_id' => $product->id,
@@ -191,8 +369,9 @@ class ProcurementIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('purchase_orders', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'supplier_id' => ['required', 'integer', $owned('suppliers')], 'date' => ['required', 'date'],
+            'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'purchase'))],
             'expected_date' => ['nullable', 'date', 'after_or_equal:date'], 'currency_code' => ['nullable', 'string', 'size:3'],
             'exchange_rate' => ['nullable', 'numeric', 'gt:0'], 'description' => ['nullable', 'string', 'max:2000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')],
@@ -204,9 +383,13 @@ class ProcurementIntegrationController extends Controller
             if ($existing) return response()->json(['data' => $existing->load('supplier', 'lines.product'), 'status' => 'duplicate_ignored']);
         }
         $supplier = Supplier::findOrFail($data['supplier_id']);
-        $order = DB::transaction(function () use ($data, $companyId, $supplier, $request): PurchaseOrder {
+        $priceList = !empty($data['price_list_id']) ? PriceList::where('company_id', $companyId)->where('list_type', 'purchase')->findOrFail($data['price_list_id']) : null;
+        if ($priceList && (!$priceList->is_active || ($priceList->starts_on && $priceList->starts_on->toDateString() > $data['date']) || ($priceList->ends_on && $priceList->ends_on->toDateString() < $data['date']))) abort(422, 'The selected purchase price list is not active for the order date.');
+        if ($priceList && $priceList->currency_code !== strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD'))) abort(422, 'The selected purchase price list currency does not match the order currency.');
+        $order = DB::transaction(function () use ($data, $companyId, $supplier, $priceList, $request): PurchaseOrder {
             $order = PurchaseOrder::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null, 'supplier_id' => $supplier->id,
+                'price_list_id' => $priceList?->id,
                 'date' => $data['date'], 'expected_date' => $data['expected_date'] ?? null, 'description' => $data['description'] ?? null,
                 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $data['exchange_rate'] ?? 1,
                 'po_no' => app(NumberingSequenceService::class)->nextOrFallback('purchase_order', 'PO-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
@@ -217,7 +400,7 @@ class ProcurementIntegrationController extends Controller
                 app(ProductLifecycleService::class)->assertPurchasable($product);
                 $stockQuantity = app(UomConversionService::class)->toStock($product, $enteredQuantity, $uomId ? (int) $uomId : null, 'purchase');
                 $unitPrice = array_key_exists('unit_price', $line) && $line['unit_price'] !== null ? (float) $line['unit_price'] : 0;
-                $agreement = app(SupplierProductPriceService::class)->bestFor($supplier, $product, $stockQuantity, now()->toDateString(), $order->currency_code);
+                $agreement = app(SupplierProductPriceService::class)->bestFor($supplier, $product, $stockQuantity, $order->date->toDateString(), $order->currency_code, $order->price_list_id);
                 if ($agreement && $unitPrice <= 0) $unitPrice = (float) $agreement->unit_price;
                 if ($uomId) $unitPrice /= max($stockQuantity / $enteredQuantity, 0.000001);
                 PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $product->id, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'ordered_qty' => $stockQuantity, 'unit_price' => $unitPrice]);
@@ -225,7 +408,7 @@ class ProcurementIntegrationController extends Controller
             app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray());
             return $order;
         });
-        return response()->json(['data' => $order->load('supplier', 'lines.product'), 'status' => 'pending_approval'], 201);
+        return response()->json(['data' => $order->load('supplier', 'priceList', 'lines.product'), 'status' => 'pending_approval'], 201);
     }
 
     public function approveOrder(int $id): JsonResponse
@@ -310,9 +493,13 @@ class ProcurementIntegrationController extends Controller
             }
             $order = PurchaseOrder::with('lines')->lockForUpdate()->findOrFail($receipt->purchase_order_id);
             $hasShortage = $order->lines->contains(fn ($line): bool => (float) $line->received_qty + 0.000001 < (float) $line->ordered_qty);
-            $receipt->update(['status' => 'approved', 'approved_by' => $actorId, 'approved_at' => now(), 'discrepancy_status' => $receipt->is_final_delivery && $hasShortage ? 'open' : 'none']);
+            $hasOverage = $order->lines->contains(fn ($line): bool => (float) $line->received_qty > (float) $line->ordered_qty + 0.000001);
+            $shortageDiscrepancy = $receipt->is_final_delivery && $hasShortage;
+            $discrepancyType = $shortageDiscrepancy && $hasOverage ? 'mixed' : ($hasOverage ? 'overage' : ($shortageDiscrepancy ? 'shortage' : 'none'));
+            $hasDiscrepancy = $shortageDiscrepancy || $hasOverage;
+            $receipt->update(['status' => 'approved', 'approved_by' => $actorId, 'approved_at' => now(), 'discrepancy_status' => $hasDiscrepancy ? 'open' : 'none', 'discrepancy_type' => $discrepancyType]);
             $isComplete = $order->lines->every(fn ($line): bool => (float) $line->received_qty >= (float) $line->ordered_qty);
-            $order->update(['status' => $isComplete || ($receipt->is_final_delivery && !$hasShortage) ? 'received' : 'partially_received', 'receiving_closed' => $isComplete || ($receipt->is_final_delivery && !$hasShortage)]);
+            $order->update(['status' => $isComplete && !$hasDiscrepancy ? 'received' : 'partially_received', 'receiving_closed' => $isComplete && !$hasDiscrepancy]);
             app(AuditService::class)->record('goods_receipt.approved', $receipt, ['status' => 'pending'], ['status' => 'approved']);
             return $receipt->fresh();
         });
@@ -338,12 +525,13 @@ class ProcurementIntegrationController extends Controller
 
     public function resolveReceiptDiscrepancy(Request $request, int $id): JsonResponse
     {
-        $data = $request->validate(['resolution' => ['required', 'in:accept_shortage'], 'resolution_reason' => ['required', 'string', 'max:3000']]);
+        $data = $request->validate(['resolution' => ['required', 'in:accept_shortage,accept_overage,accept_discrepancy'], 'resolution_reason' => ['required', 'string', 'max:3000']]);
         $companyId = $request->user()?->company_id;
         $actorId = $request->user()?->id ?? auth()->id();
         $receipt = DB::transaction(function () use ($data, $id, $companyId, $actorId): GoodsReceipt {
             $receipt = GoodsReceipt::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->lockForUpdate()->findOrFail($id);
             if ($receipt->status !== 'approved' || $receipt->discrepancy_status !== 'open') throw new \RuntimeException('Only approved receipts with an open discrepancy can be resolved.');
+            if (($receipt->discrepancy_type === 'shortage' && !in_array($data['resolution'], ['accept_shortage', 'accept_discrepancy'], true)) || ($receipt->discrepancy_type === 'overage' && !in_array($data['resolution'], ['accept_overage', 'accept_discrepancy'], true)) || ($receipt->discrepancy_type === 'mixed' && $data['resolution'] !== 'accept_discrepancy')) abort(422, 'The resolution does not match the receipt discrepancy type.');
             app(ApprovalGuard::class)->assertDifferent($receipt);
             $before = $receipt->only(['discrepancy_status', 'discrepancy_resolution', 'discrepancy_resolved_by', 'discrepancy_resolved_at']);
             $receipt->update(['discrepancy_status' => 'accepted', 'discrepancy_resolution' => $data['resolution'].': '.$data['resolution_reason'], 'discrepancy_resolved_by' => $actorId, 'discrepancy_resolved_at' => now()]);

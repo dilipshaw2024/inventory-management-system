@@ -28,7 +28,7 @@ class GenerateProductionOrders extends Command
         foreach ($companies as $companyId) {
             $boms = BillOfMaterial::withoutGlobalScopes()
                 ->with('product')
-                ->where('is_active', true)
+                ->where('is_active', true)->where('approval_status', 'approved')
                 ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
                 ->whereHas('product', fn ($query) => $query->withoutGlobalScope('company')->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))
                 ->where(fn ($query) => $query->whereNull('effective_from')->orWhereDate('effective_from', '<=', now()->toDateString()))

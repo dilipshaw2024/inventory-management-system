@@ -6,6 +6,7 @@ use App\Models\Product;
 use App\Models\SalesOrder;
 use App\Models\StockReservation;
 use Illuminate\Support\Facades\DB;
+use App\Services\StockReservationService;
 
 class BackorderAllocationService
 {
@@ -28,14 +29,14 @@ class BackorderAllocationService
                     foreach ($order->lines as $line) {
                         $required = (float) $line->ordered_qty - (float) $line->delivered_qty;
                         if ($required <= 0.000001) continue;
-                        $reserved = (float) StockReservation::where('sales_order_line_id', $line->id)->where('status', 'active')->sum(DB::raw('quantity - released_quantity'));
+                        $reserved = (float) StockReservation::where('sales_order_line_id', $line->id)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->sum(DB::raw('quantity - released_quantity'));
                         $needed = $required - $reserved;
                         if ($needed <= 0.000001) continue;
                         $product = Product::lockForUpdate()->findOrFail($line->product_id);
                         $available = app(InventoryAvailabilityService::class)->available($product, true, $order->location_id, $companyId);
                         $quantity = min($needed, max(0, $available));
                         if ($quantity <= 0.000001) continue;
-                        StockReservation::create(['company_id' => $companyId, 'product_id' => $product->id, 'location_id' => $order->location_id, 'sales_order_line_id' => $line->id, 'quantity' => $quantity, 'created_by' => null]);
+                        StockReservation::create(['company_id' => $companyId, 'product_id' => $product->id, 'location_id' => $order->location_id, 'sales_order_line_id' => $line->id, 'quantity' => $quantity, 'created_by' => null, 'expires_at' => app(StockReservationService::class)->reservationExpiry($companyId)]);
                         $added += $quantity;
                     }
                     return $added;

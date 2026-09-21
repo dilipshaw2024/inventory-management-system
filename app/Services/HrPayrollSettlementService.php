@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\AccountMapping;
 use App\Models\HrPayRun;
+use App\Models\JournalEntry;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
@@ -26,6 +27,20 @@ class HrPayrollSettlementService
         return DB::transaction(function () use ($run, $journal, $paidAt, $reference): HrPayRun {
             $run->update(['status' => 'paid', 'paid_at' => $paidAt, 'payment_reference' => $reference, 'settlement_journal_entry_id' => $journal->id]);
             return $run->fresh(['journal', 'settlementJournal', 'payslips.employee']);
+        });
+    }
+
+    public function reverse(HrPayRun $run, string $reason): HrPayRun
+    {
+        return DB::transaction(function () use ($run, $reason): HrPayRun {
+            $run = HrPayRun::where('company_id', $run->company_id)->lockForUpdate()->findOrFail($run->id);
+            if ($run->status !== 'paid' || !$run->settlement_journal_entry_id) throw new RuntimeException('Only settled pay runs can have their settlement reversed.');
+            if ($run->settlement_reversal_journal_entry_id) throw new RuntimeException('This payroll settlement has already been reversed.');
+            $journal = JournalEntry::where('company_id', $run->company_id)->whereKey($run->settlement_journal_entry_id)->first();
+            if (!$journal || $journal->status !== 'posted') throw new RuntimeException('The payroll settlement journal is missing or is not posted.');
+            $reversal = app(AccountingService::class)->reverse($journal, $reason);
+            $run->update(['status' => 'settlement_reversed', 'settlement_reversal_journal_entry_id' => $reversal->id, 'settlement_reversed_at' => now(), 'settlement_reversed_by' => auth()->id(), 'settlement_reversal_reason' => $reason]);
+            return $run->fresh(['journal', 'settlementJournal', 'settlementReversalJournal', 'payslips.employee']);
         });
     }
 

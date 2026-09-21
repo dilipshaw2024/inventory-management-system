@@ -22,19 +22,37 @@ use Illuminate\Support\Facades\DB;
 
 class InventoryReturnController extends Controller
 {
-    public function index() { $returns = InventoryReturn::with(['customer', 'supplier', 'location', 'sourceInvoice', 'creator', 'refunds', 'lines.product', 'lines.batch'])->latest()->paginate(30); return view('backend.stock.return_all', compact('returns')); }
-    public function create() { $products = Product::where('status', 1)->orderBy('name')->get(); $customers = Customer::where('status', 1)->orderBy('name')->get(); $suppliers = Supplier::where('status', 1)->orderBy('name')->get(); $invoices = Invoice::where('status', 1)->orderByDesc('date')->get(['id', 'invoice_no', 'date']); $receipts = GoodsReceipt::where('status', 'approved')->with('purchaseOrder.supplier')->latest('date')->get(); $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))->orderBy('code')->get(); return view('backend.stock.return_add', compact('products', 'customers', 'suppliers', 'invoices', 'receipts', 'locations')); }
+    private function companyId(): int
+    {
+        return (int) auth()->user()->company_id;
+    }
+
+    private function companyReturn(int $id): InventoryReturn
+    {
+        return InventoryReturn::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
+    private function visibleProducts()
+    {
+        return Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'));
+    }
+
+    public function index() { $returns = InventoryReturn::where('company_id', $this->companyId())->with(['customer', 'supplier', 'location', 'sourceInvoice', 'creator', 'refunds', 'lines.product', 'lines.batch'])->latest()->paginate(30); return view('backend.stock.return_all', compact('returns')); }
+    public function create() { $companyId = $this->companyId(); $products = $this->visibleProducts()->where('status', 1)->orderBy('name')->get(); $customers = Customer::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->where('status', 1)->orderBy('name')->get(); $suppliers = Supplier::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->where('status', 1)->orderBy('name')->get(); $invoices = Invoice::where('company_id', $companyId)->where('status', 1)->orderByDesc('date')->get(['id', 'invoice_no', 'date']); $receipts = GoodsReceipt::where('company_id', $companyId)->where('status', 'approved')->with('purchaseOrder.supplier')->latest('date')->get(); $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('code')->get(); return view('backend.stock.return_add', compact('products', 'customers', 'suppliers', 'invoices', 'receipts', 'locations')); }
     public function store(InventoryReturnRequest $request)
     {
         try {
-            $return = DB::transaction(function () use ($request): InventoryReturn {
+            $companyId = $this->companyId();
+            $return = DB::transaction(function () use ($request, $companyId): InventoryReturn {
                 if ($request->return_type === 'sales' && !$request->customer_id) throw new \RuntimeException('A customer is required for a sales return.');
                 if ($request->return_type === 'purchase' && !$request->supplier_id) throw new \RuntimeException('A supplier is required for a purchase return.');
-                $party = $request->return_type === 'sales' ? Customer::find($request->customer_id) : Supplier::find($request->supplier_id);
+                $party = $request->return_type === 'sales'
+                    ? Customer::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->find($request->customer_id)
+                    : Supplier::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->find($request->supplier_id);
                 $inspectionRequired = $request->boolean('inspection_required');
-                $return = InventoryReturn::create($request->only(['return_type', 'customer_id', 'source_invoice_id', 'source_goods_receipt_id', 'supplier_id', 'location_id', 'date', 'reason_code', 'description']) + ['inspection_required' => $inspectionRequired, 'inspection_status' => $inspectionRequired ? 'pending' : 'not_required', 'tax_exempt' => (bool) ($party?->tax_exempt), 'tax_exemption_number' => $party?->tax_exemption_number, 'tax_jurisdiction' => $party?->tax_jurisdiction, 'return_no' => $request->return_no ?: app(NumberingSequenceService::class)->nextOrFallback('inventory_return', 'RET-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'created_by' => auth()->id()]);
+                $return = InventoryReturn::create($request->only(['return_type', 'customer_id', 'source_invoice_id', 'source_goods_receipt_id', 'supplier_id', 'location_id', 'date', 'reason_code', 'description']) + ['company_id' => $companyId, 'inspection_required' => $inspectionRequired, 'inspection_status' => $inspectionRequired ? 'pending' : 'not_required', 'tax_exempt' => (bool) ($party?->tax_exempt), 'tax_exemption_number' => $party?->tax_exemption_number, 'tax_jurisdiction' => $party?->tax_jurisdiction, 'return_no' => $request->return_no ?: app(NumberingSequenceService::class)->nextOrFallback('inventory_return', 'RET-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'created_by' => auth()->id()]);
                 foreach ($request->product_id as $index => $productId) {
-                    $product = Product::findOrFail($productId);
+                    $product = $this->visibleProducts()->findOrFail($productId);
                     $lines = $request->return_type === 'sales' && ($product->product_type ?: 'stock') === 'bundle'
                         ? app(\App\Services\BundleFulfillmentService::class)->expandReturnLine($product, (float) $request->quantity[$index], (float) ($request->unit_cost[$index] ?? 0), $request->unit_price[$index] ?? null, $request->tax_rate[$index] ?? null, $request->component_serial_numbers[$index] ?? [])
                         : [['product_id' => $product->id, 'quantity' => $request->quantity[$index], 'unit_cost' => $request->unit_cost[$index] ?? 0, 'unit_price' => $request->unit_price[$index] ?? null, 'tax_rate' => $request->tax_rate[$index] ?? null, 'serial_numbers' => $request->serial_numbers[$index] ?? null]];
@@ -51,12 +69,12 @@ class InventoryReturnController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(InventoryReturn::class, $id);
         try {
             DB::transaction(function () use ($id): void {
-                $return = InventoryReturn::with('lines')->lockForUpdate()->findOrFail($id);
+                $return = InventoryReturn::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($return->status !== 'pending') throw new \RuntimeException('This return has already been processed.');
                 if ($return->inspection_required && $return->inspection_status !== 'passed') throw new \RuntimeException('This return must pass inspection before approval.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($return);
                 if ($return->return_type === 'sales' && $return->source_invoice_id) {
-                    $source = Invoice::with('invoice_details.product')->lockForUpdate()->findOrFail($return->source_invoice_id);
+                    $source = Invoice::where('company_id', $this->companyId())->with('invoice_details.product')->lockForUpdate()->findOrFail($return->source_invoice_id);
                     if ($return->customer_id && Payment::where('invoice_id', $source->id)->value('customer_id') && (int) $return->customer_id !== (int) Payment::where('invoice_id', $source->id)->value('customer_id')) throw new \RuntimeException('Return customer does not match the source invoice.');
                     foreach ($return->lines as $line) {
                         $invoiced = (float) $source->invoice_details->where('product_id', $line->product_id)->when($line->batch_id, fn ($rows) => $rows->where('batch_id', $line->batch_id))->sum('selling_qty');
@@ -68,7 +86,7 @@ class InventoryReturnController extends Controller
                     }
                 }
                 if ($return->return_type === 'purchase' && $return->source_goods_receipt_id) {
-                    $source = GoodsReceipt::with(['purchaseOrder', 'lines'])->where('status', 'approved')->lockForUpdate()->findOrFail($return->source_goods_receipt_id);
+                    $source = GoodsReceipt::where('company_id', $this->companyId())->with(['purchaseOrder', 'lines'])->where('status', 'approved')->lockForUpdate()->findOrFail($return->source_goods_receipt_id);
                     if ($return->supplier_id && (int) $return->supplier_id !== (int) $source->purchaseOrder->supplier_id) throw new \RuntimeException('Return supplier does not match the source goods receipt.');
                     foreach ($return->lines as $line) {
                         $received = (float) $source->lines->where('product_id', $line->product_id)->when($line->batch_id, fn ($rows) => $rows->where('batch_id', $line->batch_id))->sum('received_qty');
@@ -77,7 +95,7 @@ class InventoryReturnController extends Controller
                     }
                 }
                 foreach ($return->lines as $line) {
-                    $product = Product::lockForUpdate()->findOrFail($line->product_id);
+                    $product = $this->visibleProducts()->lockForUpdate()->findOrFail($line->product_id);
                     $salesReturn = $return->return_type === 'sales';
                     $batch = null;
                     if ($line->batch_id) {
@@ -115,7 +133,7 @@ class InventoryReturnController extends Controller
     public function reject(\Illuminate\Http\Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $return = InventoryReturn::findOrFail($id);
+        $return = $this->companyReturn($id);
         if ($return->status !== 'pending') return back()->with(['message' => 'Only pending returns can be rejected.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($return); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $before = $return->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);
@@ -128,7 +146,7 @@ class InventoryReturnController extends Controller
     {
         $data = $request->validate(['inspection_status' => ['required', 'in:passed,failed'], 'inspection_notes' => ['required', 'string', 'max:3000']]);
         try {
-            $return = InventoryReturn::findOrFail($id);
+            $return = $this->companyReturn($id);
             if ($return->status !== 'pending' || !$return->inspection_required || $return->inspection_status !== 'pending') throw new \RuntimeException('Only pending returns awaiting inspection can be inspected.');
             app(\App\Services\ApprovalGuard::class)->assertDifferent($return);
             $before = $return->only(['inspection_status', 'inspection_notes', 'inspected_by', 'inspected_at']);

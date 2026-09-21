@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Customer;
 use App\Models\CustomerPaymentAllocation;
+use App\Models\CustomerCreditNote;
 use App\Models\Invoice;
 use App\Models\Payment;
 use Carbon\CarbonImmutable;
@@ -23,19 +24,22 @@ class CustomerCreditService
             })->get(['id', 'date', 'created_at', 'total_amount']);
 
         $invoiceIds = $invoices->pluck('id');
-        $paid = $invoiceIds->isEmpty() ? collect() : Payment::whereIn('invoice_id', $invoiceIds)
-            ->where('is_reversed', false)->whereDate('created_at', '<=', $asOfDate->toDateString())
+        $paid = $invoiceIds->isEmpty() ? collect() : Payment::whereIn('invoice_id', $invoiceIds)->where('approval_status', 'approved')
+            ->where('is_reversed', false)->where(fn ($query) => $query->whereDate('payment_date', '<=', $asOfDate->toDateString())->orWhere(fn ($legacy) => $legacy->whereNull('payment_date')->whereDate('created_at', '<=', $asOfDate->toDateString())))
             ->selectRaw('invoice_id, COALESCE(SUM(paid_amount), 0) AS amount')->groupBy('invoice_id')->pluck('amount', 'invoice_id');
         $allocated = $invoiceIds->isEmpty() ? collect() : CustomerPaymentAllocation::whereIn('invoice_id', $invoiceIds)
             ->whereNull('voided_at')->whereDate('allocated_at', '<=', $asOfDate->toDateString())
-            ->whereHas('payment', fn ($query) => $query->where('is_reversed', false))
+            ->whereHas('payment', fn ($query) => $query->where('approval_status', 'approved')->where('is_reversed', false))
             ->selectRaw('invoice_id, COALESCE(SUM(amount), 0) AS amount')->groupBy('invoice_id')->pluck('amount', 'invoice_id');
+        $credits = $invoiceIds->isEmpty() ? collect() : CustomerCreditNote::whereIn('invoice_id', $invoiceIds)
+            ->where('status', 'approved')->whereDate('credit_date', '<=', $asOfDate->toDateString())
+            ->selectRaw('invoice_id, COALESCE(SUM(total_amount), 0) AS amount')->groupBy('invoice_id')->pluck('amount', 'invoice_id');
 
         $outstanding = 0.0;
         $overdueAmount = 0.0;
         $oldestOverdueDays = 0;
         foreach ($invoices as $invoice) {
-            $balance = max(0, (float) $invoice->total_amount - (float) ($paid[$invoice->id] ?? 0) - (float) ($allocated[$invoice->id] ?? 0));
+            $balance = max(0, (float) $invoice->total_amount - (float) ($paid[$invoice->id] ?? 0) - (float) ($allocated[$invoice->id] ?? 0) - (float) ($credits[$invoice->id] ?? 0));
             if ($balance <= 0.000001) continue;
             $outstanding += $balance;
             $baseDate = $invoice->date ?: $invoice->created_at;
@@ -48,12 +52,12 @@ class CustomerCreditService
         }
 
         $legacyInvoiceIds = $invoiceIds->all() ?: [-1];
-        $legacy = Payment::where('customer_id', $customer->id)->whereNotIn('invoice_id', $legacyInvoiceIds)
-            ->where('due_amount', '>', 0)->where('is_reversed', false)->whereDate('created_at', '<=', $asOfDate->toDateString())->get(['due_amount', 'created_at']);
+        $legacy = Payment::where('customer_id', $customer->id)->where('approval_status', 'approved')->whereNotIn('invoice_id', $legacyInvoiceIds)
+            ->where('due_amount', '>', 0)->where('is_reversed', false)->where(fn ($query) => $query->whereDate('payment_date', '<=', $asOfDate->toDateString())->orWhere(fn ($legacy) => $legacy->whereNull('payment_date')->whereDate('created_at', '<=', $asOfDate->toDateString())))->get(['due_amount', 'payment_date', 'created_at']);
         foreach ($legacy as $payment) {
             $balance = (float) $payment->due_amount;
             $outstanding += $balance;
-            $dueDate = CarbonImmutable::parse($payment->created_at)->startOfDay()->addDays((int) $customer->credit_days);
+            $dueDate = CarbonImmutable::parse($payment->payment_date ?: $payment->created_at)->startOfDay()->addDays((int) $customer->credit_days);
             $daysOverdue = max(0, $dueDate->diffInDays($asOfDate, false));
             if ($daysOverdue > 0) {
                 $overdueAmount += $balance;

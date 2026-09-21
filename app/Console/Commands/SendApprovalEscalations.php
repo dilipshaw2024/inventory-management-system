@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\ApprovalPolicy;
 use App\Models\ApprovalAction;
+use App\Models\ApprovalEscalation;
 use App\Models\User;
 use App\Notifications\ApprovalEscalationNotification;
 use App\Services\ApprovalGuard;
@@ -53,19 +54,43 @@ class SendApprovalEscalations extends Command
                     ->latest('approved_at')->first();
                 if ($latestAction?->approved_at) $lastStepAt = $latestAction->approved_at;
                 if ($lastStepAt->copy()->addHours((int) $policy->escalation_after_hours)->isFuture()) continue;
+                $threshold = max(1, (int) $policy->escalation_after_hours);
+                $overdueHours = max(1, $lastStepAt->diffInHours(now()));
+                $level = min(max(1, (int) ($policy->max_escalation_level ?: 3)), max(1, intdiv($overdueHours, $threshold)));
+                $escalationPermission = $policy->required_permission;
+                $tierPermissions = is_array($policy->escalation_permissions) ? array_values($policy->escalation_permissions) : [];
+                if ($level > 1 && !empty($tierPermissions[$level - 2])) $escalationPermission = $tierPermissions[$level - 2];
                 $users = User::query()->where('is_active', true)->where('company_id', $document->company_id)
                     ->with('roles.permissions')->get()
-                    ->filter(fn (User $user): bool => $user->hasPermission($policy->required_permission));
+                    ->filter(fn (User $user): bool => $user->hasPermission($escalationPermission));
                 foreach ($users as $user) {
-                    $duplicate = $user->notifications()->where('type', ApprovalEscalationNotification::class)
-                        ->whereDate('created_at', Carbon::today())
-                        ->whereJsonContains('data->document_type', $document->getMorphClass())
-                        ->whereJsonContains('data->document_id', $document->getKey())->exists();
-                    if ($duplicate) continue;
+                    $priorEscalations = ApprovalEscalation::withoutGlobalScopes()
+                        ->where('company_id', $document->company_id)
+                        ->where('document_type', $document->getMorphClass())
+                        ->where('document_id', $document->getKey())
+                        ->where('approval_step', (int) $policy->approval_step)
+                        ->where('user_id', $user->id)
+                        ->where('status', 'pending')
+                        ->where('escalation_level', '<', $level)
+                        ->get();
+                    foreach ($priorEscalations as $priorEscalation) {
+                        $before = $priorEscalation->only(['status', 'superseded_at']);
+                        $priorEscalation->update(['status' => 'superseded', 'superseded_at' => now()]);
+                        app(\App\Services\AuditService::class)->record('approval_escalation.superseded', $priorEscalation, $before, $priorEscalation->fresh()->only(['status', 'superseded_at']));
+                    }
+                    $escalation = ApprovalEscalation::withoutGlobalScopes()->firstOrCreate([
+                        'company_id' => $document->company_id, 'document_type' => $document->getMorphClass(),
+                        'document_id' => $document->getKey(), 'approval_step' => (int) $policy->approval_step,
+                        'user_id' => $user->id, 'escalation_level' => $level,
+                    ], [
+                        'required_permission' => $escalationPermission, 'overdue_since' => $lastStepAt->copy()->addHours((int) $policy->escalation_after_hours), 'status' => 'pending',
+                    ]);
+                    if (!$escalation->wasRecentlyCreated) continue;
                     $user->notify(new ApprovalEscalationNotification([
                         'document_type' => $document->getMorphClass(), 'document_id' => $document->getKey(),
                         'document_no' => $document->getAttribute('order_no') ?: $document->getAttribute('invoice_no') ?: $document->getAttribute('document_no') ?: (string) $document->getKey(),
-                        'approval_step' => (int) $policy->approval_step, 'required_permission' => $policy->required_permission,
+                        'approval_step' => (int) $policy->approval_step, 'required_permission' => $escalationPermission,
+                        'escalation_level' => $level,
                         'overdue_since' => $lastStepAt->copy()->addHours((int) $policy->escalation_after_hours)->toISOString(),
                     ]));
                     $sent++;

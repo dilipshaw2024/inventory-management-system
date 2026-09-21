@@ -13,21 +13,23 @@ class CustomerPaymentAllocationService
     {
         return DB::transaction(function () use ($payment, $allocations, $externalReference): Payment {
             $payment = $this->companyScope(Payment::query(), $payment->company_id ?: auth()->user()?->company_id)->lockForUpdate()->findOrFail($payment->id);
+            if (($payment->approval_status ?? 'approved') !== 'approved') throw new \RuntimeException('Only approved customer payments can be allocated.');
             $companyId = $payment->company_id ?: auth()->user()?->company_id;
             if ($payment->is_reversed) throw new \RuntimeException('Reversed payments cannot be allocated.');
             if ($externalReference && ($existing = $this->companyScope(CustomerPaymentAllocation::query(), $payment->company_id ?: auth()->user()?->company_id)->where('external_reference', $externalReference)->first())) return $payment->load('allocations.invoice');
             if ($payment->invoice_id) throw new \RuntimeException('Invoice-bound payments cannot be reallocated. Create an unallocated payment for multi-invoice settlement.');
-            $remaining = (float) $payment->paid_amount - (float) CustomerPaymentAllocation::where('payment_id', $payment->id)->whereNull('voided_at')->whereHas('payment', fn ($query) => $query->where('is_reversed', false))->selectRaw('COALESCE(SUM(COALESCE(payment_amount, amount)), 0) AS total')->value('total');
+            $remaining = (float) $payment->paid_amount - (float) CustomerPaymentAllocation::where('payment_id', $payment->id)->whereNull('voided_at')->whereHas('payment', fn ($query) => $query->where('approval_status', 'approved')->where('is_reversed', false))->selectRaw('COALESCE(SUM(COALESCE(payment_amount, amount)), 0) AS total')->value('total');
             foreach ($allocations as $allocation) {
                 $amount = (float) ($allocation['amount'] ?? 0);
                 if ($amount <= 0 || $amount > $remaining + 0.000001) throw new \RuntimeException('Allocation amount exceeds the unallocated payment balance.');
                 $invoice = $this->companyScope(Invoice::query(), $companyId)->lockForUpdate()->whereKey($allocation['invoice_id'])->where('status', 1)->firstOrFail();
                 [$paymentAmount, $rate] = $this->convertedAmounts($payment, $invoice, $amount, $allocation['exchange_rate'] ?? null);
                 if ($payment->customer_id && $invoice->customer_id && (int) $payment->customer_id !== (int) $invoice->customer_id) throw new \RuntimeException('Payment and invoice customers do not match.');
-                $paid = (float) $this->companyScope(Payment::query(), $companyId)->where('invoice_id', $invoice->id)->where('id', '<>', $payment->id)->where('is_reversed', false)->sum('paid_amount');
-                $allocated = (float) $this->companyScope(CustomerPaymentAllocation::query(), $companyId)->where('invoice_id', $invoice->id)->whereNull('voided_at')->whereHas('payment', fn ($query) => $query->where('is_reversed', false))->sum('amount');
+                $paid = (float) $this->companyScope(Payment::query(), $companyId)->where('invoice_id', $invoice->id)->where('id', '<>', $payment->id)->where('approval_status', 'approved')->where('is_reversed', false)->sum('paid_amount');
+                $allocated = (float) $this->companyScope(CustomerPaymentAllocation::query(), $companyId)->where('invoice_id', $invoice->id)->whereNull('voided_at')->whereHas('payment', fn ($query) => $query->where('approval_status', 'approved')->where('is_reversed', false))->sum('amount');
                 if ($paid + $allocated + $amount > (float) $invoice->total_amount + 0.000001) throw new \RuntimeException('Allocation exceeds the invoice outstanding balance.');
-                CustomerPaymentAllocation::create(['company_id' => $payment->company_id ?: $companyId, 'payment_id' => $payment->id, 'invoice_id' => $invoice->id, 'amount' => $amount, 'payment_amount' => $paymentAmount, 'exchange_rate' => $rate, 'external_reference' => $externalReference, 'allocated_at' => now(), 'created_by' => auth()->id()]);
+                $createdAllocation = CustomerPaymentAllocation::create(['company_id' => $payment->company_id ?: $companyId, 'payment_id' => $payment->id, 'invoice_id' => $invoice->id, 'amount' => $amount, 'payment_amount' => $paymentAmount, 'exchange_rate' => $rate, 'external_reference' => $externalReference, 'allocated_at' => now(), 'created_by' => auth()->id()]);
+                app(\App\Services\AutomaticAccountingService::class)->postCustomerRealizedFx($createdAllocation);
                 $remaining -= $paymentAmount;
             }
             $this->syncAllocationStatus($payment);
@@ -41,8 +43,10 @@ class CustomerPaymentAllocationService
             $allocation = $this->companyScope(CustomerPaymentAllocation::query(), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
             if ($allocation->voided_at) throw new \RuntimeException('This customer payment allocation is already voided.');
             $payment = $this->companyScope(Payment::query(), $allocation->company_id ?: auth()->user()?->company_id)->lockForUpdate()->findOrFail($allocation->payment_id);
+            if (($payment->approval_status ?? 'approved') !== 'approved') throw new \RuntimeException('Only approved customer payments can have allocations changed.');
             if ($payment->is_reversed) throw new \RuntimeException('Allocations on reversed payments cannot be changed.');
             $allocation->update(['voided_at' => now(), 'voided_by' => auth()->id(), 'void_reason' => $reason]);
+            app(\App\Services\AutomaticAccountingService::class)->reverseRealizedFx($allocation, 'Reverse customer payment allocation: '.$reason);
             $this->syncAllocationStatus($payment);
             return $allocation->fresh(['payment', 'invoice']);
         });

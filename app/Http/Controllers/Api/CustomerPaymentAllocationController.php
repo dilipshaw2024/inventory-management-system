@@ -20,7 +20,7 @@ class CustomerPaymentAllocationController extends Controller
     {
         $companyId = auth()->user()?->company_id;
         $ownedCustomer = Rule::exists('customers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
-        $data = $request->validate(['customer_id' => ['required', 'integer', $ownedCustomer], 'paid_amount' => ['required', 'numeric', 'gt:0'], 'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'], 'reference' => ['nullable', 'string', 'max:255'], 'external_reference' => ['nullable', 'string', 'max:150']]);
+        $data = $request->validate(['customer_id' => ['required', 'integer', $ownedCustomer], 'paid_amount' => ['required', 'numeric', 'gt:0'], 'payment_date' => ['nullable', 'date'], 'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'], 'reference' => ['nullable', 'string', 'max:255'], 'external_reference' => ['nullable', 'string', 'max:150']]);
         if (!empty($data['external_reference'])) {
             $existing = $this->companyScope(Payment::query())->where('external_reference', $data['external_reference'])->first();
             if ($existing) return response()->json(['data' => $existing, 'status' => 'duplicate_ignored']);
@@ -28,12 +28,41 @@ class CustomerPaymentAllocationController extends Controller
         $customer = $this->companyScope(Customer::query())->findOrFail($data['customer_id']);
         $rate = (float) ($data['exchange_rate'] ?? 1);
         $payment = DB::transaction(function () use ($data, $customer, $rate, $companyId): Payment {
-            $payment = Payment::create(['company_id' => $companyId, 'customer_id' => $customer->id, 'paid_status' => 'unallocated', 'paid_amount' => $data['paid_amount'], 'due_amount' => 0, 'total_amount' => $data['paid_amount'], 'currency_code' => strtoupper($data['currency_code'] ?? (auth()->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $rate, 'base_amount' => (float) $data['paid_amount'] * $rate, 'reference' => $data['reference'] ?? null, 'external_reference' => $data['external_reference'] ?? null]);
+            $payment = Payment::create(['company_id' => $companyId, 'customer_id' => $customer->id, 'paid_status' => 'unallocated', 'payment_date' => $data['payment_date'] ?? now()->toDateString(), 'paid_amount' => $data['paid_amount'], 'due_amount' => 0, 'total_amount' => $data['paid_amount'], 'currency_code' => strtoupper($data['currency_code'] ?? (auth()->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $rate, 'base_amount' => (float) $data['paid_amount'] * $rate, 'reference' => $data['reference'] ?? null, 'external_reference' => $data['external_reference'] ?? null]);
             app(AutomaticAccountingService::class)->postCustomerPayment($payment);
             app(AuditService::class)->record('customer_payment.created', $payment, null, $payment->toArray() + ['journalized' => true]);
             return $payment;
         });
         return response()->json(['data' => $payment, 'status' => 'unallocated'], 201);
+    }
+
+    public function approvePayment(Request $request, int $id): JsonResponse
+    {
+        $payment = DB::transaction(function () use ($id, $request): Payment {
+            $payment = $this->companyScope(Payment::query())->lockForUpdate()->findOrFail($id);
+            if (($payment->approval_status ?? 'approved') !== 'pending') throw new \RuntimeException('This payment has already been processed.');
+            if ($payment->created_by && (int) $payment->created_by === (int) $request->user()?->id) throw new \RuntimeException('Maker-checker control: the creator cannot approve this transaction.');
+            app(AutomaticAccountingService::class)->postCustomerPayment($payment);
+            $payment->update(['approval_status' => 'approved', 'approved_by' => $request->user()?->id, 'approved_at' => now()]);
+            return $payment->fresh();
+        });
+        app(AuditService::class)->record('customer_payment.approved', $payment, ['approval_status' => 'pending'], $payment->fresh()->only(['approval_status', 'approved_by', 'approved_at']));
+        return response()->json(['data' => $payment->fresh()->load('customer', 'invoice'), 'status' => 'approved']);
+    }
+
+    public function rejectPayment(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
+        $payment = DB::transaction(function () use ($id, $request, $data): Payment {
+            $payment = $this->companyScope(Payment::query())->lockForUpdate()->findOrFail($id);
+            if (($payment->approval_status ?? 'approved') !== 'pending') throw new \RuntimeException('Only pending customer payments can be rejected.');
+            if ($payment->created_by && (int) $payment->created_by === (int) $request->user()?->id) throw new \RuntimeException('Maker-checker control: the creator cannot reject this transaction.');
+            $payment->update(['approval_status' => 'rejected', 'rejection_reason' => $data['rejection_reason'], 'rejected_by' => $request->user()?->id, 'rejected_at' => now()]);
+            return $payment->fresh();
+        });
+        $before = ['approval_status' => 'pending', 'rejection_reason' => null, 'rejected_by' => null, 'rejected_at' => null];
+        app(AuditService::class)->record('customer_payment.rejected', $payment, $before, $payment->fresh()->only(['approval_status', 'rejection_reason', 'rejected_by', 'rejected_at']));
+        return response()->json(['data' => $payment->fresh()->load('customer', 'invoice'), 'status' => 'rejected']);
     }
 
     public function allocate(Request $request, int $id): JsonResponse

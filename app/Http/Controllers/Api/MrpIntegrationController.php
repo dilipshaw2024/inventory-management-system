@@ -15,7 +15,7 @@ class MrpIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for MRP planning.');
         $result = app(MrpPlanningService::class)->proposalsForCompany((int) $companyId); $proposals = $result['proposals'];
-        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, $request->integer('page', 1));
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
         return response()->json(['data' => $proposals->forPage($page, $perPage)->values(), 'errors' => $result['errors'], 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $proposals->count(), 'last_page' => max(1, (int) ceil($proposals->count() / $perPage)), 'generated_at' => now()->toISOString()]]);
     }
 }

@@ -116,7 +116,7 @@ class HrEmployeeController extends Controller
     {
         $companyId = auth()->user()?->company_id;
         $data = $request->validate(['run_no' => ['required', 'string', 'max:60', Rule::unique('hr_pay_runs', 'run_no')->where(fn ($query) => $query->where('company_id', $companyId))], 'frequency' => ['required', 'in:weekly,biweekly,monthly'], 'period_from' => ['required', 'date'], 'period_to' => ['required', 'date', 'after_or_equal:period_from'], 'pay_date' => ['nullable', 'date', 'after_or_equal:period_to'], 'attendance_policy' => ['nullable', 'in:ignore,unpaid_absence'], 'overtime_policy' => ['nullable', 'in:ignore,pay_overtime'], 'overtime_multiplier' => ['nullable', 'numeric', 'min:1', 'max:5']]);
-        if (HrPayRun::where('company_id', $companyId)->where('frequency', $data['frequency'])->whereIn('status', ['draft', 'approved', 'paid'])->where('period_from', '<=', $data['period_to'])->where('period_to', '>=', $data['period_from'])->exists()) return back()->withErrors(['period_from' => 'The payroll period overlaps an existing non-cancelled run.'])->withInput();
+        if (HrPayRun::where('company_id', $companyId)->where('frequency', $data['frequency'])->whereIn('status', ['draft', 'approved', 'paid', 'settlement_reversed'])->where('period_from', '<=', $data['period_to'])->where('period_to', '>=', $data['period_from'])->exists()) return back()->withErrors(['period_from' => 'The payroll period overlaps an existing non-cancelled run.'])->withInput();
         $run = HrPayRun::create($data + ['company_id' => $companyId, 'status' => 'draft', 'created_by' => auth()->id()]);
         app(HrPayrollService::class)->generate($run);
         app(AuditService::class)->record('hr_pay_run.created', $run, null, $run->toArray());
@@ -152,5 +152,15 @@ class HrEmployeeController extends Controller
         }
         app(AuditService::class)->record('hr_pay_run.paid', $run, $old, $run->toArray());
         return back()->with(['message' => 'Pay run settled.', 'alert-type' => 'success']);
+    }
+
+    public function reversePayRun(Request $request, int $id)
+    {
+        $run = HrPayRun::where('company_id', auth()->user()?->company_id)->findOrFail($id);
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        try { $run = app(HrPayrollSettlementService::class)->reverse($run, $data['reason']); }
+        catch (\RuntimeException $exception) { return back()->withErrors(['pay_run' => $exception->getMessage()]); }
+        app(AuditService::class)->record('hr_pay_run.settlement_reversed', $run, ['status' => 'paid'], $run->toArray() + ['reason' => $data['reason']]);
+        return back()->with(['message' => 'Payroll settlement reversed.', 'alert-type' => 'success']);
     }
 }

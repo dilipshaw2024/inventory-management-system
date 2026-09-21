@@ -52,6 +52,19 @@ class CustomerRefundController extends Controller
         } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
     }
 
+    public function settle(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['settlement_reference' => ['required', 'string', 'max:150']]);
+        try {
+            $refund = $this->companyScope(CustomerRefund::query())->findOrFail($id);
+            $alreadySettled = $refund->settlement_status === 'settled';
+            $settled = app(CustomerRefundService::class)->settle($refund, $data['settlement_reference']);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $settled, 'status' => 'settled', 'idempotent' => $alreadySettled]);
+    }
+
     private function companyScope($query)
     {
         $companyId = auth()->user()?->company_id;

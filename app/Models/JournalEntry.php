@@ -30,7 +30,7 @@ class JournalEntry extends Model
             if (in_array((string) $entry->getRawOriginal('status'), ['posted', 'reversed'], true)) throw new LogicException('Posted or reversed journals cannot be deleted.');
         });
     }
-    protected $casts = ['date' => 'date', 'posted_at' => 'datetime', 'reversed_at' => 'datetime'];
+    protected $casts = ['date' => 'date', 'posted_at' => 'datetime', 'reversed_at' => 'datetime', 'consolidation_elimination' => 'boolean'];
     public function company() { return $this->belongsTo(Company::class); }
     public function lines() { return $this->hasMany(JournalLine::class); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }

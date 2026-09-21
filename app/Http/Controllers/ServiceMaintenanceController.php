@@ -13,6 +13,7 @@ use App\Models\ServiceTechnician;
 use App\Models\ServiceMaintenanceSchedule;
 use App\Models\WarrantyClaim;
 use App\Models\AssetSparePart;
+use App\Models\Supplier;
 use App\Models\ServiceContract;
 use App\Services\InventoryLedgerService;
 use App\Services\AuditService;
@@ -56,15 +57,17 @@ class ServiceMaintenanceController extends Controller
 
     public function warrantyClaims()
     {
-        $claims = WarrantyClaim::with(['asset', 'customer', 'product'])->latest()->paginate(25);
-        $assets = ServiceAsset::where('status', '!=', 'retired')->orderBy('name')->get();
-        return view('admin.erp.warranty_claims', compact('claims', 'assets'));
+        $companyId = auth()->user()?->company_id;
+        $claims = WarrantyClaim::where('company_id', $companyId)->with(['asset', 'customer', 'supplier', 'product', 'contract', 'settler', 'journalEntry'])->latest()->paginate(25);
+        $assets = ServiceAsset::where('company_id', $companyId)->where('status', '!=', 'retired')->orderBy('name')->get();
+        $suppliers = Supplier::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->where('is_active', true)->orderBy('name')->get(['id', 'name']);
+        return view('admin.erp.warranty_claims', compact('claims', 'assets', 'suppliers'));
     }
 
     public function warrantyClaim(Request $request)
     {
-        $data = $request->validate(['claim_no' => ['nullable', 'string', 'max:80', $this->companyUnique('warranty_claims', 'claim_no')], 'asset_id' => ['required', $this->companyExists('service_assets')], 'received_at' => ['required', 'date'], 'issue' => ['required', 'string', 'max:3000']]);
-        $asset = ServiceAsset::with('product')->findOrFail($data['asset_id']);
+        $data = $request->validate(['claim_no' => ['nullable', 'string', 'max:80', $this->companyUnique('warranty_claims', 'claim_no')], 'asset_id' => ['required', $this->companyExists('service_assets')], 'supplier_id' => ['nullable', $this->companyExists('suppliers')], 'received_at' => ['required', 'date'], 'issue' => ['required', 'string', 'max:3000']]);
+        $asset = ServiceAsset::where('company_id', auth()->user()?->company_id)->with('product')->findOrFail($data['asset_id']);
         $data['coverage_status'] = !$asset->warranty_until ? 'unknown' : ($asset->warranty_until->isBefore($data['received_at']) ? 'expired' : 'in_warranty');
         if ($data['coverage_status'] === 'expired') $data['decision_notes'] = 'Submitted after recorded warranty expiry; review required.';
         $claim = WarrantyClaim::create($data + ['company_id' => auth()->user()?->company_id, 'claim_no' => $data['claim_no'] ?: app(NumberingSequenceService::class)->nextOrFallback('warranty_claim', 'WC-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'customer_id' => $asset->customer_id, 'product_id' => $asset->product_id, 'created_by' => auth()->id()]);
@@ -72,18 +75,70 @@ class ServiceMaintenanceController extends Controller
         return back()->with(['message' => 'Warranty claim submitted.', 'alert-type' => 'success']);
     }
 
+    public function settleWarrantyClaim(Request $request, int $id)
+    {
+        $companyId = auth()->user()?->company_id;
+        $data = $request->validate(['settlement_reference' => ['required', 'string', 'max:150'], 'settlement_amount' => ['required', 'numeric', 'min:0'], 'settlement_currency' => ['required', 'string', 'size:3'], 'accounting_mode' => ['nullable', 'in:none,customer_reimbursement,vendor_recovery'], 'settlement_notes' => ['nullable', 'string', 'max:2000']]);
+        try {
+            DB::transaction(function () use ($companyId, $id, $data): void {
+                $claim = WarrantyClaim::where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+                if ($claim->settlement_status === 'settled') {
+                    if ($claim->settlement_reference === $data['settlement_reference']) return;
+                    throw new \RuntimeException('This warranty claim has already been settled.');
+                }
+                if (WarrantyClaim::withoutGlobalScopes()->where('company_id', $companyId)->where('settlement_reference', $data['settlement_reference'])->where('id', '<>', $claim->id)->exists()) throw new \RuntimeException('The settlement reference is already used by another warranty claim.');
+                if (!in_array($claim->status, ['approved', 'resolved'], true) || $claim->covered !== true) throw new \RuntimeException('Only an approved covered warranty claim can be settled.');
+                if (($data['accounting_mode'] ?? 'none') === 'vendor_recovery' && !$claim->supplier_id) throw new \RuntimeException('A supplier must be linked before vendor-recovery accounting can be posted.');
+                $before = $claim->only(['settlement_status', 'settlement_reference', 'settlement_amount', 'settlement_currency', 'settled_at', 'settled_by']);
+                $claim->update(['settlement_status' => 'settled', 'settlement_reference' => $data['settlement_reference'], 'settlement_amount' => $data['settlement_amount'], 'settlement_currency' => strtoupper($data['settlement_currency']), 'settled_at' => now(), 'settled_by' => auth()->id(), 'decision_notes' => trim(($claim->decision_notes ? $claim->decision_notes.' ' : '').($data['settlement_notes'] ?? ''))]);
+                $accounting = app(\App\Services\WarrantyClaimAccountingService::class)->post($claim->fresh(), $data['accounting_mode'] ?? 'none');
+                $claim->update(['accounting_status' => $accounting['status'], 'accounting_mode' => $data['accounting_mode'] ?? 'none', 'journal_entry_id' => $accounting['journal_entry_id']]);
+                app(AuditService::class)->record('warranty_claim.settled', $claim, $before, $claim->fresh()->only(['settlement_status', 'settlement_reference', 'settlement_amount', 'settlement_currency', 'settled_at', 'settled_by']));
+            });
+        } catch (\RuntimeException $exception) {
+            return back()->withInput()->withErrors(['settlement' => $exception->getMessage()]);
+        }
+        return back()->with(['message' => 'Warranty claim settled.', 'alert-type' => 'success']);
+    }
+
+    public function warrantyClaimDecision(Request $request, int $id)
+    {
+        $companyId = auth()->user()?->company_id;
+        $data = $request->validate(['status' => ['required', 'in:under_review,approved,rejected,resolved'], 'covered' => ['nullable', 'boolean'], 'decision_notes' => ['nullable', 'string', 'max:3000']]);
+        try {
+            DB::transaction(function () use ($companyId, $id, $data): void {
+                $claim = WarrantyClaim::where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+                if ($claim->settlement_status === 'settled') throw new \RuntimeException('Settled warranty claims cannot be changed.');
+                if (in_array($claim->status, ['resolved', 'rejected'], true)) throw new \RuntimeException('Closed warranty claims cannot be changed.');
+                if ($data['status'] === 'rejected' && empty($data['decision_notes'])) throw new \RuntimeException('Decision notes are required when rejecting a claim.');
+                if (in_array($data['status'], ['approved', 'rejected'], true) && (!array_key_exists('covered', $data) || $data['covered'] === null)) throw new \RuntimeException('A coverage decision is required.');
+                $before = $claim->only(['status', 'covered', 'decision_notes', 'resolved_at']);
+                $updates = $data;
+                if (array_key_exists('covered', $updates) && $updates['covered'] === null) unset($updates['covered']);
+                if ($data['status'] === 'resolved') $updates['resolved_at'] = now();
+                $claim->update($updates);
+                app(AuditService::class)->record('warranty_claim.updated', $claim, $before, $claim->fresh()->only(['status', 'covered', 'decision_notes', 'resolved_at']));
+            });
+        } catch (\RuntimeException $exception) {
+            return back()->withErrors(['status' => $exception->getMessage()]);
+        }
+        return back()->with(['message' => 'Warranty claim decision saved.', 'alert-type' => 'success']);
+    }
+
     public function spareParts(int $id)
     {
-        $asset = ServiceAsset::with(['spareParts.product'])->findOrFail($id);
+        $asset = ServiceAsset::with(['spareParts.product', 'spareParts.supplier'])->findOrFail($id);
         $products = Product::where('status', 1)->where(function ($query): void { $query->where('is_stock_item', true)->orWhereNull('is_stock_item'); })->orderBy('name')->get();
-        return view('admin.erp.asset_spare_parts', compact('asset', 'products'));
+        $suppliers = Supplier::where('is_active', true)->orderBy('name')->get(['id', 'name']);
+        return view('admin.erp.asset_spare_parts', compact('asset', 'products', 'suppliers'));
     }
 
     public function storeSparePart(Request $request, int $id)
     {
-        $data = $request->validate(['product_id' => ['required', $this->companyExists('products')], 'quantity_per_service' => ['required', 'numeric', 'gt:0'], 'minimum_stock' => ['nullable', 'numeric', 'min:0'], 'maximum_stock' => ['nullable', 'numeric', 'gte:minimum_stock'], 'notes' => ['nullable', 'string', 'max:255']]);
+        $data = $request->validate(['product_id' => ['required', $this->companyExists('products')], 'quantity_per_service' => ['required', 'numeric', 'gt:0'], 'minimum_stock' => ['nullable', 'numeric', 'min:0'], 'maximum_stock' => ['nullable', 'numeric', 'gte:minimum_stock'], 'supplier_id' => ['nullable', $this->companyExists('suppliers')], 'supplier_part_no' => ['nullable', 'string', 'max:100'], 'lead_time_days' => ['nullable', 'integer', 'min:0'], 'supplier_unit_cost' => ['nullable', 'numeric', 'min:0'], 'supplier_currency' => ['nullable', 'string', 'size:3'], 'preferred_supplier' => ['sometimes', 'boolean'], 'notes' => ['nullable', 'string', 'max:255']]);
         $asset = ServiceAsset::findOrFail($id);
         app(ProductLifecycleService::class)->assertStockManaged(Product::findOrFail($data['product_id']));
+        if (!empty($data['supplier_id']) && !Supplier::whereKey($data['supplier_id'])->where('is_active', true)->exists()) return back()->withInput()->with(['message' => 'The selected supplier is not active or authorized.', 'alert-type' => 'error']);
         $part = AssetSparePart::updateOrCreate(['asset_id' => $asset->id, 'product_id' => $data['product_id']], $data + ['company_id' => auth()->user()?->company_id]);
         app(AuditService::class)->record('asset_spare_part.updated', $part, null, $part->toArray());
         return back()->with(['message' => 'Asset spare part saved.', 'alert-type' => 'success']);
@@ -205,10 +260,13 @@ class ServiceMaintenanceController extends Controller
             'outcome' => ['nullable', 'string', 'max:3000'],
         ]);
         try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
             DB::transaction(function () use ($data, $id): void {
                 $order = MaintenanceOrder::with(['asset', 'serviceRequest'])->lockForUpdate()->findOrFail($id);
                 $oldStatus = $order->status;
                 if (in_array($oldStatus, ['completed', 'cancelled'], true)) throw new \RuntimeException('A closed maintenance order cannot be changed.');
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
                 if ($data['status'] === 'completed' && !$data['outcome']) throw new \RuntimeException('An outcome is required when completing maintenance.');
                 if ($data['status'] === 'in_progress' && $oldStatus !== 'planned') throw new \RuntimeException('Only planned maintenance orders can be started.');
                 if ($data['status'] === 'completed' && !in_array($oldStatus, ['planned', 'in_progress'], true)) throw new \RuntimeException('Only planned or in-progress orders can be completed.');
@@ -227,6 +285,27 @@ class ServiceMaintenanceController extends Controller
         return back()->with(['message' => 'Maintenance order status updated.', 'alert-type' => 'success']);
     }
 
+    public function reservePart(Request $request, int $id)
+    {
+        $companyId = auth()->user()?->company_id;
+        $data = $request->validate([
+            'product_id' => ['required', $this->companyExists('products')], 'quantity' => ['required', 'numeric', 'gt:0'],
+            'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)], 'batch_id' => ['nullable', 'integer'],
+        ]);
+        try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
+            DB::transaction(function () use ($data, $id): void {
+                $order = MaintenanceOrder::lockForUpdate()->findOrFail($id);
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
+                $product = Product::lockForUpdate()->findOrFail($data['product_id']);
+                app(\App\Services\StockReservationService::class)->reserveMaintenancePart($order, $product, (float) $data['quantity'], $data['location_id'] ?? null, $data['batch_id'] ?? null);
+                app(AuditService::class)->record('maintenance_part.reserved', $order, null, ['product_id' => $product->id, 'quantity' => (float) $data['quantity'], 'location_id' => $data['location_id'] ?? null, 'batch_id' => $data['batch_id'] ?? null]);
+            });
+        } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
+        return back()->with(['message' => 'Spare part reserved for this maintenance order.', 'alert-type' => 'success']);
+    }
+
     public function consumePart(Request $request, int $id)
     {
         $companyId = auth()->user()?->company_id;
@@ -236,8 +315,11 @@ class ServiceMaintenanceController extends Controller
             'batch_id' => ['nullable', 'integer'], 'serial_numbers' => ['nullable', 'string', 'max:5000'],
         ]);
         try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
             DB::transaction(function () use ($data, $id): void {
                 $order = MaintenanceOrder::findOrFail($id); $product = Product::lockForUpdate()->findOrFail($data['product_id']); $quantity = (float) $data['quantity'];
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
                 app(MaintenancePartConsumptionService::class)->consume($order, $product, $quantity, isset($data['unit_cost']) ? (float) $data['unit_cost'] : null, $data['location_id'] ?? null, $data['batch_id'] ?? null, !empty($data['serial_numbers']) ? preg_split('/[,\\r\\n]+/', $data['serial_numbers']) : []);
                 app(AuditService::class)->record('maintenance_part.consumed', $order, null, ['product_id' => $product->id, 'quantity' => $quantity]);
             });

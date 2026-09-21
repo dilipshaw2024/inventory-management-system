@@ -60,6 +60,10 @@ class ThreeWayMatchingTest extends TestCase
         app(PurchaseInvoiceService::class)->approve($invoice->fresh('lines'));
 
         $this->assertDatabaseHas('purchase_invoices', ['id' => $invoice->id, 'status' => 'approved']);
+        $token = $user->createToken('variance-feed', ['purchasing:read'])->plainTextToken;
+        $this->withToken($token)->getJson('/api/integration/purchase-price-variances?supplier_id='.$supplier->id)
+            ->assertOk()->assertJsonPath('summary.line_count', 1)->assertJsonPath('data.0.baseline_source', 'approved_receipt')
+            ->assertJsonPath('data.0.variance_percent', 0)->assertJsonPath('data.0.reconciliation_status', 'within_tolerance');
     }
 
     public function test_invoice_rejects_receipt_from_another_purchase_order(): void
@@ -113,6 +117,37 @@ class ThreeWayMatchingTest extends TestCase
         $this->assertDatabaseHas('goods_receipts', ['id' => $receiptId, 'discrepancy_status' => 'accepted', 'discrepancy_resolved_by' => $checker->id]);
         $this->assertDatabaseHas('purchase_orders', ['id' => $order->id, 'status' => 'received', 'receiving_closed' => true]);
         $this->postJson('/api/integration/goods-receipts', ['purchase_order_id' => $order->id, 'date' => now()->toDateString(), 'lines' => [['purchase_order_line_id' => $order->lines()->first()->id, 'quantity' => 1, 'unit_cost' => 5]]])->assertStatus(422);
+    }
+
+    public function test_over_receipt_requires_tolerance_reason_and_matching_resolution(): void
+    {
+        $company = Company::create(['name' => 'Over Receipt Co', 'code' => 'OVER-RECEIPT']);
+        $creator = User::factory()->create(['company_id' => $company->id]);
+        $checker = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Over Receipt Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Over Receipt Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Over Receipt Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Over-delivered item', 'quantity' => 0, 'status' => 1]);
+        $order = PurchaseOrder::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'po_no' => 'PO-OVER-RECEIPT', 'date' => now()->toDateString(), 'status' => 'approved']);
+        $line = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 10, 'received_qty' => 0, 'unit_price' => 5]);
+        Sanctum::actingAs($creator, ['purchasing:write']);
+
+        $payload = ['purchase_order_id' => $order->id, 'date' => now()->toDateString(), 'lines' => [['purchase_order_line_id' => $line->id, 'quantity' => 11, 'unit_cost' => 5]]];
+        $this->postJson('/api/integration/goods-receipts', $payload)->assertStatus(422);
+
+        app(ErpSettingService::class)->put('purchase_over_receipt_tolerance_percent', 10, 'float', $company->id);
+        $payload['over_receipt_reason'] = 'Supplier shipped one additional unit under the approved tolerance.';
+        $created = $this->postJson('/api/integration/goods-receipts', $payload)->assertCreated();
+        $receiptId = (int) $created->json('data.id');
+
+        Sanctum::actingAs($checker, ['purchasing:read', 'purchasing:write']);
+        $this->postJson('/api/integration/goods-receipts/'.$receiptId.'/approve')->assertOk()->assertJsonPath('data.discrepancy_status', 'open')->assertJsonPath('data.discrepancy_type', 'overage');
+        $this->assertDatabaseHas('goods_receipts', ['id' => $receiptId, 'discrepancy_reason' => $payload['over_receipt_reason'], 'discrepancy_type' => 'overage']);
+        $this->assertDatabaseHas('purchase_orders', ['id' => $order->id, 'status' => 'partially_received', 'receiving_closed' => false]);
+        $this->postJson('/api/integration/goods-receipts', $payload)->assertStatus(422);
+        $this->postJson('/api/integration/goods-receipts/'.$receiptId.'/resolve-discrepancy', ['resolution' => 'accept_shortage', 'resolution_reason' => 'Incorrect resolution type.'])->assertStatus(422);
+        $this->postJson('/api/integration/goods-receipts/'.$receiptId.'/resolve-discrepancy', ['resolution' => 'accept_overage', 'resolution_reason' => 'Additional unit accepted.'])->assertOk()->assertJsonPath('data.discrepancy_status', 'accepted');
+        $this->assertDatabaseHas('purchase_orders', ['id' => $order->id, 'status' => 'received', 'receiving_closed' => true]);
     }
 
     public function test_pending_receipt_can_be_rejected_through_integration_api(): void

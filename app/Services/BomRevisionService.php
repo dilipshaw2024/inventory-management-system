@@ -7,6 +7,13 @@ use Carbon\Carbon;
 
 class BomRevisionService
 {
+    public function assertApproved(BillOfMaterial $bom): void
+    {
+        if (($bom->approval_status ?? 'approved') !== 'approved') {
+            throw new \RuntimeException('The selected BOM revision must be approved before it can be used for production.');
+        }
+    }
+
     public function assertNoActiveOverlap(int $productId, ?string $effectiveFrom, ?string $effectiveUntil, ?int $companyId, ?int $ignoreId = null): void
     {
         $start = $effectiveFrom ? Carbon::parse($effectiveFrom)->toDateString() : '0001-01-01';

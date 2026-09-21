@@ -7,20 +7,25 @@ use App\Models\Supplier;
 use App\Models\PurchaseInvoice;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 class SupplierPerformanceController extends Controller
 {
     public function index(Request $request)
     {
-        $filters = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'supplier_id' => ['nullable', 'integer']]);
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for supplier performance.');
+        $filters = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))]]);
         $performance = $this->performanceRows($filters['from'] ?? null, $filters['to'] ?? null, $filters['supplier_id'] ?? null);
-        $suppliers = Supplier::where('status', 1)->orderBy('name')->get();
+        $suppliers = Supplier::where('status', 1)->where('company_id', $companyId)->orderBy('name')->get();
         return view('backend.purchase.supplier_performance', compact('performance', 'suppliers', 'filters'));
     }
 
     public function export(Request $request): StreamedResponse
     {
-        $filters = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'supplier_id' => ['nullable', 'integer']]);
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for supplier performance.');
+        $filters = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))]]);
         $performance = $this->performanceRows($filters['from'] ?? null, $filters['to'] ?? null, $filters['supplier_id'] ?? null);
         return response()->streamDownload(function () use ($performance): void {
             $output = fopen('php://output', 'w');
@@ -34,14 +39,16 @@ class SupplierPerformanceController extends Controller
 
     private function performanceRows(?string $from = null, ?string $to = null, ?int $supplierId = null)
     {
+        $companyId = auth()->user()?->company_id;
         $from ??= now()->subYear()->toDateString();
         $to ??= now()->toDateString();
-        $suppliers = Supplier::where('status', 1)->when($supplierId, fn ($query, $id) => $query->whereKey($id))->orderBy('name')->get();
+        $suppliers = Supplier::where('status', 1)->where('company_id', $companyId)->when($supplierId, fn ($query, $id) => $query->whereKey($id))->orderBy('name')->get();
         $orders = PurchaseOrder::with(['supplier', 'lines', 'receipts.lines', 'receipts.purchaseOrder'])
             ->whereIn('status', ['approved', 'partially_received', 'received'])
+            ->where('company_id', $companyId)
             ->whereBetween('date', [$from, $to])
             ->get();
-        $invoices = PurchaseInvoice::with('lines')->where('status', 'approved')->whereIn('purchase_order_id', $orders->pluck('id'))->get()->groupBy('purchase_order_id');
+        $invoices = PurchaseInvoice::with('lines')->where('company_id', $companyId)->where('status', 'approved')->whereIn('purchase_order_id', $orders->pluck('id'))->get()->groupBy('purchase_order_id');
         $performance = $suppliers->map(function (Supplier $supplier) use ($orders, $invoices): array {
             $supplierOrders = $orders->where('supplier_id', $supplier->id);
             $ordered = (float) $supplierOrders->sum(fn ($order) => $order->lines->sum('ordered_qty'));

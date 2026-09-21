@@ -7,6 +7,7 @@ use App\Models\Currency;
 use App\Models\ExchangeRate;
 use App\Models\TaxRate;
 use App\Models\FiscalYear;
+use App\Models\FiscalPeriod;
 use App\Models\InvoiceDetail;
 use App\Models\PurchaseInvoiceLine;
 use App\Models\InventoryReturn;
@@ -15,9 +16,11 @@ use App\Models\JournalLine;
 use App\Models\ChartOfAccount;
 use App\Models\TaxSettlement;
 use App\Models\TaxFiling;
+use App\Models\ProductClassification;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
 use App\Services\FinancialReportingService;
+use App\Services\ConsolidatedReportingService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -53,6 +56,30 @@ class FinanceIntegrationController extends Controller
         return response()->json(['data' => ['profit_and_loss' => $report['profit_and_loss'], 'balance_sheet' => $report['balance_sheet']], 'summary' => $report['summary'], 'meta' => ['from' => $from, 'to' => $to, 'accounts' => $report['profit_and_loss']->count() + $report['balance_sheet']->count()]]);
     }
 
+    public function consolidatedTrialBalance(Request $request, ConsolidatedReportingService $service): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for consolidated reporting.');
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'reporting_currency' => ['nullable', 'string', 'size:3']]);
+        $from = $data['from'] ?? now()->startOfMonth()->toDateString();
+        $to = $data['to'] ?? now()->toDateString();
+        try { $report = $service->trialBalance((int) $companyId, $from, $to, $data['reporting_currency'] ?? null); }
+        catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+        return response()->json(['data' => $report['rows'], 'summary' => $report['summary'], 'meta' => ['from' => $from, 'to' => $to, 'reporting_currency' => $report['reporting_currency'], 'companies' => $report['companies']->map(fn ($company): array => ['id' => $company->id, 'name' => $company->name, 'base_currency' => $company->base_currency])->values(), 'exchange_rates' => $report['rates'], 'intercompany_eliminations' => $this->eliminationStatus($report), 'elimination_journal_count' => $report['elimination_journal_count'], 'automatic_elimination_journal_count' => $report['automatic_elimination_journal_count']]]);
+    }
+
+    public function consolidatedFinancialStatements(Request $request, ConsolidatedReportingService $service): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for consolidated reporting.');
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'reporting_currency' => ['nullable', 'string', 'size:3']]);
+        $from = $data['from'] ?? now()->startOfMonth()->toDateString();
+        $to = $data['to'] ?? now()->toDateString();
+        try { $report = $service->financialStatements((int) $companyId, $from, $to, $data['reporting_currency'] ?? null); }
+        catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+        return response()->json(['data' => ['profit_and_loss' => $report['profit_and_loss'], 'balance_sheet' => $report['balance_sheet']], 'summary' => $report['statement_summary'], 'meta' => ['from' => $from, 'to' => $to, 'reporting_currency' => $report['reporting_currency'], 'companies' => $report['companies']->map(fn ($company): array => ['id' => $company->id, 'name' => $company->name, 'base_currency' => $company->base_currency])->values(), 'exchange_rates' => $report['rates'], 'intercompany_eliminations' => $this->eliminationStatus($report), 'elimination_journal_count' => $report['elimination_journal_count'], 'automatic_elimination_journal_count' => $report['automatic_elimination_journal_count']]]);
+    }
+
     public function cashFlow(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -67,12 +94,13 @@ class FinanceIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for tax reporting.');
-        $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100']]);
+        $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'classification_id' => ['nullable', 'integer', Rule::exists('product_classifications', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))]]);
         $from = $data['from']; $to = $data['to']; $jurisdiction = $data['jurisdiction'] ?? null;
-        $taxKey = static fn (float $rate, ?string $jurisdiction): string => number_format($rate, 4, '.', '').'|'.($jurisdiction ?: 'UNSPECIFIED');
-        $sales = InvoiceDetail::with('invoice')->whereHas('invoice', fn ($query) => $query->whereIn('status', [1, 'approved'])->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction));
-        $returns = InventoryReturn::with('lines.product')->where('return_type', 'sales')->where('status', 'approved')->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($query) => $query->where('tax_jurisdiction', $jurisdiction))->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->get()->flatMap(fn (InventoryReturn $return) => $return->lines->map(fn ($line): array => ['return' => $return, 'line' => $line]))->groupBy(fn (array $item): string => $taxKey((float) ($item['line']->tax_rate ?? 0), $item['return']->tax_jurisdiction));
-        $purchases = PurchaseInvoiceLine::with('invoice')->whereHas('invoice', fn ($query) => $query->where('status', 'approved')->whereBetween('invoice_date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction));
+        $classificationId = isset($data['classification_id']) ? (int) $data['classification_id'] : null;
+        $taxKey = static fn (float $rate, ?string $jurisdiction, $classification): string => number_format($rate, 4, '.', '').'|'.($jurisdiction ?: 'UNSPECIFIED').'|'.($classification ? $classification->scheme.':'.$classification->code : 'UNCLASSIFIED');
+        $sales = InvoiceDetail::with(['invoice', 'product.classification'])->whereHas('invoice', fn ($query) => $query->whereIn('status', [1, 'approved'])->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->when($classificationId, fn ($query) => $query->whereHas('product', fn ($product) => $product->where('classification_id', $classificationId)))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction, $line->product?->classification));
+        $returns = InventoryReturn::with('lines.product.classification')->where('return_type', 'sales')->where('status', 'approved')->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($query) => $query->where('tax_jurisdiction', $jurisdiction))->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->get()->flatMap(fn (InventoryReturn $return) => $return->lines->map(fn ($line): array => ['return' => $return, 'line' => $line]))->filter(fn (array $item): bool => !$classificationId || (int) ($item['line']->product?->classification_id ?? 0) === (int) $classificationId)->groupBy(fn (array $item): string => $taxKey((float) ($item['line']->tax_rate ?? 0), $item['return']->tax_jurisdiction, $item['line']->product?->classification));
+        $purchases = PurchaseInvoiceLine::with(['invoice', 'product.classification'])->whereHas('invoice', fn ($query) => $query->where('status', 'approved')->whereBetween('invoice_date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->when($classificationId, fn ($query) => $query->whereHas('product', fn ($product) => $product->where('classification_id', $classificationId)))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction, $line->product?->classification));
         $rates = $sales->keys()->merge($returns->keys())->merge($purchases->keys())->unique()->sort()->values();
         $rows = $rates->map(function ($rate) use ($sales, $returns, $purchases): array {
             $sale = $sales->get($rate, collect()); $return = $returns->get($rate, collect()); $purchase = $purchases->get($rate, collect());
@@ -82,10 +110,12 @@ class FinanceIntegrationController extends Controller
             $salesTax = (float) $sale->sum('tax_amount') - $returnTax;
             $purchaseTaxable = (float) $purchase->sum(fn ($line): float => (float) $line->quantity * (float) $line->unit_price - ($line->invoice?->tax_mode === 'inclusive' ? (float) ($line->tax_amount ?? 0) : 0));
             $purchaseTax = (float) $purchase->sum('tax_amount');
-            [$rateValue, $jurisdiction] = explode('|', $rate, 2);
-            return ['rate' => (float) $rateValue, 'jurisdiction' => $jurisdiction === 'UNSPECIFIED' ? null : $jurisdiction, 'sales' => ['taxable' => $salesTaxable, 'tax' => $salesTax, 'documents' => $sale->pluck('invoice_id')->unique()->count(), 'return_documents' => $return->pluck('return.id')->unique()->count()], 'purchases' => ['taxable' => $purchaseTaxable, 'tax' => $purchaseTax, 'documents' => $purchase->pluck('purchase_invoice_id')->unique()->count()], 'net_tax' => $salesTax - $purchaseTax];
+            [$rateValue, $jurisdiction] = explode('|', $rate, 3);
+            $returnClassification = $return->isNotEmpty() ? $return->first()['line']->product?->classification : null;
+            $classification = $sale->first()?->product?->classification ?: $purchase->first()?->product?->classification ?: $returnClassification;
+            return ['rate' => (float) $rateValue, 'jurisdiction' => $jurisdiction === 'UNSPECIFIED' ? null : $jurisdiction, 'classification' => $classification ? ['id' => $classification->id, 'scheme' => $classification->scheme, 'code' => $classification->code, 'jurisdiction' => $classification->jurisdiction] : null, 'sales' => ['taxable' => $salesTaxable, 'tax' => $salesTax, 'documents' => $sale->pluck('invoice_id')->unique()->count(), 'return_documents' => $return->pluck('return.id')->unique()->count()], 'purchases' => ['taxable' => $purchaseTaxable, 'tax' => $purchaseTax, 'documents' => $purchase->pluck('purchase_invoice_id')->unique()->count()], 'net_tax' => $salesTax - $purchaseTax];
         })->values();
-        return response()->json(['data' => $rows, 'summary' => ['sales_tax' => (float) $rows->sum('sales.tax'), 'purchase_tax' => (float) $rows->sum('purchases.tax'), 'net_tax' => (float) $rows->sum('net_tax'), 'sales_documents' => (int) $rows->sum('sales.documents'), 'return_documents' => (int) $rows->sum('sales.return_documents'), 'purchase_documents' => (int) $rows->sum('purchases.documents')], 'meta' => ['from' => $from, 'to' => $to, 'jurisdiction' => $jurisdiction, 'rates' => $rows->count()]]);
+        return response()->json(['data' => $rows, 'summary' => ['sales_tax' => (float) $rows->sum('sales.tax'), 'purchase_tax' => (float) $rows->sum('purchases.tax'), 'net_tax' => (float) $rows->sum('net_tax'), 'sales_documents' => (int) $rows->sum('sales.documents'), 'return_documents' => (int) $rows->sum('sales.return_documents'), 'purchase_documents' => (int) $rows->sum('purchases.documents')], 'meta' => ['from' => $from, 'to' => $to, 'jurisdiction' => $jurisdiction, 'classification_id' => $classificationId, 'rates' => $rows->count()]]);
     }
 
     public function taxReconciliation(Request $request): JsonResponse
@@ -144,6 +174,32 @@ class FinanceIntegrationController extends Controller
         $filing = TaxFiling::where('company_id', $request->user()?->company_id)->findOrFail($id);
         $verified = app(\App\Services\TaxFilingService::class)->verifySnapshot($filing);
         return response()->json(['data' => ['id' => $filing->id, 'snapshot_hash' => $filing->snapshot_hash, 'verified' => $verified], 'status' => $verified ? 'verified' : 'tampered']);
+    }
+
+    public function exportTaxFiling(Request $request, int $id)
+    {
+        $filing = TaxFiling::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $format = $request->validate(['format' => ['nullable', 'in:json,csv']])['format'] ?? 'json';
+        $service = app(\App\Services\TaxFilingService::class);
+        abort_unless($service->verifySnapshot($filing), 409, 'Tax filing snapshot integrity verification failed.');
+        $snapshot = $filing->snapshot_payload;
+        $package = [
+            'filing' => $filing->only(['id', 'filing_no', 'external_reference', 'period_from', 'period_to', 'jurisdiction', 'return_type', 'status', 'snapshot_hash']),
+            'snapshot' => $snapshot,
+            'integrity' => ['algorithm' => 'sha256', 'verified' => true],
+        ];
+        if ($format === 'json') return response()->json(['data' => $package, 'status' => 'exported']);
+        $rows = $snapshot['report']['data'] ?? [];
+        $summary = $snapshot['report']['summary'] ?? [];
+        return response()->streamDownload(function () use ($rows, $summary, $filing): void {
+            $handle = fopen('php://output', 'w');
+            fputcsv($handle, ['filing_no', 'period_from', 'period_to', 'jurisdiction', 'rate', 'classification_scheme', 'classification_code', 'sales_taxable', 'sales_tax', 'purchase_taxable', 'purchase_tax', 'net_tax']);
+            foreach ($rows as $row) {
+                fputcsv($handle, [$filing->filing_no, $filing->period_from?->toDateString(), $filing->period_to?->toDateString(), $row['jurisdiction'] ?? $filing->jurisdiction, $row['rate'] ?? null, $row['classification']['scheme'] ?? null, $row['classification']['code'] ?? null, $row['sales']['taxable'] ?? 0, $row['sales']['tax'] ?? 0, $row['purchases']['taxable'] ?? 0, $row['purchases']['tax'] ?? 0, $row['net_tax'] ?? 0]);
+            }
+            fputcsv($handle, ['SUMMARY', '', '', '', '', '', '', '', $summary['sales_tax'] ?? 0, '', $summary['purchase_tax'] ?? 0, $summary['net_tax'] ?? 0]);
+            fclose($handle);
+        }, $filing->filing_no.'.csv', ['Content-Type' => 'text/csv; charset=UTF-8']);
     }
 
     public function submitTaxFiling(Request $request, int $id): JsonResponse
@@ -231,6 +287,7 @@ class FinanceIntegrationController extends Controller
                 ];
                 $pending = collect($checks)->mapWithKeys(fn (array $check): array => [$check[2] => $this->companyScope($check[0]::query(), $year->company_id)->where('status', $check[1])->count()])->filter(fn (int $count): bool => $count > 0);
                 if ($pending->isNotEmpty()) throw new \RuntimeException('Close checklist failed: '.$pending->map(fn (int $count, string $label): string => $count.' '.$label)->implode('; ').'.');
+                app(\App\Services\FiscalPeriodService::class)->assertBankReconciliationsClosed((int) $year->company_id, $year->ends_on->toDateString());
                 $snapshot = app(\App\Services\InventorySnapshotService::class)->capture((int) $year->company_id, $year->ends_on, auth()->id());
                 if ($snapshot->status === 'variance') throw new \RuntimeException('Close checklist failed: inventory snapshot #'.$snapshot->id.' contains negative-balance variances. Resolve the inventory reconciliation before closing.');
                 $before = $year->only(['status', 'closed_at', 'closed_by', 'inventory_snapshot_id']);
@@ -252,6 +309,99 @@ class FinanceIntegrationController extends Controller
         $year->update(['status' => 'open', 'closed_at' => null, 'closed_by' => null]);
         app(AuditService::class)->record('fiscal_year.reopened', $year, $before, $year->toArray() + ['reopen_reason' => $data['reopen_reason']]);
         return response()->json(['data' => $year->fresh(), 'status' => $year->status]);
+    }
+
+    public function fiscalPeriods(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for fiscal periods.');
+        $data = $request->validate(['fiscal_year_id' => ['nullable', 'integer'], 'status' => ['nullable', 'in:open,closed'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $periods = FiscalPeriod::with('fiscalYear')->where('company_id', $companyId)
+            ->when($data['fiscal_year_id'] ?? null, fn ($query, $id) => $query->where('fiscal_year_id', $id))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($periods, $request, 'accounting.fiscal-periods', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeFiscalPeriod(Request $request): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for fiscal periods.');
+        $data = $request->validate([
+            'fiscal_year_id' => ['required', 'integer', Rule::exists('fiscal_years', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('status', 'open'))],
+            'name' => ['required', 'string', 'max:100'],
+            'starts_on' => ['required', 'date'],
+            'ends_on' => ['required', 'date', 'after_or_equal:starts_on'],
+        ]);
+        $year = FiscalYear::where('company_id', $companyId)->whereKey($data['fiscal_year_id'])->firstOrFail();
+        if ($data['starts_on'] < $year->starts_on->toDateString() || $data['ends_on'] > $year->ends_on->toDateString()) abort(422, 'Fiscal periods must be contained within their fiscal year.');
+        if (FiscalPeriod::where('company_id', $companyId)->where('fiscal_year_id', $year->id)->where(function ($query) use ($data): void {
+            $query->where('starts_on', '<=', $data['ends_on'])->where('ends_on', '>=', $data['starts_on']);
+        })->exists()) abort(422, 'The fiscal period overlaps an existing period.');
+        $period = FiscalPeriod::create($data + ['company_id' => $companyId, 'status' => 'open']);
+        app(AuditService::class)->record('fiscal_period.created', $period, null, $period->toArray());
+        return response()->json(['data' => $period->load('fiscalYear'), 'status' => 'created'], 201);
+    }
+
+    public function fiscalPeriodCloseChecklist(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for fiscal-period close checks.');
+        $period = FiscalPeriod::with('fiscalYear')->where('company_id', $companyId)->findOrFail($id);
+        $endDate = $period->ends_on->toDateString();
+        $unmatchedBankLines = \App\Models\BankStatementLine::where('company_id', $companyId)
+            ->whereDate('transaction_date', '<=', $endDate)->where('status', 'unmatched')->count();
+        $draftReconciliations = \App\Models\BankReconciliation::where('company_id', $companyId)
+            ->whereDate('statement_date', '<=', $endDate)->where('status', 'draft')->count();
+        $pendingRevaluations = \App\Models\InventoryCostRevaluationRun::withoutGlobalScopes()
+            ->where('company_id', $companyId)->where('status', 'pending')->whereDate('as_of_date', '<=', $endDate)->count();
+        $snapshot = \App\Models\InventoryReconciliationSnapshot::where('company_id', $companyId)
+            ->whereDate('as_of_date', $endDate)->latest('id')->first();
+        $checks = [
+            ['key' => 'bank_statement_lines', 'label' => 'Bank statement lines matched', 'passed' => $unmatchedBankLines === 0, 'count' => $unmatchedBankLines],
+            ['key' => 'bank_reconciliations', 'label' => 'Bank reconciliations finalized', 'passed' => $draftReconciliations === 0, 'count' => $draftReconciliations],
+            ['key' => 'inventory_revaluations', 'label' => 'Inventory cost revaluations completed', 'passed' => $pendingRevaluations === 0, 'count' => $pendingRevaluations],
+            ['key' => 'inventory_snapshot', 'label' => 'Inventory snapshot ready or capturable', 'passed' => !$snapshot || $snapshot->status === 'balanced', 'count' => $snapshot ? 1 : 0, 'status' => $snapshot?->status ?? 'will_capture_on_close'],
+        ];
+        $passed = collect($checks)->every(fn (array $check): bool => $check['passed']);
+        return response()->json(['data' => ['period' => $period, 'checks' => $checks, 'ready_to_close' => $passed], 'status' => $passed ? 'ready' : 'blocked']);
+    }
+
+    public function closeFiscalPeriod(Request $request, int $id): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $data = $request->validate(['close_reason' => ['required', 'string', 'max:2000']]);
+        try {
+            $period = DB::transaction(function () use ($id, $data, $request): FiscalPeriod {
+                $period = FiscalPeriod::where('company_id', $request->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                if ($period->status !== 'open') throw new \RuntimeException('Only open fiscal periods can be closed.');
+                $year = $period->fiscalYear()->lockForUpdate()->first();
+                if (!$year || $year->status !== 'open') throw new \RuntimeException('The parent fiscal year must be open.');
+                app(\App\Services\FiscalPeriodService::class)->assertBankReconciliationsClosed((int) $period->company_id, $period->ends_on->toDateString());
+                app(\App\Services\FiscalPeriodService::class)->assertCostRevaluationsClosed((int) $period->company_id, $period->ends_on->toDateString());
+                $snapshot = app(\App\Services\InventorySnapshotService::class)->capture((int) $period->company_id, $period->ends_on, $request->user()?->id);
+                if ($snapshot->status === 'variance') throw new \RuntimeException('The fiscal-period close failed because the inventory snapshot contains negative-balance variances.');
+                $before = $period->toArray();
+                $period->update(['status' => 'closed', 'closed_at' => now(), 'closed_by' => $request->user()?->id, 'inventory_snapshot_id' => $snapshot->id, 'close_reason' => $data['close_reason']]);
+                app(AuditService::class)->record('fiscal_period.closed', $period, $before, $period->fresh()->toArray());
+                return $period->fresh();
+            });
+        } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+        return response()->json(['data' => $period->load('fiscalYear', 'inventorySnapshot'), 'status' => $period->status]);
+    }
+
+    public function reopenFiscalPeriod(Request $request, int $id): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $data = $request->validate(['reopen_reason' => ['required', 'string', 'max:2000']]);
+        $period = FiscalPeriod::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        if ($period->status !== 'closed') abort(422, 'Only closed fiscal periods can be reopened.');
+        $before = $period->toArray();
+        $period->update(['status' => 'open', 'closed_at' => null, 'closed_by' => null]);
+        app(AuditService::class)->record('fiscal_period.reopened', $period, $before, $period->toArray() + ['reopen_reason' => $data['reopen_reason']]);
+        return response()->json(['data' => $period->fresh()->load('fiscalYear'), 'status' => $period->status]);
     }
 
     public function storeCurrency(Request $request): JsonResponse
@@ -368,6 +518,13 @@ class FinanceIntegrationController extends Controller
     private function assertWriteAccess(Request $request): void
     {
         if (!$request->user()?->tokenCan('accounting:write') && !$request->user()?->tokenCan('integration:write')) abort(403, 'This token cannot modify finance configuration.');
+    }
+
+    private function eliminationStatus(array $report): string
+    {
+        $manual = (int) ($report['elimination_journal_count'] ?? 0) > 0;
+        $automatic = (int) ($report['automatic_elimination_journal_count'] ?? 0) > 0;
+        return $manual && $automatic ? 'manual_and_automatic_applied' : ($manual ? 'manual_journals_applied' : ($automatic ? 'automatic_matches_applied' : 'not_applied'));
     }
 
     private function companyScope($query, ?int $companyId)

@@ -5,13 +5,20 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\InventoryLocation;
 use App\Models\InventoryReplenishmentPolicy;
+use App\Models\InventoryTransfer;
+use App\Models\InventoryTransferLine;
 use App\Models\Product;
 use App\Models\PurchaseOrderLine;
+use App\Models\ReplenishmentScenario;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
+use App\Services\NumberingSequenceService;
+use App\Services\ReplenishmentScenarioService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use App\Services\ReplenishmentPlanningService;
+use App\Services\TransferReplenishmentService;
+use App\Services\ReplenishmentPurchaseOrderService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
@@ -38,19 +45,20 @@ class PlanningIntegrationController extends Controller
         $recentIssueProductIds = in_array($data['type'], ['slow', 'dead'], true)
             ? \App\Models\InventoryMovement::whereIn('product_id', $products->pluck('id'))->where('movement_type', 'issue')->where('posted_at', '>=', $cutoff)->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->pluck('product_id')->unique()
             : collect();
-        $matching = $products->filter(function (Product $product) use ($data, $availability, $policies, $recentIssueProductIds): bool {
+        $planning = app(ReplenishmentPlanningService::class);
+        $matching = $products->filter(function (Product $product) use ($data, $availability, $policies, $recentIssueProductIds, $planning, $companyId): bool {
             $current = (float) ($availability[$product->id] ?? 0); $policy = $policies->get($product->id);
-            $reorder = (float) ($policy?->reorder_point ?? $product->reorder_level ?? 0);
+            $reorder = $policy ? $planning->effectiveReorderPoint($product, $policy, (int) $companyId) : (float) ($product->reorder_level ?? 0);
             $maximum = $policy?->max_stock !== null ? (float) $policy->max_stock : ($product->max_stock === null ? null : (float) $product->max_stock);
             return match ($data['type']) {
                 'low' => $current <= $reorder, 'excess' => $maximum !== null && $current > $maximum,
                 'slow' => !$recentIssueProductIds->contains($product->id), 'dead' => !$recentIssueProductIds->contains($product->id) && $current > 0,
             };
         })->sortByDesc(fn (Product $product): float => (float) ($availability[$product->id] ?? 0))->values();
-        $page = max(1, $request->integer('page', 1));
+        $page = max(1, (int) $request->input('page', 1));
         $products = new LengthAwarePaginator($matching->forPage($page, $perPage)->values(), $matching->count(), $perPage, $page, ['path' => LengthAwarePaginator::resolveCurrentPath()]);
-        $items = $products->getCollection()->map(function (Product $product) use ($availability, $policies, $locationId): array {
-            $policy = $policies->get($product->id); $reorder = (float) ($policy?->reorder_point ?? $product->reorder_level ?? 0); $maximum = $policy?->max_stock !== null ? (float) $policy->max_stock : ($product->max_stock === null ? null : (float) $product->max_stock);
+        $items = $products->getCollection()->map(function (Product $product) use ($availability, $policies, $locationId, $planning, $companyId): array {
+            $policy = $policies->get($product->id); $reorder = $policy ? $planning->effectiveReorderPoint($product, $policy, (int) $companyId) : (float) ($product->reorder_level ?? 0); $maximum = $policy?->max_stock !== null ? (float) $policy->max_stock : ($product->max_stock === null ? null : (float) $product->max_stock);
             $quantity = (float) ($availability[$product->id] ?? 0); $excessQuantity = $maximum === null ? 0 : max(0, $quantity - $maximum);
             return ['product_id' => $product->id, 'name' => $product->name, 'sku' => $product->sku, 'quantity' => $quantity, 'reorder_level' => $reorder, 'min_stock' => $policy?->min_stock === null ? ($product->min_stock === null ? null : (float) $product->min_stock) : (float) $policy->min_stock, 'max_stock' => $maximum, 'excess_quantity' => $excessQuantity, 'unit_cost' => (float) ($product->purchase_price ?? 0), 'excess_value' => $excessQuantity * (float) ($product->purchase_price ?? 0), 'supplier_id' => $product->supplier_id, 'category_id' => $product->category_id, 'location_id' => $locationId];
         })->values();
@@ -125,7 +133,7 @@ class PlanningIntegrationController extends Controller
     private function policyRules(?int $companyId, bool $partial = false): array
     {
         $required = $partial ? 'sometimes' : 'required';
-        return ['external_reference' => [$partial ? 'sometimes' : 'nullable', 'nullable', 'string', 'max:150'], 'product_id' => [$required, 'integer'], 'location_id' => [$required, 'integer'], 'reorder_point' => [$required, 'numeric', 'min:0'], 'safety_stock' => ['nullable', 'numeric', 'min:0'], 'safety_stock_method' => ['nullable', 'in:fixed,variability'], 'service_level_z' => ['nullable', 'numeric', 'gt:0', 'max:6'], 'min_stock' => ['nullable', 'numeric', 'min:0'], 'max_stock' => ['nullable', 'numeric', 'gte:min_stock'], 'lead_time_days' => ['nullable', 'integer', 'min:0'], 'safety_time_days' => ['nullable', 'integer', 'min:0'], 'is_active' => ['sometimes', 'boolean']];
+        return ['external_reference' => [$partial ? 'sometimes' : 'nullable', 'nullable', 'string', 'max:150'], 'product_id' => [$required, 'integer'], 'location_id' => [$required, 'integer'], 'reorder_point' => [$required, 'numeric', 'min:0'], 'reorder_point_method' => ['nullable', 'in:fixed,demand'], 'reorder_history_days' => ['nullable', 'integer', 'min:7', 'max:730'], 'safety_stock' => ['nullable', 'numeric', 'min:0'], 'safety_stock_method' => ['nullable', 'in:fixed,variability'], 'service_level_z' => ['nullable', 'numeric', 'gt:0', 'max:6'], 'min_stock' => ['nullable', 'numeric', 'min:0'], 'max_stock' => ['nullable', 'numeric', 'gte:min_stock'], 'lead_time_days' => ['nullable', 'integer', 'min:0'], 'safety_time_days' => ['nullable', 'integer', 'min:0'], 'is_active' => ['sometimes', 'boolean']];
     }
 
     private function assertOwnedLocation(int $locationId, int $companyId): void
@@ -145,8 +153,18 @@ class PlanningIntegrationController extends Controller
         abort_unless($companyId, 403, 'A company is required for replenishment planning.');
         if (!empty($data['location_id'])) $this->assertOwnedLocation((int) $data['location_id'], (int) $companyId);
         $proposals = app(ReplenishmentPlanningService::class)->proposalsForCompany((int) $companyId, $data['product_id'] ?? null, $data['location_id'] ?? null, $data['forecast_horizon_days'] ?? null);
-        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, $request->integer('page', 1)); $pageItems = $proposals->forPage($page, $perPage)->values();
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1)); $pageItems = $proposals->forPage($page, $perPage)->values();
         return response()->json(['data' => $pageItems, 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $proposals->count(), 'last_page' => max(1, (int) ceil($proposals->count() / $perPage)), 'generated_at' => now()->toISOString()]]);
+    }
+
+    public function multiEchelonReplenishment(Request $request, ReplenishmentPlanningService $planning): JsonResponse
+    {
+        $data = $request->validate(['product_id' => ['nullable', 'integer'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for multi-echelon replenishment planning.');
+        $rows = $planning->multiEchelonForCompany((int) $companyId, $data['product_id'] ?? null);
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
+        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'read_only' => true, 'generated_at' => now()->toISOString()]]);
     }
 
     public function timePhasedReplenishment(Request $request): JsonResponse
@@ -180,5 +198,148 @@ class PlanningIntegrationController extends Controller
         })->values();
         $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
         return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'horizon_days' => $horizon, 'generated_at' => now()->toISOString()]]);
+    }
+
+    public function replenishmentScenario(Request $request, ReplenishmentScenarioService $scenarios): JsonResponse
+    {
+        $data = $request->validate([
+            'product_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'],
+            'demand_multiplier' => ['nullable', 'numeric', 'min:0', 'max:10'],
+            'daily_demand' => ['nullable', 'numeric', 'min:0'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for replenishment scenarios.');
+        if (!empty($data['location_id'])) $this->assertOwnedLocation((int) $data['location_id'], (int) $companyId);
+        $horizon = (int) ($data['horizon_days'] ?? 30);
+        $rows = $scenarios->simulate((int) $companyId, $data['product_id'] ?? null, $data['location_id'] ?? null, $horizon, (float) ($data['demand_multiplier'] ?? 1), array_key_exists('daily_demand', $data) ? (float) $data['daily_demand'] : null);
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
+        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'horizon_days' => $horizon, 'read_only' => true, 'generated_at' => now()->toISOString()]]);
+    }
+
+    public function savedScenarios(Request $request): JsonResponse
+    {
+        $data = $request->validate(['updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        abort_unless($request->user()?->company_id, 403, 'A company is required for saved replenishment scenarios.');
+        $rows = ReplenishmentScenario::with(['product:id,name,sku', 'location:id,name,code'])
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($rows, $request, 'planning.replenishment-scenarios', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function saveScenario(Request $request, ReplenishmentScenarioService $scenarios): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for saved replenishment scenarios.');
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:150'], 'external_reference' => ['nullable', 'string', 'max:150'],
+            'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'],
+            'horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'],
+            'demand_multiplier' => ['nullable', 'numeric', 'min:0', 'max:10'], 'daily_demand' => ['nullable', 'numeric', 'min:0'],
+        ]);
+        if (!empty($data['location_id'])) $this->assertOwnedLocation((int) $data['location_id'], (int) $companyId);
+        if (!empty($data['product_id'])) $this->assertOwnedProduct((int) $data['product_id'], (int) $companyId);
+        if (!empty($data['external_reference'])) {
+            $existing = ReplenishmentScenario::where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing->load(['product', 'location']), 'status' => 'duplicate_ignored']);
+        }
+        $horizon = (int) ($data['horizon_days'] ?? 30);
+        $rows = $scenarios->simulate((int) $companyId, $data['product_id'] ?? null, $data['location_id'] ?? null, $horizon, (float) ($data['demand_multiplier'] ?? 1), array_key_exists('daily_demand', $data) ? (float) $data['daily_demand'] : null);
+        $createdBy = $request->user()?->id;
+        $scenario = DB::transaction(function () use ($data, $companyId, $horizon, $rows, $createdBy): ReplenishmentScenario {
+            $scenario = ReplenishmentScenario::create([
+                'company_id' => $companyId, 'name' => $data['name'], 'external_reference' => $data['external_reference'] ?? null,
+                'product_id' => $data['product_id'] ?? null, 'location_id' => $data['location_id'] ?? null, 'horizon_days' => $horizon,
+                'demand_multiplier' => $data['demand_multiplier'] ?? 1, 'daily_demand_override' => $data['daily_demand'] ?? null,
+                'result_snapshot' => $rows->values()->all(), 'created_by' => $createdBy,
+            ]);
+            app(AuditService::class)->record('replenishment_scenario.saved', $scenario, null, ['name' => $scenario->name, 'horizon_days' => $horizon, 'row_count' => $rows->count(), 'external_reference' => $scenario->external_reference]);
+            return $scenario;
+        });
+        return response()->json(['data' => $scenario->load(['product', 'location']), 'status' => 'saved'], 201);
+    }
+
+    public function showSavedScenario(int $id): JsonResponse
+    {
+        $scenario = ReplenishmentScenario::with(['product', 'location', 'creator'])->findOrFail($id);
+        return response()->json(['data' => $scenario, 'status' => 'saved']);
+    }
+
+    public function transferSuggestions(Request $request, TransferReplenishmentService $transfers): JsonResponse
+    {
+        $data = $request->validate(['product_id' => ['nullable', 'integer'], 'destination_location_id' => ['nullable', 'integer'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $companyId = $request->user()?->company_id; abort_unless($companyId, 403, 'A company is required for transfer replenishment.');
+        if (!empty($data['destination_location_id'])) $this->assertOwnedLocation((int) $data['destination_location_id'], (int) $companyId);
+        $suggestions = $transfers->suggestionsForCompany((int) $companyId, $data['product_id'] ?? null, $data['destination_location_id'] ?? null);
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
+        $items = $suggestions->forPage($page, $perPage)->values()->map(fn (array $row): array => collect($row)->except('product')->all());
+        return response()->json(['data' => $items, 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $suggestions->count(), 'last_page' => max(1, (int) ceil($suggestions->count() / $perPage)), 'generated_at' => now()->toISOString(), 'approval_required' => true]]);
+    }
+
+    public function createTransferFromSuggestion(Request $request, TransferReplenishmentService $transfers): JsonResponse
+    {
+        $data = $request->validate([
+            'external_reference' => ['nullable', 'string', 'max:150'],
+            'product_id' => ['required', 'integer'],
+            'source_location_id' => ['required', 'integer'],
+            'destination_location_id' => ['required', 'integer', 'different:source_location_id'],
+            'quantity' => ['required', 'numeric', 'gt:0'],
+            'expected_arrival' => ['nullable', 'date'],
+            'description' => ['nullable', 'string', 'max:2000'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for transfer replenishment.');
+
+        if (!empty($data['external_reference'])) {
+            $existing = InventoryTransfer::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation'), 'status' => 'duplicate_ignored']);
+        }
+
+        $suggestion = $transfers->suggestionsForCompany((int) $companyId, (int) $data['product_id'])
+            ->first(fn (array $row): bool => (int) $row['source_location_id'] === (int) $data['source_location_id']
+                && (int) $row['destination_location_id'] === (int) $data['destination_location_id']);
+        if (!$suggestion || (float) $data['quantity'] > (float) $suggestion['quantity'] + 0.000001) {
+            abort(422, 'The requested transfer exceeds the current replenishment suggestion. Refresh the suggestion and try again.');
+        }
+
+        $transfer = $transfers->createPendingTransfer($suggestion, (int) $companyId, $request->user()?->id, $data['external_reference'] ?? null, $data['expected_arrival'] ?? null, $data['description'] ?? null);
+
+        return response()->json(['data' => $transfer->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation'), 'status' => 'pending_approval', 'approval_required' => true], 201);
+    }
+
+    public function createPurchaseOrderFromSuggestion(Request $request, ReplenishmentPurchaseOrderService $purchaseOrders): JsonResponse
+    {
+        $data = $request->validate([
+            'external_reference' => ['nullable', 'string', 'max:150'],
+            'product_id' => ['required', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'quantity' => ['nullable', 'numeric', 'gt:0'],
+            'description' => ['nullable', 'string', 'max:2000'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for purchase replenishment.');
+        $this->assertOwnedProduct((int) $data['product_id'], (int) $companyId);
+        if (!empty($data['location_id'])) $this->assertOwnedLocation((int) $data['location_id'], (int) $companyId);
+
+        try {
+            $result = $purchaseOrders->createDraft(
+                (int) $companyId,
+                (int) $data['product_id'],
+                isset($data['location_id']) ? (int) $data['location_id'] : null,
+                isset($data['quantity']) ? (float) $data['quantity'] : null,
+                $data['external_reference'] ?? null,
+                $request->user()?->id,
+                $data['description'] ?? null
+            );
+            return response()->json([
+                'data' => $result['order'],
+                'status' => $result['duplicate'] ? 'duplicate_ignored' : 'pending_approval',
+                'approval_required' => true,
+            ], $result['duplicate'] ? 200 : 201);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
     }
 }

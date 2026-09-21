@@ -16,6 +16,7 @@ use App\Services\HrLeaveService;
 use App\Services\HrAttendanceService;
 use App\Services\HrPayrollAccountingService;
 use App\Services\HrPayrollSettlementService;
+use App\Services\IntegrationCursorService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -38,6 +39,9 @@ class HrIntegrationController extends Controller
             ->when($data['department_id'] ?? null, fn ($query, $id) => $query->where('department_id', $id))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query, $request, 'hr.employees', (int) ($data['per_page'] ?? 50));
+        }
         $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1)); $total = (clone $query)->count();
         return response()->json(['data' => $query->forPage($page, $perPage)->get(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $total, 'last_page' => max(1, (int) ceil($total / $perPage))]]);
     }
@@ -102,14 +106,22 @@ class HrIntegrationController extends Controller
     public function payRuns(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);
-        $runs = HrPayRun::withCount('payslips')->where('company_id', $companyId)->orderByDesc('period_to')->orderByDesc('id')->get();
+        $query = HrPayRun::withCount('payslips')->where('company_id', $companyId);
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query->orderBy('updated_at')->orderBy('id'), $request, 'hr.pay-runs', (int) $request->input('per_page', 50));
+        }
+        $runs = $query->orderByDesc('period_to')->orderByDesc('id')->get();
         return response()->json(['data' => $runs, 'meta' => ['total' => $runs->count()]]);
     }
 
     public function payrollRules(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);
-        $rules = HrPayrollRule::where('company_id', $companyId)->orderBy('code')->get();
+        $query = HrPayrollRule::where('company_id', $companyId);
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query->orderBy('updated_at')->orderBy('id'), $request, 'hr.payroll-rules', (int) $request->input('per_page', 50));
+        }
+        $rules = $query->orderBy('code')->get();
         return response()->json(['data' => $rules, 'meta' => ['total' => $rules->count()]]);
     }
 
@@ -138,7 +150,7 @@ class HrIntegrationController extends Controller
             if ($existing) return response()->json(['data' => $existing, 'status' => 'existing']);
         }
         $data = $request->validate(['run_no' => ['required', 'string', 'max:60', Rule::unique('hr_pay_runs', 'run_no')->where(fn ($query) => $query->where('company_id', $companyId))], 'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('hr_pay_runs', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))], 'frequency' => ['required', 'in:weekly,biweekly,monthly'], 'period_from' => ['required', 'date'], 'period_to' => ['required', 'date', 'after_or_equal:period_from'], 'pay_date' => ['nullable', 'date', 'after_or_equal:period_to'], 'attendance_policy' => ['nullable', 'in:ignore,unpaid_absence'], 'overtime_policy' => ['nullable', 'in:ignore,pay_overtime'], 'overtime_multiplier' => ['nullable', 'numeric', 'min:1', 'max:5']]);
-        if (HrPayRun::where('company_id', $companyId)->where('frequency', $data['frequency'])->whereIn('status', ['draft', 'approved', 'paid'])->where('period_from', '<=', $data['period_to'])->where('period_to', '>=', $data['period_from'])->exists()) abort(422, 'The payroll period overlaps an existing non-cancelled run.');
+        if (HrPayRun::where('company_id', $companyId)->where('frequency', $data['frequency'])->whereIn('status', ['draft', 'approved', 'paid', 'settlement_reversed'])->where('period_from', '<=', $data['period_to'])->where('period_to', '>=', $data['period_from'])->exists()) abort(422, 'The payroll period overlaps an existing non-cancelled run.');
         $run = HrPayRun::create($data + ['company_id' => $companyId, 'status' => 'draft', 'created_by' => $request->user()->id]);
         $run = app(HrPayrollService::class)->generate($run);
         app(AuditService::class)->record('hr_pay_run.created', $run, null, $run->toArray());
@@ -176,9 +188,23 @@ class HrIntegrationController extends Controller
         return response()->json(['data' => $run, 'status' => 'paid']);
     }
 
+    public function reversePayRun(Request $request, int $id): JsonResponse
+    {
+        $run = HrPayRun::where('company_id', $this->companyId($request))->findOrFail($id);
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        try { $run = app(HrPayrollSettlementService::class)->reverse($run, $data['reason']); }
+        catch (\RuntimeException $exception) { abort(422, $exception->getMessage()); }
+        app(AuditService::class)->record('hr_pay_run.settlement_reversed', $run, ['status' => 'paid'], $run->toArray() + ['reason' => $data['reason']]);
+        return response()->json(['data' => $run, 'status' => 'settlement_reversed']);
+    }
+
     public function leaveTypes(Request $request): JsonResponse
     {
-        $types = HrLeaveType::where('company_id', $this->companyId($request))->orderBy('code')->get();
+        $query = HrLeaveType::where('company_id', $this->companyId($request));
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query->orderBy('updated_at')->orderBy('id'), $request, 'hr.leave-types', (int) $request->input('per_page', 50));
+        }
+        $types = $query->orderBy('code')->get();
         return response()->json(['data' => $types, 'meta' => ['total' => $types->count()]]);
     }
 
@@ -194,8 +220,12 @@ class HrIntegrationController extends Controller
     public function leaveRequests(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);
-        $data = $request->validate(['status' => ['nullable', 'in:pending,approved,rejected'], 'employee_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date']]);
-        $requests = HrLeaveRequest::with(['employee', 'leaveType', 'approver'])->where('company_id', $companyId)->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))->when($data['employee_id'] ?? null, fn ($query, $id) => $query->where('employee_id', $id))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))->orderBy('updated_at')->orderBy('id')->get();
+        $data = $request->validate(['status' => ['nullable', 'in:pending,approved,rejected'], 'employee_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $query = HrLeaveRequest::with(['employee', 'leaveType', 'approver'])->where('company_id', $companyId)->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))->when($data['employee_id'] ?? null, fn ($query, $id) => $query->where('employee_id', $id))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))->orderBy('updated_at')->orderBy('id');
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query, $request, 'hr.leave-requests', (int) ($data['per_page'] ?? 50));
+        }
+        $requests = $query->get();
         return response()->json(['data' => $requests, 'meta' => ['total' => $requests->count()]]);
     }
 
@@ -236,9 +266,13 @@ class HrIntegrationController extends Controller
     public function attendance(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);
-        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'employee_id' => ['nullable', 'integer'], 'status' => ['nullable', 'in:present,absent,leave,holiday'], 'updated_since' => ['nullable', 'date']]);
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'employee_id' => ['nullable', 'integer'], 'status' => ['nullable', 'in:present,absent,leave,holiday'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $from = $data['from'] ?? now()->startOfMonth()->toDateString(); $to = $data['to'] ?? now()->toDateString();
-        $rows = HrAttendance::with('employee')->where('company_id', $companyId)->whereBetween('attendance_date', [$from, $to])->when($data['employee_id'] ?? null, fn ($query, $id) => $query->where('employee_id', $id))->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))->orderBy('attendance_date')->orderBy('employee_id')->get();
+        $query = HrAttendance::with('employee')->where('company_id', $companyId)->whereBetween('attendance_date', [$from, $to])->when($data['employee_id'] ?? null, fn ($query, $id) => $query->where('employee_id', $id))->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date));
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query->orderBy('updated_at')->orderBy('id'), $request, 'hr.attendance', (int) ($data['per_page'] ?? 50));
+        }
+        $rows = $query->orderBy('attendance_date')->orderBy('employee_id')->get();
         return response()->json(['data' => $rows, 'meta' => ['from' => $from, 'to' => $to, 'total' => $rows->count()]]);
     }
 

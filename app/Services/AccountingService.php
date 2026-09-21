@@ -108,6 +108,8 @@ class AccountingService
                 'date' => now()->toDateString(),
                 'description' => $reason ?: 'Reversal of '.$entry->entry_no,
                 'reversal_of_id' => $entry->id,
+                'consolidation_elimination' => (bool) $entry->consolidation_elimination,
+                'consolidation_reference' => $entry->consolidation_reference ? 'REV-'.$entry->consolidation_reference : null,
             ], $entry->lines->map(fn ($line) => array_merge($line->only([
                 'account_id', 'currency_code', 'exchange_rate', 'department_id', 'cost_center_id', 'description',
             ]), ['debit' => $line->credit, 'credit' => $line->debit]))->all());

@@ -18,25 +18,35 @@ use Illuminate\Support\Facades\DB;
 
 class InventoryAdjustmentController extends Controller
 {
+    private function companyId(): int
+    {
+        return (int) auth()->user()->company_id;
+    }
+
+    private function companyAdjustment(int $id): InventoryAdjustment
+    {
+        return InventoryAdjustment::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
     public function index()
     {
-        $adjustments = InventoryAdjustment::with(['creator', 'approver'])->latest()->paginate(30);
+        $adjustments = InventoryAdjustment::where('company_id', $this->companyId())->with(['creator', 'approver'])->latest()->paginate(30);
         return view('backend.stock.adjustment_all', compact('adjustments'));
     }
 
     public function create()
     {
-        $products = Product::orderBy('name')->get();
+        $products = Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('name')->get();
         $opening = false;
-        $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
+        $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
         return view('backend.stock.adjustment_add', compact('products', 'locations', 'opening'));
     }
 
     public function openingCreate()
     {
-        $products = Product::orderBy('name')->get();
+        $products = Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('name')->get();
         $opening = true;
-        $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
+        $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
         return view('backend.stock.adjustment_add', compact('products', 'locations', 'opening'));
     }
 
@@ -54,7 +64,7 @@ class InventoryAdjustmentController extends Controller
     public function store(InventoryAdjustmentRequest $request)
     {
         foreach ($request->input('location_id', []) as $locationId) {
-            if ($locationId && !InventoryLocation::where('is_active', true)->find($locationId)) return back()->withErrors(['location_id' => 'Selected inventory location is inactive or outside the current company.'])->withInput();
+            if ($locationId && !InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->find($locationId)) return back()->withErrors(['location_id' => 'Selected inventory location is inactive or outside the current company.'])->withInput();
         }
         $adjustment = DB::transaction(function () use ($request): InventoryAdjustment {
             $adjustment = InventoryAdjustment::create([
@@ -95,14 +105,14 @@ class InventoryAdjustmentController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(InventoryAdjustment::class, $id);
         try {
             DB::transaction(function () use ($id): void {
-                $adjustment = InventoryAdjustment::with('lines')->lockForUpdate()->findOrFail($id);
+                $adjustment = InventoryAdjustment::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($adjustment->status !== 'pending') {
                     throw new \RuntimeException('This adjustment has already been processed.');
                 }
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($adjustment);
 
                 foreach ($adjustment->lines as $line) {
-                    $product = Product::lockForUpdate()->findOrFail($line->product_id);
+                    $product = Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->lockForUpdate()->findOrFail($line->product_id);
                     $quantity = (float) $line->quantity;
                     if ($line->direction === 'out' && app(\App\Services\InventoryAvailabilityService::class)->available($product, true, $line->location_id, $adjustment->company_id) < $quantity) {
                         throw new \RuntimeException('Insufficient stock for '.$product->name.'.');
@@ -157,7 +167,7 @@ class InventoryAdjustmentController extends Controller
     public function reject(Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $adjustment = InventoryAdjustment::findOrFail($id);
+        $adjustment = $this->companyAdjustment($id);
         if ($adjustment->status !== 'pending') {
             return redirect()->back()->with(['message' => 'This adjustment has already been processed.', 'alert-type' => 'error']);
         }

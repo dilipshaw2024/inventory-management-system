@@ -19,9 +19,24 @@ use App\Services\ProductLifecycleService;
 
 class PurchaseController extends Controller
 {
+    private function companyId(): int
+    {
+        return (int) Auth::user()->company_id;
+    }
+
+    private function visibleProducts()
+    {
+        return Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'));
+    }
+
+    private function companyPurchase(int $id): Purchase
+    {
+        return Purchase::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
     public function PurchaseAll(){
 
-        $allData = Purchase::orderBy('date','desc')->orderBy('id','desc')->get();
+        $allData = Purchase::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->get();
         return view('backend.purchase.purchase_all',compact('allData'));
 
     } // End Method 
@@ -29,9 +44,10 @@ class PurchaseController extends Controller
 
     public function PurchaseAdd(){
 
-        $supplier = Supplier::orderBy('id','desc')->get();
-        $unit = Unit::orderBy('id','desc')->get();
-        $category = Category::orderBy('id','desc')->get();
+        $companyId = $this->companyId();
+        $supplier = Supplier::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
+        $unit = Unit::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
+        $category = Category::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
         return view('backend.purchase.purchase_add',compact('supplier','unit','category'));
 
     } // End Method 
@@ -50,7 +66,7 @@ class PurchaseController extends Controller
 
         $count_category = count($request->category_id);
         for ($i=0; $i < $count_category; $i++) {
-            $product = Product::find($request->product_id[$i]);
+            $product = $this->visibleProducts()->find($request->product_id[$i]);
             if (!$product || (int) $product->supplier_id !== (int) $request->supplier_id[$i] || (int) $product->category_id !== (int) $request->category_id[$i]) {
                 return redirect()->back()->withInput()->with(['message' => 'One or more purchase products do not match the selected supplier/category.', 'alert-type' => 'error']);
             }
@@ -61,6 +77,7 @@ class PurchaseController extends Controller
         DB::transaction(function () use ($request, $count_category) {
           for ($i=0; $i < $count_category; $i++) {
             $purchase = new Purchase();
+            $purchase->company_id = $this->companyId();
             $purchase->date = date('Y-m-d', strtotime($request->date[$i]));
             $purchase->purchase_no = $request->purchase_no[$i];
             $purchase->supplier_id = $request->supplier_id[$i];
@@ -89,7 +106,7 @@ class PurchaseController extends Controller
 
     public function PurchaseDelete($id){
 
-        $purchase = Purchase::findOrFail($id);
+        $purchase = $this->companyPurchase((int) $id);
         if ((int) $purchase->status === 1) {
             return redirect()->back()->with(['message' => 'Approved purchases cannot be deleted because they affect stock history.', 'alert-type' => 'error']);
         }
@@ -106,7 +123,7 @@ class PurchaseController extends Controller
 
     public function PurchasePending(){
 
-        $allData = Purchase::orderBy('date','desc')->orderBy('id','desc')->where('status','0')->get();
+        $allData = Purchase::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->where('status','0')->get();
         return view('backend.purchase.purchase_pending',compact('allData'));
     }// End Method 
 
@@ -114,12 +131,12 @@ class PurchaseController extends Controller
     public function PurchaseApprove($id){
 
         $approved = DB::transaction(function () use ($id) {
-            $purchase = Purchase::lockForUpdate()->findOrFail($id);
+            $purchase = Purchase::where('company_id', $this->companyId())->lockForUpdate()->findOrFail($id);
             if ((int) $purchase->status === 1) {
                 return false;
             }
 
-            $product = Product::lockForUpdate()->findOrFail($purchase->product_id);
+            $product = $this->visibleProducts()->lockForUpdate()->findOrFail($purchase->product_id);
             app(ProductLifecycleService::class)->assertPurchasable($product);
             $product->quantity = (float) $product->quantity + (float) $purchase->buying_qty;
             $product->save();
@@ -164,7 +181,7 @@ class PurchaseController extends Controller
         $dates = $request->validate(['start_date' => ['required', 'date'], 'end_date' => ['required', 'date', 'after_or_equal:start_date']]);
         $sdate = $dates['start_date'];
         $edate = $dates['end_date'];
-        $allData = Purchase::whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
+        $allData = Purchase::where('company_id', $this->companyId())->whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
 
 
         $start_date = date('Y-m-d',strtotime($request->start_date));

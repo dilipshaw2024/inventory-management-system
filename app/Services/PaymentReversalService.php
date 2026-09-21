@@ -16,7 +16,7 @@ class PaymentReversalService
             $class = $payment instanceof Payment ? Payment::class : SupplierPayment::class;
             $payment = $class::lockForUpdate()->findOrFail($payment->id);
             if ($payment->is_reversed) throw new \RuntimeException('This payment has already been reversed.');
-            if (($payment instanceof SupplierPayment && $payment->status !== 'approved') || ($payment instanceof Payment && (float) $payment->paid_amount <= 0)) throw new \RuntimeException('Only posted payments can be reversed.');
+            if (($payment instanceof SupplierPayment && $payment->status !== 'approved') || ($payment instanceof Payment && (($payment->approval_status ?? 'approved') !== 'approved' || (float) $payment->paid_amount <= 0))) throw new \RuntimeException('Only posted payments can be reversed.');
             if ($payment instanceof Payment && $payment->allocations()->whereNull('voided_at')->exists()) throw new \RuntimeException('Allocated customer payments must be unallocated before reversal.');
             if ($payment instanceof SupplierPayment && $payment->allocations()->whereNull('voided_at')->exists()) throw new \RuntimeException('Allocated supplier payments must be unallocated before reversal.');
             $journal = JournalEntry::where('source_type', $payment->getMorphClass())->where('source_id', $payment->id)->where('status', 'posted')->latest('id')->first();

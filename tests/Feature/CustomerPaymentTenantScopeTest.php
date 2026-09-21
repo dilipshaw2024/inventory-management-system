@@ -13,10 +13,13 @@ use App\Models\CustomerPaymentAllocation;
 use App\Models\SupplierPaymentAllocation;
 use App\Models\Currency;
 use App\Models\ExchangeRate;
+use App\Models\AccountMapping;
+use App\Models\ChartOfAccount;
 use App\Services\CustomerPaymentAllocationService;
 use App\Services\SupplierPaymentService;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
 class CustomerPaymentTenantScopeTest extends TestCase
@@ -132,5 +135,41 @@ class CustomerPaymentTenantScopeTest extends TestCase
         $this->assertEquals(100.0, (float) $supplierPaymentResult->payment_amount);
         $this->assertEquals(0.9, (float) $supplierPaymentResult->exchange_rate);
         $this->assertDatabaseHas('supplier_payments', ['id' => $supplierPayment->id, 'allocation_status' => 'fully_allocated']);
+    }
+
+    public function test_cross_currency_settlement_posts_and_reverses_realized_fx(): void
+    {
+        $company = Company::create(['name' => 'Realized FX Co', 'code' => 'REALIZED-FX', 'base_currency' => 'USD']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['accounting:write']);
+        $receivable = ChartOfAccount::create(['company_id' => $company->id, 'code' => '1200', 'name' => 'AR', 'account_type' => 'asset', 'is_active' => true]);
+        $payable = ChartOfAccount::create(['company_id' => $company->id, 'code' => '2100', 'name' => 'AP', 'account_type' => 'liability', 'is_active' => true]);
+        $gain = ChartOfAccount::create(['company_id' => $company->id, 'code' => '7100', 'name' => 'FX Gain', 'account_type' => 'income', 'is_active' => true]);
+        $loss = ChartOfAccount::create(['company_id' => $company->id, 'code' => '8100', 'name' => 'FX Loss', 'account_type' => 'expense', 'is_active' => true]);
+        foreach ([['accounts_receivable', $receivable->id], ['accounts_payable', $payable->id], ['fx_gain', $gain->id], ['fx_loss', $loss->id]] as [$key, $accountId]) AccountMapping::create(['company_id' => $company->id, 'mapping_key' => $key, 'account_id' => $accountId]);
+
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'FX Customer', 'status' => 1]);
+        $invoice = Invoice::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'invoice_no' => 'INV-REALIZED-FX', 'date' => now()->toDateString(), 'status' => 1, 'currency_code' => 'EUR', 'exchange_rate' => 1, 'total_amount' => 90]);
+        $payment = Payment::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'paid_status' => 'unallocated', 'paid_amount' => 100, 'due_amount' => 0, 'total_amount' => 100, 'currency_code' => 'USD', 'exchange_rate' => 1.2, 'base_amount' => 120, 'is_reversed' => false]);
+        $customerAllocation = app(CustomerPaymentAllocationService::class)->allocate($payment, [['invoice_id' => $invoice->id, 'amount' => 90, 'exchange_rate' => 0.9]], 'REALIZED-CUSTOMER-FX');
+
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'FX Supplier', 'is_active' => true]);
+        $purchaseInvoice = PurchaseInvoice::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'invoice_no' => 'PINV-REALIZED-FX', 'invoice_date' => now()->toDateString(), 'status' => 'approved', 'currency_code' => 'EUR', 'exchange_rate' => 1, 'total_amount' => 90]);
+        $supplierPayment = SupplierPayment::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'payment_no' => 'PAY-REALIZED-FX', 'payment_date' => now()->toDateString(), 'status' => 'approved', 'amount' => 100, 'currency_code' => 'USD', 'exchange_rate' => 1.2, 'base_amount' => 120, 'is_reversed' => false]);
+        $supplierAllocation = app(SupplierPaymentService::class)->allocate($supplierPayment, $purchaseInvoice->id, 90, 'REALIZED-SUPPLIER-FX', 0.9);
+
+        $this->assertDatabaseCount('journal_entries', 2);
+        $this->assertDatabaseHas('journal_entries', ['source_type' => CustomerPaymentAllocation::class, 'source_id' => $customerAllocation->allocations->first()->id, 'external_reference' => 'FX-CUSTOMER-SETTLEMENT-'.$customerAllocation->allocations->first()->id]);
+        $this->assertDatabaseHas('journal_entries', ['source_type' => SupplierPaymentAllocation::class, 'source_id' => $supplierAllocation->id, 'external_reference' => 'FX-SUPPLIER-SETTLEMENT-'.$supplierAllocation->id]);
+        $this->assertDatabaseHas('journal_lines', ['account_id' => $receivable->id, 'debit' => 30]);
+        $this->assertDatabaseHas('journal_lines', ['account_id' => $gain->id, 'credit' => 30]);
+        $this->assertDatabaseHas('journal_lines', ['account_id' => $loss->id, 'debit' => 30]);
+        $this->assertDatabaseHas('journal_lines', ['account_id' => $payable->id, 'credit' => 30]);
+
+        app(CustomerPaymentAllocationService::class)->void($customerAllocation->allocations->first()->id, 'Corrected settlement');
+        app(SupplierPaymentService::class)->voidAllocation($supplierAllocation->id, 'Corrected settlement');
+        $this->assertDatabaseCount('journal_entries', 4);
+        $this->assertDatabaseHas('journal_entries', ['source_type' => CustomerPaymentAllocation::class, 'source_id' => $customerAllocation->allocations->first()->id, 'status' => 'reversed']);
+        $this->assertDatabaseHas('journal_entries', ['source_type' => SupplierPaymentAllocation::class, 'source_id' => $supplierAllocation->id, 'status' => 'reversed']);
     }
 }

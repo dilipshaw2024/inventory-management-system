@@ -48,6 +48,7 @@ class SupplierPaymentService
             if ($amount <= 0 || $allocated + $paymentAmount > (float) $payment->amount + 0.000001) throw new \RuntimeException('Allocation exceeds the unallocated payment balance.');
             if ($paid + $invoiceAllocated + $amount > (float) $invoice->total_amount + 0.000001) throw new \RuntimeException('Allocation exceeds the invoice outstanding balance.');
             $allocation = SupplierPaymentAllocation::create(['company_id' => $payment->company_id, 'supplier_payment_id' => $payment->id, 'purchase_invoice_id' => $invoice->id, 'amount' => $amount, 'payment_amount' => $paymentAmount, 'exchange_rate' => $rate, 'external_reference' => $externalReference, 'allocated_at' => now(), 'created_by' => auth()->id()]);
+            app(\App\Services\AutomaticAccountingService::class)->postSupplierRealizedFx($allocation);
             $this->syncAllocationStatus($payment);
             return $allocation;
         });
@@ -62,6 +63,7 @@ class SupplierPaymentService
             $payment = $this->companyScope(SupplierPayment::query(), $allocation->company_id ?: auth()->user()?->company_id)->lockForUpdate()->findOrFail($allocation->supplier_payment_id);
             if ($payment->is_reversed) throw new \RuntimeException('Allocations on reversed payments cannot be changed.');
             $allocation->update(['voided_at' => now(), 'voided_by' => auth()->id(), 'void_reason' => $reason]);
+            app(\App\Services\AutomaticAccountingService::class)->reverseRealizedFx($allocation, 'Reverse supplier payment allocation: '.$reason);
             $this->syncAllocationStatus($payment);
             return $allocation->fresh(['payment', 'invoice']);
         });

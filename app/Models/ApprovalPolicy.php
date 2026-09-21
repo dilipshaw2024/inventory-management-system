@@ -19,6 +19,8 @@ class ApprovalPolicy extends Model
         'branch_id' => 'integer',
         'category_id' => 'integer',
         'is_active' => 'boolean',
+        'escalation_permissions' => 'array',
+        'max_escalation_level' => 'integer',
     ];
 
     public function company() { return $this->belongsTo(Company::class); }

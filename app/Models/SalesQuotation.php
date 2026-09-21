@@ -10,7 +10,7 @@ class SalesQuotation extends Model
     use BelongsToCompany;
 
     protected $guarded = [];
-    protected $casts = ['quote_date' => 'date', 'valid_until' => 'date', 'approved_at' => 'datetime', 'rejected_at' => 'datetime'];
+    protected $casts = ['quote_date' => 'date', 'valid_until' => 'date', 'approved_at' => 'datetime', 'rejected_at' => 'datetime', 'customer_portal_token_expires_at' => 'datetime', 'customer_portal_last_accessed_at' => 'datetime', 'customer_responded_at' => 'datetime'];
     public function customer() { return $this->belongsTo(Customer::class); }
     public function lines() { return $this->hasMany(SalesQuotationLine::class); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }

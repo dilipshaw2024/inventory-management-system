@@ -15,7 +15,7 @@ class ProductionSuggestionService
         $openProductionByProduct = ProductionOrder::withoutGlobalScopes()->where('company_id', $companyId)->whereIn('status', ['draft', 'released', 'in_progress'])->get()->groupBy('product_id')->map(fn (Collection $orders): float => (float) $orders->sum(fn (ProductionOrder $order): float => max(0, (float) $order->planned_quantity - (float) $order->completed_quantity)));
         return BillOfMaterial::withoutGlobalScopes()
             ->with(['product', 'lines.component'])
-            ->where('is_active', true)
+            ->where('is_active', true)->where('approval_status', 'approved')
             ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
             ->whereHas('product', fn ($query) => $query->withoutGlobalScope('company')->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))
             ->where(fn ($query) => $query->whereNull('effective_from')->orWhereDate('effective_from', '<=', now()->toDateString()))

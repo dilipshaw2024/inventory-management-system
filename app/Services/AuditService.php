@@ -65,7 +65,7 @@ class AuditService
             }
         }
         try {
-            app(\App\Services\WebhookService::class)->dispatch($companyId, $action, ['auditable_type' => $model?->getMorphClass(), 'auditable_id' => $model?->getKey(), 'old_values' => $oldValues, 'new_values' => $newValues, 'user_id' => $userId ?? auth()->id()]);
+            app(\App\Services\WebhookService::class)->dispatch($companyId, $action, ['auditable_type' => $model?->getMorphClass(), 'auditable_id' => $model?->getKey(), 'old_values' => $oldValues, 'new_values' => $newValues, 'user_id' => $userId ?? auth()->id()], 'audit_log:'.$audit->id);
         } catch (\Throwable $exception) {
             report($exception);
         }

@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Delivery;
 use App\Models\DeliveryOperation;
+use App\Models\DeliveryPackage;
 use Illuminate\Support\Facades\DB;
 
 class WarehouseFulfillmentService
@@ -55,7 +56,19 @@ class WarehouseFulfillmentService
     {
         if ($delivery->status !== 'approved') throw new \RuntimeException('Only approved deliveries can be dispatched.');
         $this->assertReadyForDispatch($delivery);
-        DeliveryOperation::updateOrCreate(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch'], ['status' => 'completed', 'performed_by' => auth()->id(), 'completed_at' => now()]);
+        $dispatchedAt = now();
+        DeliveryOperation::updateOrCreate(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch'], ['status' => 'completed', 'performed_by' => auth()->id(), 'completed_at' => $dispatchedAt]);
         $delivery->update(['fulfillment_status' => 'dispatched']);
+        DeliveryPackage::where('delivery_id', $delivery->id)->where('status', 'packed')->update(['status' => 'dispatched', 'dispatched_at' => $dispatchedAt]);
+    }
+
+    public function markDelivered(Delivery $delivery, $deliveredAt): void
+    {
+        DeliveryPackage::where('delivery_id', $delivery->id)->whereIn('status', ['packed', 'dispatched'])->update(['status' => 'delivered', 'delivered_at' => $deliveredAt]);
+    }
+
+    public function markCancelled(Delivery $delivery): void
+    {
+        DeliveryPackage::where('delivery_id', $delivery->id)->whereIn('status', ['packed', 'dispatched'])->update(['status' => 'cancelled']);
     }
 }

@@ -64,6 +64,8 @@ class TaxReconciliationTest extends TestCase
         $this->assertNotEmpty($filing->json('data.snapshot_hash'));
         $this->assertNotEmpty($filing->json('data.snapshot_payload.report.summary'));
         $this->getJson('/api/accounting/tax-filings/'.$filingId.'/verify')->assertOk()->assertJsonPath('status', 'verified')->assertJsonPath('data.verified', true);
+        $this->getJson('/api/accounting/tax-filings/'.$filingId.'/export?format=json')->assertOk()->assertJsonPath('status', 'exported')->assertJsonPath('data.integrity.verified', true)->assertJsonPath('data.filing.snapshot_hash', $filing->json('data.snapshot_hash'));
+        $this->get('/api/accounting/tax-filings/'.$filingId.'/export?format=csv')->assertOk()->assertHeader('content-type', 'text/csv; charset=UTF-8')->assertHeader('content-disposition', 'attachment; filename='.$filing->json('data.filing_no').'.csv');
         $this->postJson('/api/accounting/tax-filings/'.$filingId.'/submit', ['filing_reference' => 'PORTAL-123'])
             ->assertOk()->assertJsonPath('data.status', 'submitted')->assertJsonPath('data.filing_reference', 'PORTAL-123');
         $this->postJson('/api/accounting/tax-filings/'.$filingId.'/decision', ['status' => 'accepted'])

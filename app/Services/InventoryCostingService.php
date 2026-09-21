@@ -7,10 +7,64 @@ use App\Models\InventoryCostLayer;
 use App\Models\InventoryMovement;
 use App\Models\InventoryMovementAllocation;
 use App\Models\Product;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 class InventoryCostingService
 {
+    /**
+     * Preview open-layer cost variances without changing layers, movements, or journals.
+     *
+     * Weighted/moving-average products converge their open layers to the
+     * quantity-weighted average; standard-cost products converge to standard_cost.
+     */
+    public function revaluationPreviewForCompany(int $companyId, ?string $asOf = null, ?int $productId = null, ?int $locationId = null): Collection
+    {
+        $products = Product::withoutGlobalScope('company')
+            ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+            ->where('status', 1)->whereIn('costing_method', ['weighted_average', 'moving_average', 'standard'])
+            ->where(fn ($query) => $query->whereIn('costing_method', ['weighted_average', 'moving_average'])->orWhereNotNull('standard_cost'))
+            ->when($productId, fn ($query, $id) => $query->whereKey($id))->get()->keyBy('id');
+        if ($products->isEmpty()) return collect();
+
+        $cutoff = $asOf ? CarbonImmutable::parse($asOf)->endOfDay() : null;
+        $layers = InventoryCostLayer::withoutGlobalScopes()
+            ->with(['consumptions.movement', 'location'])
+            ->whereIn('product_id', $products->keys())
+            ->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))
+            ->when($cutoff, fn ($query) => $query->where('received_at', '<=', $cutoff))
+            ->when(!$cutoff, fn ($query) => $query->where('remaining_quantity', '>', 0))
+            ->orderBy('product_id')->orderBy('received_at')->orderBy('id')->get();
+
+        return $layers->groupBy('product_id')->map(function (Collection $productLayers, $id) use ($products, $cutoff): ?array {
+            $product = $products->get($id);
+            $rows = $productLayers->map(function (InventoryCostLayer $layer) use ($cutoff): array {
+                $consumed = $cutoff
+                    ? (float) $layer->consumptions->filter(function ($consumption) use ($cutoff): bool {
+                        $date = $consumption->movement?->posted_at ?? $consumption->created_at;
+                        return $date !== null && $date <= $cutoff;
+                    })->sum('quantity')
+                    : (float) $layer->original_quantity - (float) $layer->remaining_quantity;
+                $quantity = $cutoff
+                    ? max(0, (float) $layer->original_quantity - $consumed)
+                    : (float) $layer->remaining_quantity;
+                return ['layer_id' => (int) $layer->id, 'location_id' => $layer->location_id, 'location_code' => $layer->location?->code, 'quantity' => $quantity, 'current_unit_cost' => (float) $layer->unit_cost];
+            })->filter(fn (array $row): bool => $row['quantity'] > 0.000001)->values();
+            if ($rows->isEmpty()) return null;
+
+            $totalQuantity = (float) $rows->sum('quantity');
+            $target = $product->costing_method === 'standard'
+                ? (float) ($product->standard_cost ?? 0)
+                : (float) $rows->sum(fn (array $row): float => $row['quantity'] * $row['current_unit_cost']) / max($totalQuantity, 0.000001);
+            $lines = $rows->map(function (array $row) use ($target): array {
+                $variance = $row['quantity'] * ($target - $row['current_unit_cost']);
+                return $row + ['target_unit_cost' => round($target, 6), 'variance_amount' => round($variance, 6)];
+            })->filter(fn (array $row): bool => abs($row['variance_amount']) > 0.000001)->values();
+            return ['product_id' => (int) $product->id, 'name' => $product->name, 'sku' => $product->sku, 'costing_method' => $product->costing_method, 'as_of' => $cutoff?->toDateString(), 'quantity' => round($totalQuantity, 6), 'current_value' => round((float) $rows->sum(fn (array $row): float => $row['quantity'] * $row['current_unit_cost']), 6), 'target_unit_cost' => round($target, 6), 'target_value' => round($totalQuantity * $target, 6), 'variance_amount' => round((float) $lines->sum('variance_amount'), 6), 'revaluation_required' => $lines->isNotEmpty(), 'lines' => $lines];
+        })->filter()->values();
+    }
+
     public function receipt(int $productId, float $quantity, float $unitCost, ?int $locationId = null, ?int $batchId = null, ?InventoryMovement $movement = null, ?int $serialId = null): void
     {
         if ($quantity <= 0) return;

@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\BillOfMaterial;
 use App\Models\Product;
+use App\Services\UomConversionService;
 use Carbon\Carbon;
 
 /**
@@ -48,8 +49,9 @@ class BomExplosionService
         $path[] = $bom->id;
         $bom->loadMissing('lines');
         foreach ($bom->lines as $line) {
-            $quantity = (float) $line->quantity * $factor * (1 + ((float) $line->scrap_percent / 100));
             $component = $this->componentForCompany((int) $line->component_product_id, $companyId);
+            $lineQuantity = $line->uom_id ? app(UomConversionService::class)->toStock($component, (float) $line->quantity, (int) $line->uom_id, 'manufacturing', $asOf) : (float) $line->quantity;
+            $quantity = $lineQuantity * $factor * (1 + ((float) $line->scrap_percent / 100));
             $child = $this->effectiveChild($line->component_product_id, $companyId, $asOf);
 
             if ($child) {
@@ -73,11 +75,10 @@ class BomExplosionService
         $path[] = $bom->id;
         $lines = [];
         foreach ($bom->lines as $line) {
-            if ($companyId !== null) {
-                $this->componentForCompany((int) $line->component_product_id, $companyId);
-            }
+            $component = $this->componentForCompany((int) $line->component_product_id, $companyId);
             $child = $this->effectiveChild($line->component_product_id, $companyId, $asOf);
-            $lines[] = ['component_product_id' => (int) $line->component_product_id, 'quantity' => (float) $line->quantity, 'scrap_percent' => (float) $line->scrap_percent, 'child' => $child ? $this->snapshotNode($child, $companyId, $asOf, $path) : null];
+            $lineQuantity = $line->uom_id ? app(UomConversionService::class)->toStock($component, (float) $line->quantity, (int) $line->uom_id, 'manufacturing', $asOf) : (float) $line->quantity;
+            $lines[] = ['component_product_id' => (int) $line->component_product_id, 'quantity' => $lineQuantity, 'entered_quantity' => (float) $line->quantity, 'uom_id' => $line->uom_id ? (int) $line->uom_id : null, 'scrap_percent' => (float) $line->scrap_percent, 'child' => $child ? $this->snapshotNode($child, $companyId, $asOf, $path) : null];
         }
         return ['id' => (int) $bom->id, 'code' => $bom->code, 'version' => $bom->version ?: '1', 'product_id' => (int) $bom->product_id, 'output_quantity' => (float) $bom->output_quantity, 'lines' => $lines, 'byproducts' => $bom->byproducts->map(fn ($byproduct): array => ['product_id' => (int) $byproduct->product_id, 'quantity' => (float) $byproduct->quantity, 'cost_share_percent' => (float) $byproduct->cost_share_percent])->values()->all()];
     }
@@ -97,7 +98,7 @@ class BomExplosionService
 
     private function effectiveChild(int $productId, ?int $companyId, string $asOf): ?BillOfMaterial
     {
-        return BillOfMaterial::withoutGlobalScopes()->where('product_id', $productId)->where('is_active', true)
+        return BillOfMaterial::withoutGlobalScopes()->where('product_id', $productId)->where('is_active', true)->where('approval_status', 'approved')
             ->when($companyId !== null, fn ($query) => $query->whereHas('product', fn ($scope) => $scope->where(fn ($owner) => $owner->where('company_id', $companyId)->orWhereNull('company_id'))))
             ->when($companyId !== null, fn ($query) => $query->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))
             ->where(fn ($query) => $query->whereNull('effective_from')->orWhereDate('effective_from', '<=', $asOf))

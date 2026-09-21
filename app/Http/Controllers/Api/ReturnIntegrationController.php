@@ -33,7 +33,7 @@ class ReturnIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
             'return_type' => ['required', 'in:sales,purchase'],
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('inventory_returns', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'customer_id' => ['nullable', 'integer', Rule::exists('customers', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'supplier_id' => ['nullable', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],

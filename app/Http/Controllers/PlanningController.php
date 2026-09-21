@@ -40,10 +40,11 @@ class PlanningController extends Controller
         $recentIssueProductIds = in_array($type, ['slow', 'dead'], true)
             ? InventoryMovement::whereIn('product_id', $allProducts->pluck('id'))->where('movement_type', 'issue')->where('posted_at', '>=', $cutoff)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->pluck('product_id')->unique()
             : collect();
-        $matching = $allProducts->filter(function (Product $product) use ($type, $availability, $recentIssueProductIds, $policies): bool {
+        $planning = app(ReplenishmentPlanningService::class);
+        $matching = $allProducts->filter(function (Product $product) use ($type, $availability, $recentIssueProductIds, $policies, $planning, $companyId): bool {
             $current = (float) ($availability[$product->id] ?? 0);
             $policy = $policies->get($product->id);
-            $reorder = (float) ($policy?->reorder_point ?? $product->reorder_level);
+            $reorder = $policy ? $planning->effectiveReorderPoint($product, $policy, $companyId) : (float) $product->reorder_level;
             $maximum = $policy?->max_stock !== null ? (float) $policy->max_stock : ($product->max_stock === null ? null : (float) $product->max_stock);
             return match ($type) {
                 'low' => $current <= $reorder,
@@ -51,12 +52,12 @@ class PlanningController extends Controller
                 'slow' => !$recentIssueProductIds->contains($product->id),
                 'dead' => !$recentIssueProductIds->contains($product->id) && $current > 0,
             };
-        })->map(function (Product $product) use ($availability, $policies, $locationId): Product {
+        })->map(function (Product $product) use ($availability, $policies, $locationId, $planning, $companyId): Product {
             $current = (float) ($availability[$product->id] ?? 0); $excess = $product->max_stock === null ? 0 : max(0, $current - (float) $product->max_stock);
             $policy = $policies->get($product->id);
             $maximum = $policy?->max_stock !== null ? (float) $policy->max_stock : ($product->max_stock === null ? null : (float) $product->max_stock);
             $excess = $maximum === null ? 0 : max(0, $current - $maximum);
-            $product->setAttribute('current_stock', $current); $product->setAttribute('planning_reorder_level', (float) ($policy?->reorder_point ?? $product->reorder_level));
+            $product->setAttribute('current_stock', $current); $product->setAttribute('planning_reorder_level', $policy ? $planning->effectiveReorderPoint($product, $policy, $companyId) : (float) $product->reorder_level);
             $product->setAttribute('planning_min_stock', $policy?->min_stock === null ? $product->min_stock : (float) $policy->min_stock);
             $product->setAttribute('planning_max_stock', $maximum); $product->setAttribute('planning_location_id', $locationId);
             $product->setAttribute('excess_quantity', $excess); $product->setAttribute('excess_value', $excess * (float) ($product->purchase_price ?? 0));

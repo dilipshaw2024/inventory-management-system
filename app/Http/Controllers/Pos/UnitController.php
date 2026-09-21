@@ -12,9 +12,14 @@ use Illuminate\Validation\Rule;
 
 class UnitController extends Controller
 {
+     private function companyId(): int
+     {
+         return (int) Auth::user()->company_id;
+     }
+
      public function UnitAll(){
         
-        $units = Unit::latest()->get();
+        $units = Unit::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->latest()->get();
         return view('backend.unit.unit_all',compact('units'));
     } // End Method 
 
@@ -59,7 +64,7 @@ class UnitController extends Controller
 
     public function UnitEdit($id){
 
-          $unit = Unit::findOrFail($id);
+          $unit = Unit::where('company_id', $this->companyId())->findOrFail($id);
         return view('backend.unit.unit_edit',compact('unit'));
 
     }// End Method 
@@ -68,7 +73,7 @@ class UnitController extends Controller
     public function UnitUpdate(Request $request){
 
         $request->validate([
-            'id' => ['required', 'integer', 'exists:units,id'],
+            'id' => ['required', 'integer', Rule::exists('units', 'id')->where('company_id', $this->companyId())],
             'name' => ['required', 'string', 'max:255'],
             'code' => ['nullable', 'string', 'max:40', Rule::unique('units', 'code')->ignore($request->id)->where(fn ($query) => $query->where('company_id', Auth::user()->company_id)->orWhereNull('company_id'))],
             'decimal_places' => ['required', 'integer', 'between:0,8'],
@@ -78,7 +83,7 @@ class UnitController extends Controller
 
         $unit_id = $request->id;
 
-        Unit::findOrFail($unit_id)->update([
+        Unit::where('company_id', $this->companyId())->findOrFail($unit_id)->update([
             'name' => $request->name,
             'code' => $request->code ?: null,
             'decimal_places' => (int) $request->decimal_places,
@@ -101,7 +106,7 @@ class UnitController extends Controller
 
     public function UnitDelete($id){
 
-          $unit = Unit::findOrFail($id);
+          $unit = Unit::where('company_id', $this->companyId())->findOrFail($id);
           if ($unit->products()->exists()) {
               return redirect()->back()->with(['message' => 'This unit cannot be deleted because it is linked to a product.', 'alert-type' => 'error']);
           }

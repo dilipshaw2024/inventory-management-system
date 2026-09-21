@@ -16,7 +16,7 @@ class ForecastIntegrationController extends Controller
 {
     public function index(Request $request): JsonResponse
     {
-        $data = $request->validate(['history_days' => ['nullable', 'integer', 'min:7', 'max:730'], 'horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'], 'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'seasonality' => ['nullable', 'in:none,weekly']]);
+        $data = $request->validate(['history_days' => ['nullable', 'integer', 'min:7', 'max:730'], 'horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'], 'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'seasonality' => ['nullable', 'in:none,weekly,exponential,auto']]);
         $companyId = $request->user()?->company_id; abort_unless($companyId, 403, 'A company is required for demand forecasting.');
         if (!empty($data['location_id'])) InventoryLocation::whereKey($data['location_id'])->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->firstOrFail();
         $result = app(DemandForecastPlanningService::class)->forecastsForCompany((int) $companyId, (int) ($data['history_days'] ?? 90), (int) ($data['horizon_days'] ?? 30), $data['product_id'] ?? null, $data['location_id'] ?? null, $data['seasonality'] ?? 'none');

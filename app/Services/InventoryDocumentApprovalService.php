@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\InventoryBatch;
+use App\Models\InventoryCostLayer;
 use App\Models\InventoryDocument;
 use App\Models\Product;
 use App\Models\User;
@@ -32,13 +33,21 @@ class InventoryDocumentApprovalService
                     throw new \RuntimeException('Insufficient available stock at the selected location for '.$product->name.'.');
                 }
 
+                $batchAllocations = collect($line->batch_allocations ?: []);
+                $multiBatchIssue = $document->document_type === 'issue' && $batchAllocations->isNotEmpty();
+                if ($multiBatchIssue && abs((float) $batchAllocations->sum(fn (array $allocation): float => (float) ($allocation['quantity'] ?? 0)) - $quantity) > 0.000001) {
+                    throw new \RuntimeException('Batch allocation quantities must equal the issue quantity for '.$product->name.'.');
+                }
+                if ($multiBatchIssue && $product->tracking_type === 'serial' && $line->serial_numbers) {
+                    throw new \RuntimeException('Serial numbers must be supplied inside each batch allocation for '.$product->name.'.');
+                }
                 $batch = null;
-                if ($line->batch_no && $document->document_type === 'receipt') {
+                if (!$multiBatchIssue && $line->batch_no && $document->document_type === 'receipt') {
                     $batch = InventoryBatch::firstOrCreate(
                         ['product_id' => $product->id, 'batch_no' => $line->batch_no],
                         ['location_id' => $document->location_id, 'manufacturing_date' => $line->manufacturing_date, 'expiry_date' => $line->expiry_date, 'best_before_date' => $line->best_before_date, 'warranty_until' => $line->warranty_until]
                     );
-                } elseif ($line->batch_no && $document->document_type === 'issue') {
+                } elseif (!$multiBatchIssue && $line->batch_no && $document->document_type === 'issue') {
                     $batch = InventoryBatch::where('product_id', $product->id)->where('batch_no', $line->batch_no)->lockForUpdate()->first();
                     if (!$batch) throw new \RuntimeException('Batch '.$line->batch_no.' was not found for '.$product->name.'.');
                     if ($batch->location_id && $document->location_id && (int) $batch->location_id !== (int) $document->location_id) throw new \RuntimeException('Selected batch is not held at the selected location.');
@@ -47,7 +56,7 @@ class InventoryDocumentApprovalService
                 $serialNumbers = $line->serial_numbers ? array_values(array_filter(array_map('trim', preg_split('/[,\r\n]+/', $line->serial_numbers)))) : [];
                 $issuedSerials = collect();
                 $receivedSerials = collect();
-                if ($product->tracking_type === 'serial') {
+                if (!$multiBatchIssue && $product->tracking_type === 'serial') {
                     if ($document->document_type === 'receipt') {
                         if (count($serialNumbers) !== (int) round($quantity)) throw new \RuntimeException('Serial count must equal quantity for '.$product->name.'.');
                         foreach ($serialNumbers as $serialNo) $receivedSerials->push(app(SerialLifecycleService::class)->receive($product, $serialNo, $document->location_id, $batch?->id, $line->warranty_until));
@@ -64,7 +73,23 @@ class InventoryDocumentApprovalService
                 $unitCost = $line->unit_cost !== null ? (float) $line->unit_cost : (float) ($product->purchase_price ?? 0);
                 $departmentId = $line->department_id ?: $document->department_id;
                 $costCenterId = $line->cost_center_id ?: $document->cost_center_id;
-                if ($document->document_type === 'issue' && $issuedSerials->isNotEmpty()) {
+                if ($multiBatchIssue) {
+                    foreach ($batchAllocations as $allocation) {
+                        $allocatedQuantity = (float) $allocation['quantity'];
+                        $allocatedBatch = InventoryBatch::where('product_id', $product->id)->where('batch_no', $allocation['batch_no'])->lockForUpdate()->first();
+                        if (!$allocatedBatch) throw new \RuntimeException('Batch '.$allocation['batch_no'].' was not found for '.$product->name.'.');
+                        if ($allocatedBatch->location_id && $document->location_id && (int) $allocatedBatch->location_id !== (int) $document->location_id) throw new \RuntimeException('Selected batch is not held at the selected location.');
+                        $batchAvailable = (float) InventoryCostLayer::where('product_id', $product->id)->where('batch_id', $allocatedBatch->id)->where('remaining_quantity', '>', 0)->when($document->location_id, fn ($query) => $query->where('location_id', $document->location_id))->sum('remaining_quantity');
+                        if ($batchAvailable + 0.000001 < $allocatedQuantity) throw new \RuntimeException('Insufficient stock in batch '.$allocatedBatch->batch_no.' for '.$product->name.'.');
+                        $allocationSerials = array_values(array_filter(array_map('trim', $allocation['serial_numbers'] ?? [])));
+                        if ($product->tracking_type === 'serial') {
+                            if (count($allocationSerials) !== (int) round($allocatedQuantity)) throw new \RuntimeException('Serial count must equal the batch allocation quantity for '.$product->name.'.');
+                            foreach (app(SerialLifecycleService::class)->issueSpecific($product, $allocationSerials, $document->location_id, $allocatedBatch->id) as $serial) app(InventoryLedgerService::class)->post($product->id, 'issue', 1, $unitCost, $document->location_id, $document, $document->description, null, $allocatedBatch->id, $serial->id, $departmentId, $costCenterId);
+                        } else {
+                            app(InventoryLedgerService::class)->post($product->id, 'issue', $allocatedQuantity, $unitCost, $document->location_id, $document, $document->description, null, $allocatedBatch->id, null, $departmentId, $costCenterId);
+                        }
+                    }
+                } elseif ($document->document_type === 'issue' && $issuedSerials->isNotEmpty()) {
                     foreach ($issuedSerials as $serial) app(InventoryLedgerService::class)->post($product->id, 'issue', 1, $unitCost, $document->location_id, $document, $document->description, null, $batch?->id, $serial->id, $departmentId, $costCenterId);
                 } elseif ($document->document_type === 'receipt' && $receivedSerials->isNotEmpty()) {
                     foreach ($receivedSerials as $serial) app(InventoryLedgerService::class)->post($product->id, 'receipt', 1, $unitCost, $document->location_id, $document, $document->description, null, $batch?->id, $serial->id, $departmentId, $costCenterId);

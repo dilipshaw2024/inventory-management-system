@@ -378,6 +378,22 @@ class ErpFoundationTest extends TestCase
         self::assertEqualsWithDelta(16.0, $forecast, 0.0001);
     }
 
+    public function test_demand_forecast_exponential_smoothing_is_deterministic(): void
+    {
+        $forecast = (new DemandForecastService())->exponentialForecast(collect([2, 4, 8, 8]), 5, 1.0, 0.5);
+        self::assertEqualsWithDelta(6.75 * 5, $forecast, 0.0001);
+    }
+
+    public function test_demand_forecast_auto_selection_chooses_weekly_pattern_when_backtest_is_better(): void
+    {
+        $history = collect(range(0, 55))->map(fn (int $day): float => ((CarbonImmutable::parse('2026-01-05')->addDays($day)->dayOfWeek) === 1) ? 10.0 : 1.0);
+        $selection = (new DemandForecastService())->selectModel($history, CarbonImmutable::parse('2026-01-05'), 14, 2.2857);
+        self::assertSame('weekly', $selection['model']);
+        self::assertLessThan($selection['naive_error'], $selection['weekly_error']);
+        self::assertArrayHasKey('rmse', $selection['metrics']['weekly']);
+        self::assertArrayHasKey('wape', $selection['metrics']['weekly']);
+    }
+
     public function test_webhook_signature_is_hmac_sha256(): void
     {
         self::assertSame('sha256='.hash_hmac('sha256', '{"event":"stock.updated"}', 'secret'), (new WebhookService())->signature('{"event":"stock.updated"}', 'secret'));

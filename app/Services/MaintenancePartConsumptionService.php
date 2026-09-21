@@ -23,6 +23,11 @@ class MaintenancePartConsumptionService
         if ($quantity <= 0.000001) throw new \RuntimeException('Part quantity must be greater than zero.');
         $serialNumbers = array_values(array_unique(array_filter(array_map('trim', $serialNumbers))));
 
+        // A maintenance reservation belongs to the same order and is consumed
+        // before availability is checked, so it cannot reserve stock against
+        // the order that is now issuing it.
+        app(StockReservationService::class)->releaseForMaintenancePart($order, $product, $quantity, $locationId, $batchId);
+
         $batch = null;
         if ($batchId !== null) {
             $batch = InventoryBatch::whereKey($batchId)->where('product_id', $product->id)->lockForUpdate()->first();

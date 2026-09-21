@@ -20,4 +20,14 @@ class Company extends Model
     {
         return $this->hasMany(Department::class);
     }
+
+    public function parentCompany()
+    {
+        return $this->belongsTo(self::class, 'parent_company_id');
+    }
+
+    public function subsidiaries()
+    {
+        return $this->hasMany(self::class, 'parent_company_id');
+    }
 }

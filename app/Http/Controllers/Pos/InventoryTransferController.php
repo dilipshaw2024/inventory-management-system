@@ -21,16 +21,22 @@ use Illuminate\Http\Request;
 
 class InventoryTransferController extends Controller
 {
+    private function companyId(): int
+    {
+        return (int) auth()->user()->company_id;
+    }
+
     public function index()
     {
-        $transfers = InventoryTransfer::with(['creator', 'approver', 'lines.product'])->latest()->paginate(30);
+        $transfers = InventoryTransfer::where('company_id', $this->companyId())->with(['creator', 'approver', 'lines.product'])->latest()->paginate(30);
         return view('backend.stock.transfer_all', compact('transfers'));
     }
 
     public function create()
     {
-        $products = Product::orderBy('name')->get();
-        $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
+        $companyId = $this->companyId();
+        $products = Product::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('name')->get();
+        $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('code')->get();
         return view('backend.stock.transfer_add', compact('products', 'locations'));
     }
 
@@ -38,6 +44,7 @@ class InventoryTransferController extends Controller
     {
         DB::transaction(function () use ($request): void {
             $transfer = InventoryTransfer::create([
+                'company_id' => $this->companyId(),
                 'transfer_no' => $request->transfer_no ?: app(NumberingSequenceService::class)->nextOrFallback('inventory_transfer', 'TRF-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id),
                 'date' => $request->date,
                 'description' => $request->description,
@@ -67,7 +74,7 @@ class InventoryTransferController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(InventoryTransfer::class, $id);
         try {
             DB::transaction(function () use ($id): void {
-                $transfer = InventoryTransfer::with('lines')->lockForUpdate()->findOrFail($id);
+                $transfer = InventoryTransfer::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($transfer->status !== 'pending') {
                     throw new \RuntimeException('This transfer has already been processed.');
                 }
@@ -88,11 +95,11 @@ class InventoryTransferController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(InventoryTransfer::class, $id);
         try {
             DB::transaction(function () use ($id): void {
-                $transfer = InventoryTransfer::with('lines')->lockForUpdate()->findOrFail($id);
+                $transfer = InventoryTransfer::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($transfer->status !== 'approved') throw new \RuntimeException('Only approved transfers can be dispatched.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($transfer);
                 foreach ($transfer->lines as $line) {
-                    $product = Product::lockForUpdate()->findOrFail($line->product_id);
+                    $product = Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->lockForUpdate()->findOrFail($line->product_id);
                     if (app(InventoryAvailabilityService::class)->available($product, false, $line->source_location_id, $transfer->company_id) < (float) $line->quantity) throw new \RuntimeException('Insufficient stock at the selected source location for '.$product->name.'.');
                     $reservedSerials = app(SerialLifecycleService::class)->reserveForTransfer($product, (float) $line->quantity, (int) $line->source_location_id);
                     if ($reservedSerials->isNotEmpty()) {
@@ -115,7 +122,7 @@ class InventoryTransferController extends Controller
         $request->validate(['received_quantity' => ['nullable', 'array'], 'received_quantity.*' => ['nullable', 'numeric', 'min:0'], 'receiving_note' => ['nullable', 'string', 'max:2000']]);
         try {
             DB::transaction(function () use ($id, $request): void {
-                $transfer = InventoryTransfer::with(['lines.transferSerials.serial'])->lockForUpdate()->findOrFail($id);
+                $transfer = InventoryTransfer::where('company_id', $this->companyId())->with(['lines.transferSerials.serial'])->lockForUpdate()->findOrFail($id);
                 if (!in_array($transfer->status, ['in_transit', 'partially_received'], true)) throw new \RuntimeException('Only in-transit transfers can be received.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($transfer);
                 $receivedQuantities = $request->input('received_quantity', []);
@@ -173,7 +180,7 @@ class InventoryTransferController extends Controller
 
         try {
             DB::transaction(function () use ($id, $data): void {
-                $transfer = InventoryTransfer::with('lines')->lockForUpdate()->findOrFail($id);
+                $transfer = InventoryTransfer::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($transfer->status !== 'received' || $transfer->variance_status !== 'pending') {
                     throw new \RuntimeException('Only a fully received transfer with a pending variance can be resolved.');
                 }
@@ -197,7 +204,7 @@ class InventoryTransferController extends Controller
 
         try {
             DB::transaction(function () use ($id, $data): void {
-                $transfer = InventoryTransfer::with('lines')->lockForUpdate()->findOrFail($id);
+                $transfer = InventoryTransfer::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($transfer->status !== 'partially_received' || !$transfer->lines->contains(fn ($line): bool => (float) $line->received_quantity < (float) $line->quantity)) {
                     throw new \RuntimeException('Only partially received transfers with an outstanding shortage can be closed.');
                 }
@@ -216,7 +223,7 @@ class InventoryTransferController extends Controller
     public function reject(Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $transfer = InventoryTransfer::findOrFail($id);
+        $transfer = InventoryTransfer::where('company_id', $this->companyId())->findOrFail($id);
         if ($transfer->status !== 'pending') {
             return redirect()->back()->with(['message' => 'This transfer has already been processed.', 'alert-type' => 'error']);
         }

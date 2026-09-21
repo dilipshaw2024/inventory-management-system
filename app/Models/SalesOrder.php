@@ -12,6 +12,7 @@ class SalesOrder extends Model
     protected $guarded = [];
     protected $casts = ['date' => 'date', 'requested_date' => 'date', 'exchange_rate' => 'decimal:12', 'allow_backorders' => 'boolean', 'approved_at' => 'datetime', 'cancelled_at' => 'datetime', 'rejected_at' => 'datetime', 'promotion_ids' => 'array'];
     public function customer() { return $this->belongsTo(Customer::class); }
+    public function priceList() { return $this->belongsTo(PriceList::class); }
     public function store() { return $this->belongsTo(Store::class); }
     public function location() { return $this->belongsTo(InventoryLocation::class); }
     public function lines() { return $this->hasMany(SalesOrderLine::class); }

@@ -9,15 +9,19 @@ use App\Models\Product;
 use App\Models\Supplier;
 use App\Services\AuditService;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 class PriceListController extends Controller
 {
     public function index()
     {
-        $lists = PriceList::withCount('items')->latest()->paginate(30);
-        $products = Product::where('status', 1)->orderBy('name')->get(['id', 'name', 'sku']);
-        $customers = Customer::where('status', 1)->orderBy('name')->get(['id', 'name', 'sales_price_list_id']);
-        $suppliers = Supplier::where('status', 1)->orderBy('name')->get(['id', 'name', 'purchase_price_list_id']);
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for price lists.');
+        $owned = fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id');
+        $lists = PriceList::withCount('items')->where('company_id', $companyId)->latest()->paginate(30);
+        $products = Product::where('status', 1)->where($owned)->orderBy('name')->get(['id', 'name', 'sku']);
+        $customers = Customer::where('status', 1)->where($owned)->orderBy('name')->get(['id', 'name', 'sales_price_list_id']);
+        $suppliers = Supplier::where('status', 1)->where($owned)->orderBy('name')->get(['id', 'name', 'purchase_price_list_id']);
         return view('admin.erp.price_lists', compact('lists', 'products', 'customers', 'suppliers'));
     }
 
@@ -34,10 +38,11 @@ class PriceListController extends Controller
 
     public function storeItem(Request $request)
     {
-        $data = $request->validate(['price_list_id' => ['required', 'integer', 'exists:price_lists,id'], 'product_id' => ['required', 'integer', 'exists:products,id'], 'minimum_quantity' => ['required', 'numeric', 'gt:0'], 'unit_price' => ['required', 'numeric', 'min:0'], 'discount_percent' => ['nullable', 'numeric', 'min:0', 'max:100']]);
-        $list = PriceList::findOrFail($data['price_list_id']);
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for price lists.');
+        $data = $request->validate(['price_list_id' => ['required', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId))], 'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'minimum_quantity' => ['required', 'numeric', 'gt:0'], 'unit_price' => ['required', 'numeric', 'min:0'], 'discount_percent' => ['nullable', 'numeric', 'min:0', 'max:100']]);
+        $list = PriceList::where('company_id', $companyId)->findOrFail($data['price_list_id']);
         if (!$list->is_active) return back()->withErrors(['price_list_id' => 'Items cannot be added to an inactive price list.'])->withInput();
-        if (!Product::whereKey($data['product_id'])->exists()) abort(403, 'The product is outside the current company.');
         if (PriceListItem::where('price_list_id', $list->id)->where('product_id', $data['product_id'])->where('minimum_quantity', $data['minimum_quantity'])->exists()) return back()->withErrors(['minimum_quantity' => 'This product quantity break already exists.'])->withInput();
         $item = PriceListItem::create($data + ['company_id' => $list->company_id, 'price_list_id' => $list->id, 'discount_percent' => $data['discount_percent'] ?? 0, 'is_active' => true]);
         app(AuditService::class)->record('price_list_item.created', $item, null, $item->toArray());
@@ -46,9 +51,11 @@ class PriceListController extends Controller
 
     public function assignCustomer(Request $request)
     {
-        $data = $request->validate(['customer_id' => ['required', 'integer', 'exists:customers,id'], 'price_list_id' => ['nullable', 'integer', 'exists:price_lists,id']]);
-        $customer = Customer::findOrFail($data['customer_id']);
-        if ($data['price_list_id'] && !PriceList::whereKey($data['price_list_id'])->where('list_type', 'sales')->where('is_active', true)->exists()) abort(422, 'Select an active sales price list.');
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for price lists.');
+        $data = $request->validate(['customer_id' => ['required', 'integer', Rule::exists('customers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'sales'))]]);
+        $customer = Customer::whereKey($data['customer_id'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->firstOrFail();
+        if ($data['price_list_id'] && !PriceList::where('company_id', $companyId)->whereKey($data['price_list_id'])->where('list_type', 'sales')->where('is_active', true)->exists()) abort(422, 'Select an active sales price list.');
         $before = ['sales_price_list_id' => $customer->sales_price_list_id];
         $customer->update(['sales_price_list_id' => $data['price_list_id'] ?: null]);
         app(AuditService::class)->record('customer.sales_price_list_updated', $customer, $before, $customer->fresh()->only(['sales_price_list_id']));
@@ -57,9 +64,11 @@ class PriceListController extends Controller
 
     public function assignSupplier(Request $request)
     {
-        $data = $request->validate(['supplier_id' => ['required', 'integer', 'exists:suppliers,id'], 'price_list_id' => ['nullable', 'integer', 'exists:price_lists,id']]);
-        $supplier = Supplier::findOrFail($data['supplier_id']);
-        if ($data['price_list_id'] && !PriceList::whereKey($data['price_list_id'])->where('list_type', 'purchase')->where('is_active', true)->exists()) abort(422, 'Select an active purchase price list.');
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for price lists.');
+        $data = $request->validate(['supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'purchase'))]]);
+        $supplier = Supplier::whereKey($data['supplier_id'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->firstOrFail();
+        if ($data['price_list_id'] && !PriceList::where('company_id', $companyId)->whereKey($data['price_list_id'])->where('list_type', 'purchase')->where('is_active', true)->exists()) abort(422, 'Select an active purchase price list.');
         $before = ['purchase_price_list_id' => $supplier->purchase_price_list_id];
         $supplier->update(['purchase_price_list_id' => $data['price_list_id'] ?: null]);
         app(AuditService::class)->record('supplier.purchase_price_list_updated', $supplier, $before, $supplier->fresh()->only(['purchase_price_list_id']));
@@ -68,7 +77,9 @@ class PriceListController extends Controller
 
     public function deactivate(int $id)
     {
-        $list = PriceList::findOrFail($id);
+        $companyId = auth()->user()?->company_id;
+        abort_unless($companyId, 422, 'A company is required for price lists.');
+        $list = PriceList::where('company_id', $companyId)->findOrFail($id);
         if ($list->is_active) {
             $list->update(['is_active' => false]);
             app(AuditService::class)->record('price_list.deactivated', $list, ['is_active' => true], ['is_active' => false]);

@@ -48,7 +48,7 @@ class WarehouseIntegrationController extends Controller
             'volume_m3' => (float) $warehouseLocations->sum(fn (InventoryLocation $location): float => app(InventoryLocationCapacityService::class)->occupied($location)['volume_m3']),
         ]);
         $rows = $warehouses->map(function (Warehouse $warehouse) use ($occupied, $capacity, $physicalCapacity, $physicalOccupied, $period): array { $used = max(0, (float) ($occupied[$warehouse->id] ?? 0)); $totalCapacity = (float) ($capacity[$warehouse->id] ?? 0); $physicalLimits = $physicalCapacity->get($warehouse->id, ['weight_kg' => 0, 'volume_m3' => 0]); $physicalUsed = $physicalOccupied->get($warehouse->id, ['weight_kg' => 0, 'volume_m3' => 0]); $periodRow = $period->get($warehouse->id); $inbound = $periodRow ? (float) $periodRow->inbound : null; $outbound = $periodRow ? (float) $periodRow->outbound : null; return ['warehouse_id' => $warehouse->id, 'warehouse' => $warehouse, 'occupied_quantity' => $used, 'capacity' => $totalCapacity > 0 ? $totalCapacity : null, 'available_capacity' => $totalCapacity > 0 ? max(0, $totalCapacity - $used) : null, 'utilization_percent' => $totalCapacity > 0 ? min(100, ($used / $totalCapacity) * 100) : null, 'occupied_weight_kg' => $physicalUsed['weight_kg'] > 0 ? $physicalUsed['weight_kg'] : null, 'capacity_weight_kg' => $physicalLimits['weight_kg'] > 0 ? $physicalLimits['weight_kg'] : null, 'available_weight_kg' => $physicalLimits['weight_kg'] > 0 ? max(0, $physicalLimits['weight_kg'] - $physicalUsed['weight_kg']) : null, 'occupied_volume_m3' => $physicalUsed['volume_m3'] > 0 ? $physicalUsed['volume_m3'] : null, 'capacity_volume_m3' => $physicalLimits['volume_m3'] > 0 ? $physicalLimits['volume_m3'] : null, 'available_volume_m3' => $physicalLimits['volume_m3'] > 0 ? max(0, $physicalLimits['volume_m3'] - $physicalUsed['volume_m3']) : null, 'period_inbound' => $inbound, 'period_outbound' => $outbound, 'period_net' => $inbound === null ? null : $inbound - $outbound]; });
-        $page = max(1, $request->integer('page', 1)); $perPage = (int) ($data['per_page'] ?? 50); return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'from' => $data['from'] ?? null, 'to' => $data['to'] ?? null]]);
+        $page = max(1, (int) $request->input('page', 1)); $perPage = (int) ($data['per_page'] ?? 50); return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'from' => $data['from'] ?? null, 'to' => $data['to'] ?? null]]);
     }
 
     public function locationUtilization(Request $request): JsonResponse
@@ -151,12 +151,12 @@ class WarehouseIntegrationController extends Controller
 
     public function createPutawayTask(Request $request): JsonResponse
     {
-        if (!$request->user()?->tokenCan('warehouse:write') && !$request->user()?->tokenCan('integration:write')) {
+        if (!$request->user()?->tokenCan('inventory:write') && !$request->user()?->tokenCan('warehouse:write') && !$request->user()?->tokenCan('integration:write')) {
             abort(403, 'This token cannot create warehouse put-away tasks.');
         }
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('inventory_transfers', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'source_location_id' => ['required', 'integer'],
             'destination_location_id' => ['required', 'integer', 'different:source_location_id'],
@@ -209,7 +209,7 @@ class WarehouseIntegrationController extends Controller
         $this->assertWriteAccess($request);
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('inventory_transfers', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'date' => ['required', 'date'], 'description' => ['nullable', 'string', 'max:2000'],
             'carrier_name' => ['nullable', 'string', 'max:255'], 'tracking_number' => ['nullable', 'string', 'max:255'],
             'expected_arrival' => ['nullable', 'date', 'after_or_equal:date'],
@@ -244,6 +244,39 @@ class WarehouseIntegrationController extends Controller
             return $transfer;
         });
         return response()->json(['data' => $transfer->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation', 'lines.allocations.batch', 'lines.allocations.serial'), 'status' => 'pending_approval'], 201);
+    }
+
+    public function transferReconciliation(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $transfer = $this->companyScope(InventoryTransfer::with(['lines.product', 'lines.sourceLocation', 'lines.destinationLocation']), $companyId)->findOrFail($id);
+        $movements = InventoryMovement::where('reference_type', InventoryTransfer::class)->where('reference_id', $transfer->id)
+            ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->get();
+        $rows = $transfer->lines->map(function (InventoryTransferLine $line) use ($movements): array {
+            $dispatch = (float) $movements->where('product_id', $line->product_id)->where('location_id', $line->source_location_id)->where('movement_type', 'transfer_out')->sum('quantity');
+            $receipt = (float) $movements->where('product_id', $line->product_id)->where('location_id', $line->destination_location_id)->where('movement_type', 'transfer_in')->sum('quantity');
+            $expected = (float) $line->quantity;
+            $received = (float) ($line->received_quantity ?? 0);
+            $status = $dispatch <= 0.000001 && $receipt <= 0.000001
+                ? 'not_posted'
+                : (abs($dispatch - $expected) > 0.000001 || abs($receipt - $received) > 0.000001
+                    ? 'variance'
+                    : 'reconciled');
+            return [
+                'line_id' => (int) $line->id, 'product_id' => (int) $line->product_id, 'product_name' => $line->product?->name,
+                'source_location_id' => (int) $line->source_location_id, 'source_location_code' => $line->sourceLocation?->code,
+                'destination_location_id' => (int) $line->destination_location_id, 'destination_location_code' => $line->destinationLocation?->code,
+                'planned_quantity' => $expected, 'received_quantity' => $received, 'dispatched_ledger_quantity' => $dispatch,
+                'received_ledger_quantity' => $receipt, 'dispatch_variance' => $dispatch - $expected, 'receipt_variance' => $receipt - $received,
+                'reconciliation_status' => $status,
+            ];
+        })->values();
+        return response()->json([
+            'data' => $rows,
+            'transfer' => $transfer->only(['id', 'transfer_no', 'external_reference', 'status', 'variance_status', 'date', 'dispatched_at', 'received_at']),
+            'summary' => ['line_count' => $rows->count(), 'planned_quantity' => round((float) $rows->sum('planned_quantity'), 6), 'received_quantity' => round((float) $rows->sum('received_quantity'), 6), 'dispatched_ledger_quantity' => round((float) $rows->sum('dispatched_ledger_quantity'), 6), 'received_ledger_quantity' => round((float) $rows->sum('received_ledger_quantity'), 6), 'variance_line_count' => $rows->where('reconciliation_status', 'variance')->count()],
+            'read_only' => true,
+        ]);
     }
 
     public function approveTransfer(Request $request, int $id): JsonResponse
@@ -366,7 +399,7 @@ class WarehouseIntegrationController extends Controller
 
     private function assertWriteAccess(Request $request): void
     {
-        if (!$request->user()?->tokenCan('warehouse:write') && !$request->user()?->tokenCan('integration:write')) abort(403, 'This token cannot modify warehouse transfers.');
+        if (!$request->user()?->tokenCan('inventory:write') && !$request->user()?->tokenCan('warehouse:write') && !$request->user()?->tokenCan('integration:write')) abort(403, 'This token cannot modify warehouse transfers.');
     }
 
     private function companyScope($query, ?int $companyId)

@@ -30,15 +30,29 @@ class OrganizationIntegrationController extends Controller
             'name' => ['sometimes', 'required', 'string', 'max:255'], 'code' => ['sometimes', 'required', 'string', 'max:100', Rule::unique('companies', 'code')->ignore($companyId)],
             'tax_number' => ['sometimes', 'nullable', 'string', 'max:100'], 'email' => ['sometimes', 'nullable', 'email', 'max:255'],
             'phone' => ['sometimes', 'nullable', 'string', 'max:50'], 'address' => ['sometimes', 'nullable', 'string', 'max:2000'],
-            'base_currency' => ['sometimes', 'required', 'string', 'size:3'], 'is_active' => ['sometimes', 'boolean'],
+            'base_currency' => ['sometimes', 'required', 'string', 'size:3'], 'consolidation_currency' => ['sometimes', 'nullable', 'string', 'size:3'],
+            'parent_company_id' => ['sometimes', 'nullable', 'integer', Rule::exists('companies', 'id')], 'is_active' => ['sometimes', 'boolean'],
         ]);
         if (array_key_exists('base_currency', $data)) $data['base_currency'] = strtoupper($data['base_currency']);
+        if (array_key_exists('consolidation_currency', $data) && $data['consolidation_currency'] !== null) $data['consolidation_currency'] = strtoupper($data['consolidation_currency']);
         $company = Company::whereKey($companyId)->firstOrFail();
+        if (array_key_exists('parent_company_id', $data)) {
+            $parentId = $data['parent_company_id'];
+            if ($parentId !== null && (int) $parentId === (int) $company->id) abort(422, 'A company cannot be its own parent.');
+            if ($parentId !== null && $this->companyTreeContains((int) $company->id, (int) $parentId)) abort(422, 'A company cannot be assigned beneath one of its subsidiaries.');
+        }
         if (array_key_exists('is_active', $data) && !$data['is_active'] && $company->is_active) $this->assertCompanyCanDeactivate($company);
         $before = $company->only(array_keys($data));
         $company->update($data);
         app(AuditService::class)->record('organization.company.updated', $company, $before, $company->fresh()->only(array_keys($data)));
         return response()->json(['data' => $company->fresh(), 'status' => 'updated']);
+    }
+
+    private function companyTreeContains(int $companyId, int $candidateId): bool
+    {
+        $children = Company::where('parent_company_id', $companyId)->pluck('id');
+        if ($children->contains($candidateId)) return true;
+        return $children->contains(fn ($childId): bool => $this->companyTreeContains((int) $childId, $candidateId));
     }
 
     public function deactivateCompany(Request $request): JsonResponse
@@ -273,7 +287,7 @@ class OrganizationIntegrationController extends Controller
     public function companies(Request $request): JsonResponse
     {
         $data = $request->validate(['updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $companies = Company::with(['branches', 'departments'])
+        $companies = Company::with(['branches', 'departments', 'parentCompany'])
             ->when($request->user()?->company_id, fn ($query, $id) => $query->whereKey($id))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');

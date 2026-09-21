@@ -10,7 +10,7 @@ class InventoryReplenishmentPolicy extends Model
     use BelongsToCompany;
 
     protected $guarded = [];
-    protected $casts = ['reorder_point' => 'decimal:6', 'safety_stock' => 'decimal:6', 'service_level_z' => 'decimal:4', 'min_stock' => 'decimal:6', 'max_stock' => 'decimal:6', 'lead_time_days' => 'integer', 'safety_time_days' => 'integer', 'is_active' => 'boolean'];
+    protected $casts = ['reorder_point' => 'decimal:6', 'safety_stock' => 'decimal:6', 'service_level_z' => 'decimal:4', 'min_stock' => 'decimal:6', 'max_stock' => 'decimal:6', 'lead_time_days' => 'integer', 'safety_time_days' => 'integer', 'reorder_history_days' => 'integer', 'is_active' => 'boolean'];
     public function product() { return $this->belongsTo(Product::class); }
     public function location() { return $this->belongsTo(InventoryLocation::class); }
 

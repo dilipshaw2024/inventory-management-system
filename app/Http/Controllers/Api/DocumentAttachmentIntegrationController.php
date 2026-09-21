@@ -15,6 +15,7 @@ class DocumentAttachmentIntegrationController extends Controller
 {
     private array $types = [
         'product' => \App\Models\Product::class,
+        'brand' => \App\Models\Brand::class,
         'purchase_requisition' => \App\Models\PurchaseRequisition::class,
         'purchase_rfq' => \App\Models\PurchaseRfq::class,
         'purchase_order' => \App\Models\PurchaseOrder::class,

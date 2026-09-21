@@ -4,8 +4,20 @@
 <script>
 document.addEventListener('DOMContentLoaded', function () {
     const form = document.querySelector('form[action*="inventory.status.store"]');
+    const target = form?.querySelector('[name="to_status"]');
+    const fields = form ? form.querySelectorAll('.recovery-fields') : [];
+    const sync = () => fields.forEach((field) => { field.style.display = target?.value === 'scrap' ? '' : 'none'; });
+    target?.addEventListener('change', sync); sync();
+});
+document.addEventListener('DOMContentLoaded', function () {
+document.addEventListener('DOMContentLoaded', function () {
+    const form = document.querySelector('form[action*="inventory.status.store"]');
     const submit = form?.querySelector('button.btn-primary');
     if (!form || !submit) return;
+    const recovery = document.createElement('div');
+    recovery.className = 'row g-3 recovery-fields';
+    recovery.innerHTML = '<div class="col-md-4"><label>Recovery product (optional)</label><select name="recovery_product_id" class="form-select"><option value="">None</option>@foreach($products as $recoveryProduct)<option value="{{ $recoveryProduct->id }}">{{ $recoveryProduct->name }}</option>@endforeach</select></div><div class="col-md-4"><label>Recovery quantity</label><input name="recovery_quantity" type="number" min="0.000001" step="0.000001" class="form-control"></div><div class="col-md-4"><label>Recovery unit value</label><input name="recovery_unit_cost" type="number" min="0" step="0.000001" class="form-control"></div>';
+    submit.parentElement.before(recovery);
     const wrapper = document.createElement('div');
     wrapper.className = 'form-check mb-3';
     wrapper.innerHTML = '<input name="inspection_required" value="1" type="checkbox" class="form-check-input" id="status-inspection"><label class="form-check-label" for="status-inspection">Require quality inspection before approval</label>';

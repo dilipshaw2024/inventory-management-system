@@ -36,7 +36,7 @@ class SupplierCreditNoteIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
             'credit_no' => ['nullable', 'string', 'max:80', Rule::unique('supplier_credit_notes', 'credit_no')->where(fn ($query) => $query->where('company_id', $companyId))],
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('supplier_credit_notes', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'supplier_claim_id' => ['nullable', 'integer', Rule::exists('supplier_claims', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'purchase_invoice_id' => ['nullable', 'integer', Rule::exists('purchase_invoices', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],

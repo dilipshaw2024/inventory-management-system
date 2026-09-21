@@ -23,7 +23,7 @@ class GeneratePurchaseOrders extends Command
     {
         $companies = Company::query()->when($this->option('company'), fn ($query, $id) => $query->whereKey($id))->pluck('id');
         foreach ($companies as $companyId) {
-            $proposals = $planning->proposalsForCompany((int) $companyId);
+            $proposals = $planning->proposalsForCompany((int) $companyId, null, null, null, true);
             if ($proposals->isEmpty()) {
                 $this->info('Company '.$companyId.': no purchase shortage found.');
                 continue;

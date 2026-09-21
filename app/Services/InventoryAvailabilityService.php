@@ -6,6 +6,8 @@ use App\Models\InventoryMovement;
 use App\Models\InventoryStatusBalance;
 use App\Models\Product;
 use App\Models\StockReservation;
+use App\Models\InventoryLocation;
+use App\Models\InventoryCostLayer;
 use Illuminate\Support\Facades\DB;
 
 class InventoryAvailabilityService
@@ -29,7 +31,7 @@ class InventoryAvailabilityService
             ->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))
             ->when($companyId !== null, fn ($query) => $query->where(fn ($nested) => $nested->where('company_id', $companyId)->orWhereNull('company_id')))
             ->selectRaw('product_id, COALESCE(SUM(quantity), 0) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
-        $reserved = $subtractReservations ? StockReservation::whereIn('product_id', $ids)->where('status', 'active')
+        $reserved = $subtractReservations ? StockReservation::whereIn('product_id', $ids)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))
             ->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))
             ->when($companyId !== null, fn ($query) => $query->where(fn ($nested) => $nested->where('company_id', $companyId)->orWhereNull('company_id')))
             ->selectRaw('product_id, COALESCE(SUM(quantity - released_quantity), 0) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id') : collect();
@@ -69,9 +71,56 @@ class InventoryAvailabilityService
                 ->sum('quantity')
             : 0.0;
         $reserved = $subtractReservations
-            ? (float) StockReservation::where('product_id', $product->id)->where('status', 'active')->when($companyId !== null, fn ($query) => $query->where(fn ($nested) => $nested->where('company_id', $companyId)->orWhereNull('company_id')))->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))->sum(DB::raw('quantity - released_quantity'))
+            ? (float) StockReservation::where('product_id', $product->id)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->when($companyId !== null, fn ($query) => $query->where(fn ($nested) => $nested->where('company_id', $companyId)->orWhereNull('company_id')))->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))->sum(DB::raw('quantity - released_quantity'))
             : 0;
 
         return max(0, $onHand - $nonAvailable - $reserved);
+    }
+
+    /**
+     * Build a read-only finite allocation plan across eligible locations.
+     * The plan never creates reservations or ledger movements.
+     *
+     * @param array<int, int> $locationIds
+     * @return array{product_id:int, requested_quantity:float, allocated_quantity:float, shortfall:float, strategy:string, allocations:array<int, array<string, mixed>>}
+     */
+    public function allocationPlan(Product $product, float $quantity, int $companyId, array $locationIds = [], string $strategy = 'fefo'): array
+    {
+        if ($quantity <= 0.000001) throw new \InvalidArgumentException('Allocation quantity must be greater than zero.');
+        if (!in_array($strategy, ['fefo', 'most_stock'], true)) throw new \InvalidArgumentException('Unsupported allocation strategy.');
+        $locations = InventoryLocation::where('is_active', true)
+            ->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))
+            ->when($locationIds !== [], fn ($query) => $query->whereIn('id', $locationIds))
+            ->orderBy('id')->get();
+        $candidates = collect();
+        foreach ($locations as $location) {
+            $available = $this->available($product, true, $location->id, $companyId);
+            if ($available <= 0.000001) continue;
+            if (in_array($product->tracking_type, ['batch', 'lot'], true)) {
+                $layers = InventoryCostLayer::with('batch')->where('product_id', $product->id)->where('location_id', $location->id)->whereNotNull('batch_id')->where('remaining_quantity', '>', 0)->get();
+                $reserved = StockReservation::where('product_id', $product->id)->where('location_id', $location->id)->where('status', 'active')->whereIn('batch_id', $layers->pluck('batch_id'))->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->get()->groupBy('batch_id')->map(fn ($rows): float => (float) $rows->sum(fn ($row): float => (float) $row->open_quantity));
+                foreach ($layers->groupBy('batch_id') as $batchId => $batchLayers) {
+                    $batch = $batchLayers->first()->batch;
+                    $open = max(0, (float) $batchLayers->sum('remaining_quantity') - (float) ($reserved[$batchId] ?? 0));
+                    if ($open <= 0.000001) continue;
+                    $candidates->push(['location_id' => $location->id, 'location_code' => $location->code, 'batch_id' => (int) $batchId, 'available_quantity' => $open, 'expiry_date' => $batch?->expiry_date?->toDateString(), 'best_before_date' => $batch?->best_before_date?->toDateString()]);
+                }
+            } else {
+                $candidates->push(['location_id' => $location->id, 'location_code' => $location->code, 'batch_id' => null, 'available_quantity' => $available, 'expiry_date' => null, 'best_before_date' => null]);
+            }
+        }
+        $candidates = $candidates->sortBy(function (array $candidate) use ($strategy): array {
+            $expiry = $candidate['expiry_date'] ?: ($candidate['best_before_date'] ?: '9999-12-31');
+            return $strategy === 'most_stock' ? [-$candidate['available_quantity'], $expiry, $candidate['location_id']] : [$expiry, $candidate['location_id'], $candidate['batch_id'] ?? 0];
+        })->values();
+        $remaining = $quantity;
+        $allocations = $candidates->map(function (array $candidate) use (&$remaining): ?array {
+            if ($remaining <= 0.000001) return null;
+            $allocated = min($remaining, (float) $candidate['available_quantity']);
+            $remaining -= $allocated;
+            return $candidate + ['allocated_quantity' => $allocated];
+        })->filter()->values()->all();
+        $allocated = $quantity - $remaining;
+        return ['product_id' => (int) $product->id, 'requested_quantity' => $quantity, 'allocated_quantity' => $allocated, 'shortfall' => max(0, $remaining), 'strategy' => $strategy, 'allocations' => $allocations];
     }
 }

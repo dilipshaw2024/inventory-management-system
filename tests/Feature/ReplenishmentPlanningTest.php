@@ -6,7 +6,10 @@ use App\Models\Branch;
 use App\Models\Category;
 use App\Models\Company;
 use App\Models\InventoryLocation;
+use App\Models\InventoryMovement;
 use App\Models\InventoryReplenishmentPolicy;
+use App\Models\InventoryTransfer;
+use App\Models\InventoryTransferLine;
 use App\Models\Product;
 use App\Models\Permission;
 use App\Models\Role;
@@ -151,5 +154,118 @@ class ReplenishmentPlanningTest extends TestCase
         $counts = app(DashboardMetricsService::class)->thresholdCounts(collect([$product]), $company->id, [$product->id => 0]);
 
         $this->assertSame(['low' => 1, 'excess' => 0], $counts);
+    }
+
+    public function test_replenishment_scenario_is_read_only_and_applies_daily_demand_override(): void
+    {
+        $company = Company::create(['name' => 'Scenario Planning Co', 'code' => 'SCENARIO-PLAN']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Scenario Branch', 'code' => 'SCENARIO-BRANCH']);
+        $warehouse = $branch->warehouses()->create(['name' => 'Scenario Warehouse', 'code' => 'SCENARIO-WAREHOUSE']);
+        $location = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Scenario Bin', 'code' => 'SCENARIO-BIN', 'type' => 'bin', 'is_active' => true]);
+        $sourceLocation = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Scenario Source', 'code' => 'SCENARIO-SOURCE', 'type' => 'bin', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Scenario Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Scenario Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Scenario Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Scenario item', 'reorder_level' => 5, 'quantity' => 0, 'status' => 1]);
+        InventoryReplenishmentPolicy::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $location->id, 'reorder_point' => 5, 'min_stock' => 10, 'max_stock' => 10, 'lead_time_days' => 5, 'is_active' => true]);
+        $transfer = InventoryTransfer::create(['company_id' => $company->id, 'transfer_no' => 'SCENARIO-TRANSFER-1', 'date' => now()->toDateString(), 'expected_arrival' => now()->toDateString(), 'description' => 'Scenario receipt', 'status' => 'pending']);
+        InventoryTransferLine::create(['transfer_id' => $transfer->id, 'product_id' => $product->id, 'source_location_id' => $sourceLocation->id, 'destination_location_id' => $location->id, 'quantity' => 5, 'unit_cost' => 4]);
+
+        Sanctum::actingAs($user, ['inventory:read']);
+        $response = $this->getJson('/api/inventory/replenishment/scenario?product_id='.$product->id.'&location_id='.$location->id.'&horizon_days=3&daily_demand=2');
+
+        $response->assertOk()
+            ->assertJsonPath('meta.read_only', true)
+            ->assertJsonPath('meta.horizon_days', 3)
+            ->assertJsonPath('data.0.product_id', $product->id)
+            ->assertJsonPath('data.0.daily_demand_override', 2)
+            ->assertJsonPath('data.0.scenario_daily_demand', 2)
+            ->assertJsonPath('data.0.buckets.0.open_transfer_receipt', 5)
+            ->assertJsonPath('data.0.buckets.0.scenario_projected_balance', 3)
+            ->assertJsonPath('data.0.buckets.0.scenario_shortfall', 7);
+        Sanctum::actingAs($user, ['inventory:write']);
+        $saved = $this->postJson('/api/inventory/replenishment/scenarios', [
+            'name' => 'Demand stress scenario', 'external_reference' => 'SCENARIO-SAVED-1',
+            'product_id' => $product->id, 'location_id' => $location->id, 'horizon_days' => 3, 'daily_demand' => 2,
+        ]);
+        $saved->assertCreated()->assertJsonPath('status', 'saved')->assertJsonPath('data.name', 'Demand stress scenario')->assertJsonPath('data.result_snapshot.0.product_id', $product->id);
+        $scenarioId = $saved->json('data.id');
+        Sanctum::actingAs($user, ['inventory:read']);
+        $this->getJson('/api/inventory/replenishment/scenarios')->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.id', $scenarioId);
+        $this->getJson('/api/inventory/replenishment/scenarios/'.$scenarioId)->assertOk()->assertJsonPath('data.result_snapshot.0.buckets.0.scenario_shortfall', 7);
+        Sanctum::actingAs($user, ['inventory:write']);
+        $this->postJson('/api/inventory/replenishment/scenarios', [
+            'name' => 'Replay scenario', 'external_reference' => 'SCENARIO-SAVED-1', 'product_id' => $product->id, 'location_id' => $location->id,
+        ])->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $scenarioId);
+        $permission = Permission::create(['code' => 'reports.view', 'name' => 'View reports', 'module' => 'reports']);
+        $savePermission = Permission::create(['code' => 'inventory.post', 'name' => 'Post inventory', 'module' => 'inventory']);
+        $role = Role::create(['code' => 'scenario-planner', 'name' => 'Scenario planner', 'is_active' => true]);
+        $role->permissions()->attach([$permission->id, $savePermission->id]); $user->roles()->attach($role);
+        $this->actingAs($user)->get('/planning/replenishment-scenario?location_id='.$location->id.'&horizon_days=3&daily_demand=2')->assertOk()->assertSee('Scenario item')->assertSee('Demand stress scenario')->assertViewHas('scenarios', fn ($rows): bool => $rows->first()['buckets']->first()['open_transfer_receipt'] === 5.0);
+        $this->actingAs($user)->post('/planning/replenishment-scenario/save', ['name' => 'Browser saved scenario', 'product_id' => $product->id, 'location_id' => $location->id, 'horizon_days' => 3, 'demand_multiplier' => 1, 'daily_demand' => 2])->assertRedirect();
+        $this->assertDatabaseHas('replenishment_scenarios', ['company_id' => $company->id, 'name' => 'Browser saved scenario', 'created_by' => $user->id]);
+        $this->assertDatabaseCount('inventory_movements', 0);
+        $this->assertDatabaseCount('purchase_orders', 0);
+    }
+
+    public function test_multi_echelon_replenishment_exposes_hierarchy_and_nets_transfer_supply(): void
+    {
+        $company = Company::create(['name' => 'Network Planning Co', 'code' => 'NETWORK-PLAN']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Network Branch', 'code' => 'NETWORK-BRANCH']);
+        $warehouse = $branch->warehouses()->create(['name' => 'Network Warehouse', 'code' => 'NETWORK-WAREHOUSE']);
+        $parent = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Central', 'code' => 'CENTRAL', 'type' => 'warehouse', 'is_active' => true]);
+        $child = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'parent_id' => $parent->id, 'name' => 'Store Bin', 'code' => 'STORE-BIN', 'type' => 'bin', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Network Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Network Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Network Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Network item', 'reorder_level' => 5, 'quantity' => 0, 'status' => 1]);
+        InventoryReplenishmentPolicy::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $parent->id, 'reorder_point' => 5, 'min_stock' => 5, 'max_stock' => 10, 'is_active' => true]);
+        InventoryReplenishmentPolicy::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $child->id, 'reorder_point' => 5, 'min_stock' => 10, 'max_stock' => 10, 'is_active' => true]);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $parent->id, 'movement_type' => 'receipt', 'quantity' => 20, 'unit_cost' => 2, 'reason' => 'Network opening receipt']);
+
+        Sanctum::actingAs($user, ['inventory:read']);
+        $response = $this->getJson('/api/inventory/replenishment/multi-echelon?product_id='.$product->id);
+
+        $response->assertOk()
+            ->assertJsonPath('meta.read_only', true)
+            ->assertJsonPath('data.0.product_id', $product->id)
+            ->assertJsonPath('data.0.shortage', 10)
+            ->assertJsonPath('data.0.transfer_suggestion_quantity', 10)
+            ->assertJsonPath('data.0.external_purchase_requirement', 0)
+            ->assertJsonPath('data.0.nodes.1.parent_location_id', $parent->id)
+            ->assertJsonPath('data.0.nodes.1.hierarchy.0.code', 'CENTRAL')
+            ->assertJsonPath('data.0.nodes.1.hierarchy.1.code', 'STORE-BIN');
+        $this->assertCount(0, app(ReplenishmentPlanningService::class)->proposalsForCompany($company->id, null, null, null, true));
+        $this->assertDatabaseCount('inventory_transfers', 0);
+    }
+
+    public function test_demand_reorder_point_uses_location_issue_history_and_lead_time(): void
+    {
+        $company = Company::create(['name' => 'Demand Reorder Co', 'code' => 'DEMAND-REORDER']);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Demand Branch', 'code' => 'DEMAND-BRANCH']);
+        $warehouse = $branch->warehouses()->create(['name' => 'Demand Warehouse', 'code' => 'DEMAND-WAREHOUSE']);
+        $location = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Demand Bin', 'code' => 'DEMAND-BIN', 'type' => 'bin', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Demand Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Demand Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Demand Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Demand item', 'reorder_level' => 0, 'quantity' => 0, 'status' => 1]);
+        InventoryReplenishmentPolicy::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $location->id, 'reorder_point' => 0, 'reorder_point_method' => 'demand', 'reorder_history_days' => 10, 'lead_time_days' => 3, 'min_stock' => 6, 'is_active' => true]);
+        for ($day = 0; $day < 10; $day++) {
+            InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $location->id, 'movement_type' => 'issue', 'quantity' => 2, 'unit_cost' => 1, 'posted_at' => now()->subDays($day)->setTime(10, 0)]);
+        }
+        $availability = Mockery::mock(InventoryAvailabilityService::class);
+        $availability->shouldReceive('available')->once()->andReturn(0.0);
+        $this->app->instance(InventoryAvailabilityService::class, $availability);
+        $prices = Mockery::mock(SupplierProductPriceService::class);
+        $prices->shouldReceive('bestFor')->once()->andReturnNull();
+        $this->app->instance(SupplierProductPriceService::class, $prices);
+
+        $proposal = app(ReplenishmentPlanningService::class)->proposalsForCompany($company->id)->first();
+
+        $this->assertNotNull($proposal);
+        $this->assertSame(6.0, (float) $proposal['quantity']);
+        $this->assertSame(0.0, (float) $proposal['current_stock']);
     }
 }

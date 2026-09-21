@@ -8,12 +8,23 @@ use App\Models\Supplier;
 use App\Http\Requests\Pos\SupplierRequest;
 use Auth;
 use Illuminate\Support\Carbon;
+use Illuminate\Validation\Rule;
 
 class SupplierController extends Controller
 {
+    private function companyId(): int
+    {
+        return (int) Auth::user()->company_id;
+    }
+
+    private function companySupplier($id): Supplier
+    {
+        return Supplier::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
     public function SupplierAll(){
         // $suppliers = Supplier::all();
-        $suppliers = Supplier::latest()->get();
+        $suppliers = Supplier::where('company_id', $this->companyId())->latest()->get();
         return view('backend.supplier.supplier_all',compact('suppliers'));
     } // End Method 
 
@@ -61,7 +72,7 @@ class SupplierController extends Controller
 
     public function SupplierEdit($id){
 
-        $supplier = Supplier::findOrFail($id);
+        $supplier = $this->companySupplier($id);
         return view('backend.supplier.supplier_edit',compact('supplier'));
 
     } // End Method 
@@ -69,7 +80,7 @@ class SupplierController extends Controller
     public function SupplierUpdate(Request $request){
 
         $request->validate([
-            'id' => ['required', 'integer', 'exists:suppliers,id'],
+            'id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where('company_id', $this->companyId())],
             'name' => ['required', 'string', 'max:255'],
             'mobile_no' => ['nullable', 'string', 'max:30'],
             'email' => ['nullable', 'email', 'max:255'],
@@ -91,7 +102,7 @@ class SupplierController extends Controller
         $sullier_id = $request->id;
         $calendar = $this->planningCalendar($request);
 
-        Supplier::findOrFail($sullier_id)->update([
+        $this->companySupplier($sullier_id)->update([
             'name' => $request->name,
             'mobile_no' => $request->mobile_no,
             'email' => $request->email,
@@ -133,7 +144,7 @@ class SupplierController extends Controller
 
     public function SupplierDelete($id){
 
-      $supplier = Supplier::findOrFail($id);
+      $supplier = $this->companySupplier($id);
       if ($supplier->products()->exists() || $supplier->purchases()->exists()) {
         return redirect()->back()->with(['message' => 'This supplier cannot be deleted because it is linked to products or purchases.', 'alert-type' => 'error']);
       }

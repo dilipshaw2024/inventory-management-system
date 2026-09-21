@@ -8,12 +8,13 @@ use App\Models\ServiceAsset;
 use App\Models\ServiceRequest;
 use App\Models\ServiceTechnician;
 use App\Models\AssetSparePart;
+use App\Models\Supplier;
 use App\Models\Product;
 use App\Models\MaintenancePart;
 use App\Models\ServiceMaintenanceSchedule;
+use App\Models\ServiceAssetMeterReading;
 use App\Models\WarrantyClaim;
 use App\Services\ProductLifecycleService;
-use App\Services\InventoryAvailabilityService;
 use App\Services\InventoryLedgerService;
 use App\Services\AuditService;
 use App\Services\NumberingSequenceService;
@@ -25,6 +26,7 @@ use App\Models\AssetOwnershipTransfer;
 use App\Models\Invoice;
 use App\Models\InvoiceDetail;
 use App\Models\ServiceContract;
+use App\Models\InventorySerial;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -53,7 +55,7 @@ class ServiceIntegrationController extends Controller
             'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
-        $assets = $this->companyScope(ServiceAsset::with(['product', 'customer']))
+        $assets = $this->companyScope(ServiceAsset::with(['product', 'customer', 'serial']))
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
@@ -68,7 +70,7 @@ class ServiceIntegrationController extends Controller
             'external_reference' => ['nullable', 'string', 'max:150', $this->companyUnique('service_assets', 'external_reference')],
             'name' => ['required', 'string', 'max:255'], 'manufacturer' => ['nullable', 'string', 'max:150'], 'model_no' => ['nullable', 'string', 'max:150'],
             'installation_date' => ['nullable', 'date'], 'condition' => ['nullable', 'in:operational,needs_repair,out_of_service'], 'meter_value' => ['nullable', 'numeric', 'min:0'],
-            'product_id' => ['nullable', 'integer', $this->companyExists('products')],
+            'product_id' => ['nullable', 'integer', $this->companyExists('products')], 'inventory_serial_id' => ['nullable', 'integer'],
             'customer_id' => ['nullable', 'integer', $this->companyExists('customers')],
             'serial_no' => ['nullable', 'string', 'max:100'], 'location' => ['nullable', 'string', 'max:500'],
             'warranty_until' => ['nullable', 'date'], 'status' => ['nullable', 'in:active,retired'],
@@ -77,6 +79,9 @@ class ServiceIntegrationController extends Controller
             'depreciation_units_total' => ['nullable', 'numeric', 'gt:0'], 'depreciation_units_used' => ['nullable', 'numeric', 'min:0'],
             'in_service_date' => ['nullable', 'date'], 'accumulated_depreciation' => ['nullable', 'numeric', 'min:0'],
         ]);
+        $serial = $this->validatedInventorySerial($data['inventory_serial_id'] ?? null, $data['product_id'] ?? null, $data['serial_no'] ?? null, $companyId);
+        if ($serial && empty($data['product_id'])) $data['product_id'] = $serial->product_id;
+        if ($serial) $data['serial_no'] = $serial->serial_no;
         if ((float) ($data['salvage_value'] ?? 0) > (float) ($data['acquisition_cost'] ?? 0)) abort(422, 'Salvage value cannot exceed acquisition cost.');
         if ((float) ($data['accumulated_depreciation'] ?? 0) > max(0, (float) ($data['acquisition_cost'] ?? 0) - (float) ($data['salvage_value'] ?? 0))) abort(422, 'Accumulated depreciation cannot exceed the depreciable base.');
         if (isset($data['depreciation_units_total'], $data['depreciation_units_used']) && (float) $data['depreciation_units_used'] > (float) $data['depreciation_units_total']) abort(422, 'Used depreciation units cannot exceed total units.');
@@ -91,7 +96,7 @@ class ServiceIntegrationController extends Controller
             app(AuditService::class)->record('service_asset.created', $asset, null, $asset->toArray() + ['api' => true]);
             return $asset;
         });
-        return response()->json(['data' => $asset->load(['product', 'customer']), 'status' => 'created'], 201);
+        return response()->json(['data' => $asset->load(['product', 'customer', 'serial']), 'status' => 'created'], 201);
     }
 
     public function updateAsset(Request $request, int $id): JsonResponse
@@ -102,7 +107,7 @@ class ServiceIntegrationController extends Controller
             'asset_no' => ['sometimes', 'string', 'max:80', Rule::unique('service_assets', 'asset_no')->ignore($asset->id)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'external_reference' => ['sometimes', 'nullable', 'string', 'max:150', Rule::unique('service_assets', 'external_reference')->ignore($asset->id)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'name' => ['sometimes', 'string', 'max:255'], 'manufacturer' => ['sometimes', 'nullable', 'string', 'max:150'], 'model_no' => ['sometimes', 'nullable', 'string', 'max:150'], 'installation_date' => ['sometimes', 'nullable', 'date'], 'condition' => ['sometimes', 'in:operational,needs_repair,out_of_service'], 'meter_value' => ['sometimes', 'nullable', 'numeric', 'min:0'], 'product_id' => ['sometimes', 'nullable', 'integer', $this->companyExists('products')],
-            'customer_id' => ['sometimes', 'nullable', 'integer', $this->companyExists('customers')], 'serial_no' => ['sometimes', 'nullable', 'string', 'max:100'],
+            'customer_id' => ['sometimes', 'nullable', 'integer', $this->companyExists('customers')], 'serial_no' => ['sometimes', 'nullable', 'string', 'max:100'], 'inventory_serial_id' => ['sometimes', 'nullable', 'integer'],
             'location' => ['sometimes', 'nullable', 'string', 'max:500'], 'warranty_until' => ['sometimes', 'nullable', 'date'],
             'status' => ['sometimes', 'in:active,retired'],
             'acquisition_cost' => ['sometimes', 'numeric', 'min:0'], 'salvage_value' => ['sometimes', 'numeric', 'min:0'],
@@ -110,6 +115,8 @@ class ServiceIntegrationController extends Controller
             'depreciation_units_total' => ['sometimes', 'nullable', 'numeric', 'gt:0'], 'depreciation_units_used' => ['sometimes', 'numeric', 'min:0'],
             'in_service_date' => ['sometimes', 'nullable', 'date'], 'accumulated_depreciation' => ['sometimes', 'numeric', 'min:0'],
         ]);
+        $serial = $this->validatedInventorySerial($data['inventory_serial_id'] ?? $asset->inventory_serial_id, $data['product_id'] ?? $asset->product_id, $data['serial_no'] ?? $asset->serial_no, $companyId);
+        if ($serial) { $data['inventory_serial_id'] = $serial->id; $data['product_id'] = $serial->product_id; $data['serial_no'] = $serial->serial_no; }
         if (($data['status'] ?? null) === 'active' && $asset->status === 'retired') abort(422, 'Retired assets cannot be reactivated.');
         $cost = (float) ($data['acquisition_cost'] ?? $asset->acquisition_cost ?? 0);
         $salvage = (float) ($data['salvage_value'] ?? $asset->salvage_value ?? 0);
@@ -122,7 +129,44 @@ class ServiceIntegrationController extends Controller
         $before = $asset->only(array_keys($data));
         $asset->update($data);
         app(AuditService::class)->record('service_asset.updated', $asset, $before, $asset->fresh()->only(array_keys($data)) + ['api' => true]);
-        return response()->json(['data' => $asset->fresh()->load(['product', 'customer']), 'status' => 'updated']);
+        return response()->json(['data' => $asset->fresh()->load(['product', 'customer', 'serial']), 'status' => 'updated']);
+    }
+
+    public function meterReadings(Request $request, int $id): JsonResponse
+    {
+        $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
+        $data = $request->validate(['updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $readings = ServiceAssetMeterReading::where('asset_id', $asset->id)
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($readings, $request, 'service.asset-meter-readings', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeMeterReading(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            // Replay detection below must run before uniqueness validation so an
+            // already-recorded integration event remains idempotent.
+            'external_reference' => ['required', 'string', 'max:150'],
+            'meter_value' => ['required', 'numeric', 'min:0'], 'occurred_at' => ['required', 'date'],
+            'source' => ['nullable', 'string', 'max:80'], 'metadata' => ['nullable', 'array'],
+        ]);
+        $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
+        $existing = $this->companyScope(ServiceAssetMeterReading::query())->where('external_reference', $data['external_reference'])->first();
+        if ($existing) return response()->json(['data' => $existing->load('asset'), 'status' => 'duplicate_ignored']);
+        try {
+            $reading = DB::transaction(function () use ($asset, $data, $companyId, $request): ServiceAssetMeterReading {
+                $locked = $this->companyScope(ServiceAsset::query())->lockForUpdate()->findOrFail($asset->id);
+                if ($locked->meter_value !== null && (float) $data['meter_value'] < (float) $locked->meter_value) throw new \RuntimeException('Meter readings cannot move backwards; submit a correction through an approved asset workflow.');
+                $reading = ServiceAssetMeterReading::create($data + ['company_id' => $companyId, 'asset_id' => $locked->id, 'created_by' => $request->user()?->id]);
+                $locked->update(['meter_value' => $data['meter_value']]);
+                app(AuditService::class)->record('service_asset.meter_reading_recorded', $reading, ['meter_value' => $locked->getRawOriginal('meter_value')], $reading->toArray() + ['asset_id' => $locked->id, 'api' => true]);
+                return $reading;
+            });
+        } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+        $dueSchedules = ServiceMaintenanceSchedule::where('asset_id', $asset->id)->where('is_active', true)->whereNotNull('meter_interval')->whereNotNull('next_meter_due')->where('next_meter_due', '<=', $data['meter_value'])->get(['id', 'name', 'next_meter_due', 'meter_interval']);
+        return response()->json(['data' => $reading->load('asset'), 'due_schedules' => $dueSchedules, 'status' => 'recorded'], 201);
     }
 
     public function valuation(Request $request, int $id): JsonResponse
@@ -151,10 +195,10 @@ class ServiceIntegrationController extends Controller
     {
         $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
         return response()->json(['data' => [
-            'asset' => $asset->load(['product', 'customer']),
+            'asset' => $asset->load(['product', 'customer', 'serial']),
             'requests' => $asset->requests()->with(['customer', 'assignee', 'contract'])->latest()->get(),
             'maintenance_orders' => $asset->maintenanceOrders()->with(['assignee', 'serviceRequest', 'serviceInvoice', 'laborJournal'])->latest()->get(),
-            'warranty_claims' => $asset->warrantyClaims()->with(['customer', 'product', 'creator'])->latest()->get(),
+            'warranty_claims' => $asset->warrantyClaims()->with(['customer', 'product', 'contract', 'creator', 'settler'])->latest()->get(),
             'ownership_transfers' => $asset->ownershipTransfers()->with(['previousCustomer', 'newCustomer', 'creator'])->get(),
             'depreciation_entries' => $asset->depreciationEntries()->with('journal')->latest('depreciation_date')->get(),
         ], 'asset_id' => $asset->id]);
@@ -192,7 +236,25 @@ class ServiceIntegrationController extends Controller
     public function spareParts(int $id): JsonResponse
     {
         $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
-        return response()->json(['data' => $asset->spareParts()->with('product')->orderBy('id')->get(), 'asset_id' => $asset->id]);
+        return response()->json(['data' => $asset->spareParts()->with(['product', 'supplier'])->orderBy('id')->get(), 'asset_id' => $asset->id]);
+    }
+
+    public function sparePartCatalog(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'asset_id' => ['nullable', 'integer'], 'product_id' => ['nullable', 'integer'],
+            'supplier_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $parts = AssetSparePart::with(['asset:id,asset_no,name', 'product', 'supplier'])
+            ->where('company_id', $companyId)
+            ->when($data['asset_id'] ?? null, fn ($query, $id) => $query->where('asset_id', $id))
+            ->when($data['product_id'] ?? null, fn ($query, $id) => $query->where('product_id', $id))
+            ->when($data['supplier_id'] ?? null, fn ($query, $id) => $query->where('supplier_id', $id))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($parts, $request, 'service.spare-parts', (int) ($data['per_page'] ?? 50));
     }
 
     public function storeSparePart(Request $request, int $id): JsonResponse
@@ -202,37 +264,78 @@ class ServiceIntegrationController extends Controller
         $data = $request->validate([
             'product_id' => ['required', 'integer', $this->companyExists('products')],
             'quantity_per_service' => ['required', 'numeric', 'gt:0'], 'minimum_stock' => ['nullable', 'numeric', 'min:0'],
-            'maximum_stock' => ['nullable', 'numeric', 'gte:minimum_stock'], 'notes' => ['nullable', 'string', 'max:1000'],
+            'maximum_stock' => ['nullable', 'numeric', 'gte:minimum_stock'], 'supplier_id' => ['nullable', 'integer', $this->companyExists('suppliers')],
+            'supplier_part_no' => ['nullable', 'string', 'max:100'], 'lead_time_days' => ['nullable', 'integer', 'min:0'],
+            'supplier_unit_cost' => ['nullable', 'numeric', 'min:0'], 'supplier_currency' => ['nullable', 'string', 'size:3'],
+            'preferred_supplier' => ['sometimes', 'boolean'], 'notes' => ['nullable', 'string', 'max:1000'],
         ]);
         $product = $this->companyScope(Product::query())->findOrFail($data['product_id']);
         app(ProductLifecycleService::class)->assertStockManaged($product);
+        if (!empty($data['supplier_id']) && !$this->companyScope(Supplier::query())->whereKey($data['supplier_id'])->where('is_active', true)->exists()) abort(422, 'The selected supplier is not active or authorized.');
         if ($asset->spareParts()->where('product_id', $product->id)->exists()) abort(422, 'This spare part is already linked to the asset.');
         $part = DB::transaction(function () use ($data, $asset, $companyId): AssetSparePart {
             $part = AssetSparePart::create($data + ['asset_id' => $asset->id, 'company_id' => $companyId]);
             app(AuditService::class)->record('asset_spare_part.created', $part, null, $part->toArray() + ['api' => true]);
             return $part;
         });
-        return response()->json(['data' => $part->load('product'), 'status' => 'created'], 201);
+        return response()->json(['data' => $part->load(['product', 'supplier']), 'status' => 'created'], 201);
     }
 
     public function updateSparePart(Request $request, int $id, int $partId): JsonResponse
     {
         $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
         $part = $asset->spareParts()->whereKey($partId)->firstOrFail();
-        $data = $request->validate(['quantity_per_service' => ['sometimes', 'numeric', 'gt:0'], 'minimum_stock' => ['sometimes', 'numeric', 'min:0'], 'maximum_stock' => ['sometimes', 'nullable', 'numeric'], 'notes' => ['sometimes', 'nullable', 'string', 'max:1000']]);
+        $data = $request->validate(['quantity_per_service' => ['sometimes', 'numeric', 'gt:0'], 'minimum_stock' => ['sometimes', 'numeric', 'min:0'], 'maximum_stock' => ['sometimes', 'nullable', 'numeric'], 'supplier_id' => ['sometimes', 'nullable', 'integer', $this->companyExists('suppliers')], 'supplier_part_no' => ['sometimes', 'nullable', 'string', 'max:100'], 'lead_time_days' => ['sometimes', 'nullable', 'integer', 'min:0'], 'supplier_unit_cost' => ['sometimes', 'nullable', 'numeric', 'min:0'], 'supplier_currency' => ['sometimes', 'nullable', 'string', 'size:3'], 'preferred_supplier' => ['sometimes', 'boolean'], 'notes' => ['sometimes', 'nullable', 'string', 'max:1000']]);
         if (array_key_exists('maximum_stock', $data) && $data['maximum_stock'] !== null && (float) $data['maximum_stock'] < (float) ($data['minimum_stock'] ?? $part->minimum_stock)) abort(422, 'Maximum stock must be greater than or equal to minimum stock.');
+        if (array_key_exists('supplier_id', $data) && $data['supplier_id'] !== null && !$this->companyScope(Supplier::query())->whereKey($data['supplier_id'])->where('is_active', true)->exists()) abort(422, 'The selected supplier is not active or authorized.');
         $before = $part->only(array_keys($data));
         $part->update($data);
         app(AuditService::class)->record('asset_spare_part.updated', $part, $before, $part->fresh()->only(array_keys($data)) + ['api' => true]);
-        return response()->json(['data' => $part->fresh()->load('product'), 'status' => 'updated']);
+        return response()->json(['data' => $part->fresh()->load(['product', 'supplier']), 'status' => 'updated']);
+    }
+
+    public function sparePartReplenishment(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'asset_id' => ['nullable', 'integer'], 'product_id' => ['nullable', 'integer'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $recommendations = app(\App\Services\ServiceSparePartReplenishmentService::class)->recommendations((int) $companyId, $data['asset_id'] ?? null, $data['product_id'] ?? null);
+        $page = max(1, (int) $request->input('page', 1));
+        $perPage = (int) ($data['per_page'] ?? 50);
+        return response()->json(['data' => $recommendations->forPage($page, $perPage)->values(), 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $recommendations->count(), 'last_page' => max(1, (int) ceil($recommendations->count() / $perPage)), 'read_only' => true]]);
+    }
+
+    public function createSparePartPurchaseOrders(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'external_reference' => ['required', 'string', 'max:120'],
+            'date' => ['required', 'date'], 'expected_date' => ['nullable', 'date', 'after_or_equal:date'],
+            'items' => ['required', 'array', 'min:1', 'max:100'],
+            'items.*.asset_spare_part_id' => ['required', 'integer'],
+            'items.*.quantity' => ['nullable', 'numeric', 'gt:0'],
+        ]);
+        try {
+            $result = app(\App\Services\ServiceSparePartReplenishmentService::class)->createPurchaseOrders(
+                (int) $companyId, $data['items'], $data['external_reference'], $data['date'], $data['expected_date'] ?? null,
+                $request->user()?->id, $request->user()?->branch_id,
+            );
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $result['orders'], 'status' => $result['existing_only'] ? 'existing' : 'pending_approval'], $result['existing_only'] ? 200 : 201);
     }
 
     public function requests(Request $request): JsonResponse
     {
-        $data = $request->validate(['status' => ['nullable', 'in:open,assigned,in_progress,resolved,cancelled'], 'priority' => ['nullable', 'in:low,normal,high,urgent'], 'sla_status' => ['nullable', 'in:not_tracked,due,met,breached,closed'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['status' => ['nullable', 'in:open,assigned,in_progress,resolved,cancelled'], 'priority' => ['nullable', 'in:low,normal,high,urgent'], 'sla_status' => ['nullable', 'in:not_tracked,due,met,breached,closed'], 'sla_escalation_level' => ['nullable', 'integer', 'min:0', 'max:3'], 'sla_escalated' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $rows = $this->companyScope(ServiceRequest::with(['asset', 'customer', 'contract', 'assignee']))
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['priority'] ?? null, fn ($query, $priority) => $query->where('priority', $priority))
+            ->when(array_key_exists('sla_escalation_level', $data), fn ($query) => $query->where('sla_escalation_level', $data['sla_escalation_level']))
+            ->when(array_key_exists('sla_escalated', $data), fn ($query) => $query->where('sla_escalation_level', ($data['sla_escalated'] ? '>' : '='), 0))
             ->when($data['sla_status'] ?? null, function ($query, $sla): void {
                 $now = now();
                 match ($sla) {
@@ -376,10 +479,13 @@ class ServiceIntegrationController extends Controller
     {
         $data = $request->validate(['status' => ['required', 'in:in_progress,completed,cancelled'], 'actual_hours' => ['nullable', 'numeric', 'min:0'], 'labor_cost' => ['nullable', 'numeric', 'min:0'], 'outcome' => ['nullable', 'string', 'max:3000']]);
         try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
             $order = DB::transaction(function () use ($data, $id): MaintenanceOrder {
                 $order = $this->companyScope(MaintenanceOrder::with(['asset', 'serviceRequest']))->lockForUpdate()->findOrFail($id);
                 $oldStatus = $order->status;
                 if (in_array($oldStatus, ['completed', 'cancelled'], true)) throw new \RuntimeException('A closed maintenance order cannot be changed.');
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
                 if ($data['status'] === 'completed' && empty($data['outcome'])) throw new \RuntimeException('An outcome is required when completing maintenance.');
                 if ($data['status'] === 'in_progress' && $oldStatus !== 'planned') throw new \RuntimeException('Only planned maintenance orders can be started.');
                 if ($data['status'] === 'completed' && !in_array($oldStatus, ['planned', 'in_progress'], true)) throw new \RuntimeException('Only planned or in-progress orders can be completed.');
@@ -463,6 +569,73 @@ class ServiceIntegrationController extends Controller
         return app(\App\Http\Controllers\Api\InventoryIntegrationController::class)->rejectSalesInvoice($request, $invoice->id);
     }
 
+    public function reservePart(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'product_id' => ['required', 'integer', $this->companyExists('products')],
+            'quantity' => ['required', 'numeric', 'gt:0'],
+            'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
+            'batch_id' => ['nullable', 'integer'],
+        ]);
+        try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
+            $reservations = DB::transaction(function () use ($data, $id): \Illuminate\Support\Collection {
+                $order = $this->companyScope(MaintenanceOrder::query())->lockForUpdate()->findOrFail($id);
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
+                $product = $this->companyScope(Product::query())->lockForUpdate()->findOrFail($data['product_id']);
+                $reservations = app(\App\Services\StockReservationService::class)->reserveMaintenancePart($order, $product, (float) $data['quantity'], $data['location_id'] ?? null, $data['batch_id'] ?? null);
+                app(AuditService::class)->record('maintenance_part.reserved', $order, null, ['product_id' => $product->id, 'quantity' => (float) $data['quantity'], 'location_id' => $data['location_id'] ?? null, 'batch_id' => $data['batch_id'] ?? null, 'api' => true]);
+                return $reservations;
+            });
+            return response()->json(['data' => $reservations, 'status' => 'reserved'], 201);
+        } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+    }
+
+    public function allocatePart(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'product_id' => ['required', 'integer', $this->companyExists('products')],
+            'quantity' => ['required', 'numeric', 'gt:0'],
+            'location_ids' => ['nullable', 'array'],
+            'location_ids.*' => ['integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
+            'strategy' => ['nullable', 'in:fefo,most_stock'],
+            'allow_partial' => ['sometimes', 'boolean'],
+        ]);
+        try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
+            $result = DB::transaction(function () use ($data, $id, $companyId): array {
+                $order = $this->companyScope(MaintenanceOrder::query())->lockForUpdate()->findOrFail($id);
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
+                $product = $this->companyScope(Product::query())->lockForUpdate()->findOrFail($data['product_id']);
+                $plan = app(\App\Services\InventoryAvailabilityService::class)->allocationPlan(
+                    $product, (float) $data['quantity'], (int) $companyId,
+                    array_map('intval', $data['location_ids'] ?? []), $data['strategy'] ?? 'fefo'
+                );
+                if (($data['allow_partial'] ?? true) === false && $plan['shortfall'] > 0.000001) {
+                    throw new \RuntimeException('Insufficient available stock to allocate the requested spare-part quantity.');
+                }
+                $reservations = collect();
+                foreach ($plan['allocations'] as $allocation) {
+                    $reservations = $reservations->merge(app(\App\Services\StockReservationService::class)->reserveMaintenancePart(
+                        $order, $product, (float) $allocation['allocated_quantity'], (int) $allocation['location_id'], $allocation['batch_id'] ?? null
+                    ));
+                }
+                app(AuditService::class)->record('maintenance_part.auto_allocated', $order, null, [
+                    'product_id' => $product->id, 'requested_quantity' => (float) $data['quantity'],
+                    'reserved_quantity' => (float) $plan['allocated_quantity'], 'shortfall' => (float) $plan['shortfall'],
+                    'strategy' => $plan['strategy'], 'api' => true,
+                ]);
+                return ['plan' => $plan, 'reservations' => $reservations->unique('id')->values()];
+            });
+            $status = $result['plan']['shortfall'] > 0.000001 ? 'partially_reserved' : 'reserved';
+            return response()->json(['data' => $result, 'status' => $status], 201);
+        } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+    }
+
     public function consumePart(Request $request, int $id): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -473,9 +646,12 @@ class ServiceIntegrationController extends Controller
             'batch_id' => ['nullable', 'integer'], 'serial_numbers' => ['nullable', 'string', 'max:5000'],
         ]);
         try {
+            app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(MaintenanceOrder::class, $id);
             $order = DB::transaction(function () use ($data, $id, $companyId): MaintenanceOrder {
                 $order = $this->companyScope(MaintenanceOrder::query())->lockForUpdate()->findOrFail($id);
                 if (in_array($order->status, ['completed', 'cancelled'], true)) throw new \RuntimeException('Closed maintenance orders cannot consume spare parts.');
+                $approval = app(\App\Services\ApprovalGuard::class);
+                if ($approval->pendingPolicy($order)) $approval->assertDifferent($order);
                 $product = $this->companyScope(Product::query())->lockForUpdate()->findOrFail($data['product_id']);
                 $quantity = (float) $data['quantity'];
                 app(\App\Services\MaintenancePartConsumptionService::class)->consume($order, $product, $quantity, isset($data['unit_cost']) ? (float) $data['unit_cost'] : null, $data['location_id'] ?? null, $data['batch_id'] ?? null, !empty($data['serial_numbers']) ? preg_split('/[,\\r\\n]+/', $data['serial_numbers']) : []);
@@ -522,9 +698,13 @@ class ServiceIntegrationController extends Controller
 
     public function warrantyClaims(Request $request): JsonResponse
     {
-        $data = $request->validate(['status' => ['nullable', 'in:submitted,under_review,approved,rejected,resolved'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $rows = $this->companyScope(WarrantyClaim::with(['asset', 'customer', 'product', 'creator']))
+        $data = $request->validate(['status' => ['nullable', 'in:submitted,under_review,approved,rejected,resolved'], 'contract_id' => ['nullable', 'integer', $this->companyExists('service_contracts')], 'coverage_status' => ['nullable', 'in:unknown,in_warranty,expired,contract_covered'], 'settlement_status' => ['nullable', 'in:unsettled,settled'], 'accounting_status' => ['nullable', 'in:not_posted,missing_mapping,posted'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $rows = $this->companyScope(WarrantyClaim::with(['asset', 'customer', 'supplier', 'product', 'contract', 'creator', 'journalEntry']))
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['contract_id'] ?? null, fn ($query, $contractId) => $query->where('contract_id', $contractId))
+            ->when($data['coverage_status'] ?? null, fn ($query, $coverageStatus) => $query->where('coverage_status', $coverageStatus))
+            ->when($data['settlement_status'] ?? null, fn ($query, $settlementStatus) => $query->where('settlement_status', $settlementStatus))
+            ->when($data['accounting_status'] ?? null, fn ($query, $accountingStatus) => $query->where('accounting_status', $accountingStatus))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($rows, $request, 'service.warranty-claims', (int) ($data['per_page'] ?? 50));
@@ -533,31 +713,83 @@ class ServiceIntegrationController extends Controller
     public function storeWarrantyClaim(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
-        $data = $request->validate(['claim_no' => ['nullable', 'string', 'max:80', $this->companyUnique('warranty_claims', 'claim_no')], 'external_reference' => ['nullable', 'string', 'max:150', $this->companyUnique('warranty_claims', 'external_reference')], 'asset_id' => ['required', 'integer', $this->companyExists('service_assets')], 'received_at' => ['required', 'date'], 'issue' => ['required', 'string', 'max:3000']]);
-        if (!empty($data['external_reference']) && ($existing = $this->companyScope(WarrantyClaim::query())->where('external_reference', $data['external_reference'])->first())) return response()->json(['data' => $existing->load(['asset', 'customer', 'product']), 'status' => 'duplicate_ignored']);
+        $data = $request->validate(['claim_no' => ['nullable', 'string', 'max:80', $this->companyUnique('warranty_claims', 'claim_no')], 'external_reference' => ['nullable', 'string', 'max:150', $this->companyUnique('warranty_claims', 'external_reference')], 'asset_id' => ['required', 'integer', $this->companyExists('service_assets')], 'contract_id' => ['nullable', 'integer', $this->companyExists('service_contracts')], 'supplier_id' => ['nullable', 'integer', $this->companyExists('suppliers')], 'received_at' => ['required', 'date'], 'issue' => ['required', 'string', 'max:3000']]);
+        if (!empty($data['external_reference']) && ($existing = $this->companyScope(WarrantyClaim::query())->where('external_reference', $data['external_reference'])->first())) return response()->json(['data' => $existing->load(['asset', 'customer', 'supplier', 'product', 'contract']), 'status' => 'duplicate_ignored']);
         $asset = $this->companyScope(ServiceAsset::query())->findOrFail($data['asset_id']);
         $data['coverage_status'] = !$asset->warranty_until ? 'unknown' : ($asset->warranty_until->isBefore($data['received_at']) ? 'expired' : 'in_warranty');
         if ($data['coverage_status'] === 'expired') $data['decision_notes'] = 'Submitted after recorded warranty expiry; review required.';
+        if (!empty($data['contract_id'])) {
+            $contract = $this->companyScope(ServiceContract::query())->findOrFail($data['contract_id']);
+            $receivedAt = Carbon::parse($data['received_at']);
+            if ($contract->status !== 'active' || $contract->starts_on->isAfter($receivedAt) || $contract->ends_on->isBefore($receivedAt)) abort(422, 'The selected service contract was not active when the claim was received.');
+            if ($contract->asset_id && (int) $contract->asset_id !== (int) $asset->id) abort(422, 'The service contract belongs to a different asset.');
+            if ($contract->customer_id && $asset->customer_id && (int) $contract->customer_id !== (int) $asset->customer_id) abort(422, 'The service contract belongs to a different customer.');
+            $data['coverage_status'] = 'contract_covered';
+            $data['decision_notes'] = trim((string) ($data['decision_notes'] ?? '')) ?: 'Submitted under active service contract '.$contract->contract_no.'.';
+        }
         $attributes = array_merge($data, ['company_id' => $companyId, 'customer_id' => $asset->customer_id, 'product_id' => $asset->product_id, 'created_by' => auth()->id()]);
         if (empty($attributes['claim_no'])) $attributes['claim_no'] = app(NumberingSequenceService::class)->nextOrFallback('warranty_claim', 'WC-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId);
         $claim = WarrantyClaim::create($attributes);
         app(AuditService::class)->record('warranty_claim.created', $claim, null, $claim->toArray() + ['api' => true]);
-        return response()->json(['data' => $claim->load(['asset', 'customer', 'product']), 'status' => 'submitted'], 201);
+        return response()->json(['data' => $claim->load(['asset', 'customer', 'supplier', 'product', 'contract']), 'status' => 'submitted'], 201);
     }
 
     public function updateWarrantyClaim(Request $request, int $id): JsonResponse
     {
         $claim = $this->companyScope(WarrantyClaim::query())->findOrFail($id);
+        if ($claim->settlement_status === 'settled') abort(422, 'Settled warranty claims cannot be changed.');
         $data = $request->validate(['status' => ['required', 'in:under_review,approved,rejected,resolved'], 'covered' => ['nullable', 'boolean'], 'decision_notes' => ['nullable', 'string', 'max:3000']]);
         if ($claim->status === 'resolved' || $claim->status === 'rejected') abort(422, 'Closed warranty claims cannot be changed.');
         if ($data['status'] === 'rejected' && empty($data['decision_notes'])) abort(422, 'Decision notes are required when rejecting a warranty claim.');
-        if (in_array($data['status'], ['approved', 'rejected'], true) && !array_key_exists('covered', $data)) abort(422, 'A coverage decision is required when approving or rejecting a warranty claim.');
+        if (in_array($data['status'], ['approved', 'rejected'], true) && (!array_key_exists('covered', $data) || $data['covered'] === null)) abort(422, 'A coverage decision is required when approving or rejecting a warranty claim.');
+        if (array_key_exists('covered', $data) && $data['covered'] === null) unset($data['covered']);
         $before = $claim->only(['status', 'covered', 'decision_notes', 'resolved_at']);
         $updates = $data;
         if ($data['status'] === 'resolved') $updates['resolved_at'] = now();
         $claim->update($updates);
         app(AuditService::class)->record('warranty_claim.updated', $claim, $before, $claim->fresh()->only(['status', 'covered', 'decision_notes', 'resolved_at']) + ['api' => true]);
-        return response()->json(['data' => $claim->fresh()->load(['asset', 'customer', 'product']), 'status' => $claim->status]);
+        return response()->json(['data' => $claim->fresh()->load(['asset', 'customer', 'product', 'contract']), 'status' => $claim->status]);
+    }
+
+    public function settleWarrantyClaim(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['settlement_reference' => ['required', 'string', 'max:150'], 'settlement_amount' => ['required', 'numeric', 'min:0'], 'settlement_currency' => ['required', 'string', 'size:3'], 'settlement_notes' => ['nullable', 'string', 'max:2000'], 'accounting_mode' => ['nullable', 'in:none,customer_reimbursement,vendor_recovery']]);
+        [$claim, $status] = DB::transaction(function () use ($request, $id, $data): array {
+            $claim = $this->companyScope(WarrantyClaim::query())->lockForUpdate()->findOrFail($id);
+            if ($claim->settlement_status === 'settled') {
+                if ($claim->settlement_reference === $data['settlement_reference']) return [$claim, 'duplicate_ignored'];
+                abort(422, 'This warranty claim has already been settled.');
+            }
+            if (WarrantyClaim::withoutGlobalScopes()->where('company_id', $claim->company_id)->where('settlement_reference', $data['settlement_reference'])->where('id', '<>', $claim->id)->exists()) abort(422, 'The settlement reference is already used by another warranty claim.');
+            if (!in_array($claim->status, ['approved', 'resolved'], true) || $claim->covered !== true) abort(422, 'Only an approved covered warranty claim can be settled.');
+            if (($data['accounting_mode'] ?? 'none') === 'vendor_recovery' && !$claim->supplier_id) abort(422, 'A supplier must be linked before vendor-recovery accounting can be posted.');
+            $before = $claim->only(['settlement_status', 'settlement_reference', 'settlement_amount', 'settlement_currency', 'settled_at', 'settled_by']);
+            $claim->update(['settlement_status' => 'settled', 'settlement_reference' => $data['settlement_reference'], 'settlement_amount' => $data['settlement_amount'], 'settlement_currency' => strtoupper($data['settlement_currency']), 'settled_at' => now(), 'settled_by' => $request->user()?->id, 'decision_notes' => trim(($claim->decision_notes ? $claim->decision_notes.' ' : '').($data['settlement_notes'] ?? ''))]);
+            $accounting = app(\App\Services\WarrantyClaimAccountingService::class)->post($claim->fresh(), $data['accounting_mode'] ?? 'none');
+            $claim->update(['accounting_status' => $accounting['status'], 'accounting_mode' => $data['accounting_mode'] ?? 'none', 'journal_entry_id' => $accounting['journal_entry_id']]);
+            app(AuditService::class)->record('warranty_claim.settled', $claim, $before, $claim->fresh()->only(['settlement_status', 'settlement_reference', 'settlement_amount', 'settlement_currency', 'settled_at', 'settled_by']));
+            return [$claim->fresh(), 'settled'];
+        });
+        return response()->json(['data' => $claim->load(['asset', 'customer', 'supplier', 'product', 'contract', 'settler', 'journalEntry']), 'status' => $status]);
+    }
+
+    public function postWarrantyClaimAccounting(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['accounting_mode' => ['required', 'in:customer_reimbursement,vendor_recovery']]);
+        [$claim, $status] = DB::transaction(function () use ($request, $id, $data): array {
+            $claim = $this->companyScope(WarrantyClaim::query())->lockForUpdate()->findOrFail($id);
+            if ($claim->settlement_status !== 'settled') abort(422, 'Only settled warranty claims can be posted to accounting.');
+            if ($claim->accounting_status === 'posted') {
+                if ($claim->accounting_mode === $data['accounting_mode']) return [$claim, 'already_posted'];
+                abort(422, 'This warranty claim already has a posted accounting journal.');
+            }
+            $before = $claim->only(['accounting_status', 'accounting_mode', 'journal_entry_id']);
+            $accounting = app(\App\Services\WarrantyClaimAccountingService::class)->post($claim, $data['accounting_mode']);
+            $claim->update(['accounting_status' => $accounting['status'], 'accounting_mode' => $data['accounting_mode'], 'journal_entry_id' => $accounting['journal_entry_id']]);
+            app(AuditService::class)->record('warranty_claim.accounting_posted', $claim, $before, $claim->fresh()->only(['accounting_status', 'accounting_mode', 'journal_entry_id']));
+            return [$claim->fresh(), $accounting['status']];
+        });
+        return response()->json(['data' => $claim->load(['asset', 'customer', 'product', 'contract', 'settler', 'journalEntry']), 'status' => $status]);
     }
 
     public function storeTechnician(Request $request): JsonResponse
@@ -637,5 +869,14 @@ class ServiceIntegrationController extends Controller
     {
         $companyId = auth()->user()?->company_id;
         return $query->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id'));
+    }
+
+    private function validatedInventorySerial(?int $serialId, ?int $productId, ?string $serialNo, int $companyId): ?InventorySerial
+    {
+        if (!$serialId) return null;
+        $serial = InventorySerial::with('product')->whereKey($serialId)->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->firstOrFail();
+        if ($productId && (int) $serial->product_id !== (int) $productId) abort(422, 'The inventory serial does not belong to the selected product.');
+        if ($serialNo !== null && trim($serialNo) !== '' && trim($serialNo) !== $serial->serial_no) abort(422, 'The service asset serial does not match the inventory serial.');
+        return $serial;
     }
 }

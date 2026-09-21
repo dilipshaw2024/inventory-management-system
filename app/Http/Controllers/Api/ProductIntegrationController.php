@@ -146,10 +146,12 @@ class ProductIntegrationController extends Controller
         if (!app(ProductLifecycleService::class)->isAvailable($parent)) abort(422, 'Variants can only be created from an active parent product.');
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('products', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'name' => ['required', 'string', 'max:255'], 'sku' => ['nullable', 'string', 'max:100', Rule::unique('products', 'sku')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'auto_sku' => ['nullable', 'boolean'],
             'barcode' => ['nullable', 'string', 'max:100', Rule::unique('products', 'barcode')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'purchase_price' => ['nullable', 'numeric', 'min:0'], 'sales_price' => ['nullable', 'numeric', 'min:0'],
+            'tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'],
             'attribute_value_id' => ['nullable', 'array'],
             'attribute_value_id.*' => ['integer', Rule::exists('product_attribute_values', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
         ]);
@@ -169,9 +171,9 @@ class ProductIntegrationController extends Controller
             $variant = Product::create([
                 'company_id' => $parent->company_id ?: $companyId, 'external_reference' => $data['external_reference'] ?? null,
                 'parent_product_id' => $parent->id, 'is_variant' => true, 'name' => $data['name'], 'supplier_id' => $parent->supplier_id,
-                'unit_id' => $parent->unit_id, 'category_id' => $parent->category_id, 'brand_id' => $parent->brand_id,
-                'sku' => $data['sku'] ?? null, 'barcode' => $data['barcode'] ?? null, 'purchase_price' => $parent->purchase_price,
-                'sales_price' => $parent->sales_price, 'tax_rate' => $parent->tax_rate, 'tracking_type' => $parent->tracking_type,
+                'unit_id' => $parent->unit_id, 'category_id' => $parent->category_id, 'brand_id' => $parent->brand_id, 'classification_id' => $parent->classification_id,
+                'sku' => $data['sku'] ?? null, 'barcode' => $data['barcode'] ?? null, 'purchase_price' => $data['purchase_price'] ?? $parent->purchase_price,
+                'sales_price' => $data['sales_price'] ?? $parent->sales_price, 'tax_rate' => $data['tax_rate'] ?? $parent->tax_rate, 'tracking_type' => $parent->tracking_type,
                 'product_type' => $parent->product_type ?: 'stock', 'lifecycle_status' => $parent->lifecycle_status ?: 'active',
                 'can_purchase' => (bool) ($parent->can_purchase ?? true), 'can_sell' => (bool) ($parent->can_sell ?? true), 'is_stock_item' => (bool) ($parent->is_stock_item ?? true),
                 'weight_kg' => $parent->weight_kg, 'length_m' => $parent->length_m, 'width_m' => $parent->width_m, 'height_m' => $parent->height_m,
@@ -182,6 +184,30 @@ class ProductIntegrationController extends Controller
             return $variant;
         });
         return response()->json(['data' => $variant->load('parentProduct', 'attributeAssignments.attribute', 'attributeAssignments.value'), 'status' => 'created'], 201);
+    }
+
+    public function updateVariant(Request $request, int $id): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $product = $this->companyScope(Product::query())->where('is_variant', true)->lockForUpdate()->findOrFail($id);
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'name' => ['sometimes', 'string', 'max:255'],
+            'sku' => ['sometimes', 'nullable', 'string', 'max:100', Rule::unique('products', 'sku')->ignore($product->id)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'barcode' => ['sometimes', 'nullable', 'string', 'max:100', Rule::unique('products', 'barcode')->ignore($product->id)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'purchase_price' => ['sometimes', 'nullable', 'numeric', 'min:0'], 'sales_price' => ['sometimes', 'nullable', 'numeric', 'min:0'],
+            'tax_rate' => ['sometimes', 'nullable', 'numeric', 'min:0', 'max:100'],
+            'status' => ['sometimes', 'boolean'], 'lifecycle_status' => ['sometimes', 'in:draft,active,discontinued,blocked,archived'],
+            'can_purchase' => ['sometimes', 'boolean'], 'can_sell' => ['sometimes', 'boolean'],
+        ]);
+        if (array_key_exists('status', $data) && !$data['status'] && app(ProductLifecycleService::class)->hasStock($product)) abort(422, 'A variant with stock cannot be deactivated.');
+        app(ProductLifecycleService::class)->assertTransitionAllowed($product, $data);
+        $before = $product->only(array_keys($data));
+        DB::transaction(function () use ($product, $data, $before): void {
+            $product->update($data + ['updated_by' => auth()->id()]);
+            app(AuditService::class)->record('product_variant.updated', $product, $before, $product->fresh()->only(array_keys($data)) + ['api' => true]);
+        });
+        return response()->json(['data' => $product->fresh()->load('parentProduct', 'attributeAssignments.attribute', 'attributeAssignments.value'), 'status' => 'updated']);
     }
 
     public function storeBarcode(Request $request, int $id): JsonResponse
@@ -250,7 +276,7 @@ class ProductIntegrationController extends Controller
     {
         $this->assertWriteAccess($request);
         $companyId = $request->user()?->company_id;
-        $data = $this->validated($request, $companyId);
+        $data = $this->validated($request, $companyId, null, true);
         if (empty($data['sku']) && ($data['auto_sku'] ?? true)) $data['sku'] = $this->nextSku($companyId);
         if (!empty($data['external_reference'])) {
             $existing = Product::where('external_reference', $data['external_reference'])->first();
@@ -291,11 +317,14 @@ class ProductIntegrationController extends Controller
         return response()->json(['data' => $product->fresh(), 'status' => 'deactivated']);
     }
 
-    private function validated(Request $request, ?int $companyId, ?int $ignoreId = null): array
+    private function validated(Request $request, ?int $companyId, ?int $ignoreId = null, bool $allowExternalReferenceReplay = false): array
     {
         $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $externalReference = $allowExternalReferenceReplay
+            ? ['nullable', 'string', 'max:150']
+            : ['nullable', 'string', 'max:150', Rule::unique('products', 'external_reference')->ignore($ignoreId)->where(fn ($query) => $query->where('company_id', $companyId))];
         return $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('products', 'external_reference')->ignore($ignoreId)->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => $externalReference,
             'name' => ['required', 'string', 'max:255'], 'supplier_id' => ['required', 'integer', $owned('suppliers')],
             'unit_id' => ['required', 'integer', $owned('units')], 'category_id' => ['required', 'integer', $owned('categories')],
             'brand_id' => ['nullable', 'integer', $owned('brands')],
@@ -306,6 +335,7 @@ class ProductIntegrationController extends Controller
             'max_stock' => ['nullable', 'numeric', 'gte:min_stock'], 'reorder_level' => ['nullable', 'numeric', 'min:0'],
             'tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'], 'tracking_type' => ['required', 'in:none,batch,serial'],
             'tax_rate_id' => ['nullable', 'integer', $owned('tax_rates')],
+            'classification_id' => ['nullable', 'integer', $owned('product_classifications')],
             'status' => ['nullable', 'boolean'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'],
             'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
@@ -316,7 +346,7 @@ class ProductIntegrationController extends Controller
 
     private function productAttributes(array $data): array
     {
-        return collect($data)->only(['external_reference', 'name', 'supplier_id', 'unit_id', 'category_id', 'brand_id', 'sku', 'barcode', 'hsn_sac_code', 'purchase_price', 'sales_price', 'min_stock', 'max_stock', 'reorder_level', 'tax_rate', 'tax_rate_id', 'tracking_type', 'status', 'product_type', 'lifecycle_status', 'can_purchase', 'can_sell', 'is_stock_item', 'weight_kg', 'length_m', 'width_m', 'height_m'])->all();
+        return collect($data)->only(['external_reference', 'name', 'supplier_id', 'unit_id', 'category_id', 'brand_id', 'sku', 'barcode', 'hsn_sac_code', 'classification_id', 'purchase_price', 'sales_price', 'min_stock', 'max_stock', 'reorder_level', 'tax_rate', 'tax_rate_id', 'tracking_type', 'status', 'product_type', 'lifecycle_status', 'can_purchase', 'can_sell', 'is_stock_item', 'weight_kg', 'length_m', 'width_m', 'height_m'])->all();
     }
 
     private function nextSku(?int $companyId): string

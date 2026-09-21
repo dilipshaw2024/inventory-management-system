@@ -25,21 +25,41 @@ use Illuminate\Support\Str;
   
 class ProductController extends Controller
 {
+    private function companyId(): int
+    {
+        return (int) Auth::user()->company_id;
+    }
+
+    private function visibleProducts()
+    {
+        return Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'));
+    }
+
+    private function companyProduct(int $id): Product
+    {
+        return Product::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
+    private function visibleMaster(string $model)
+    {
+        return $model::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'));
+    }
+
     public function barcodes()
     {
-        $products = Product::where('status', 1)->orderBy('name')->get();
-        $barcodes = ProductBarcode::with('product')->latest()->paginate(50);
+        $products = $this->visibleProducts()->where('status', 1)->orderBy('name')->get();
+        $barcodes = ProductBarcode::whereHas('product', fn ($query) => $query->where(fn ($scope) => $scope->where('company_id', $this->companyId())->orWhereNull('company_id')))->with('product')->latest()->paginate(50);
         return view('backend.product.barcodes', compact('products', 'barcodes'));
     }
 
     public function storeBarcode(Request $request)
     {
-        $productScope = Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'));
+        $productScope = Rule::exists('products', 'id')->where('company_id', auth()->user()?->company_id);
         $data = $request->validate(['product_id' => ['required', 'integer', $productScope], 'code' => ['required', 'string', 'max:120', 'unique:product_barcodes,code'], 'type' => ['required', 'in:barcode,qrcode'], 'is_primary' => ['nullable', 'boolean'], 'description' => ['nullable', 'string', 'max:255']]);
         $barcode = DB::transaction(function () use ($data): ProductBarcode {
             if (!empty($data['is_primary'])) ProductBarcode::where('product_id', $data['product_id'])->update(['is_primary' => false]);
             $barcode = ProductBarcode::create($data + ['is_primary' => (bool) ($data['is_primary'] ?? false)]);
-            $product = Product::findOrFail($data['product_id']);
+            $product = $this->companyProduct((int) $data['product_id']);
             if ($barcode->is_primary || !$product->barcode) $product->update(['barcode' => $barcode->code]);
             return $barcode;
         });
@@ -49,8 +69,8 @@ class ProductController extends Controller
     public function barcodeLookup(Request $request)
     {
         $data = $request->validate(['code' => ['required', 'string', 'max:120']]);
-        $barcode = ProductBarcode::with('product')->where('code', $data['code'])->first();
-        $product = $barcode?->product ?: Product::where('barcode', $data['code'])->first();
+        $barcode = ProductBarcode::with('product')->where('code', $data['code'])->whereHas('product', fn ($query) => $query->where(fn ($scope) => $scope->where('company_id', $this->companyId())->orWhereNull('company_id')))->first();
+        $product = $barcode?->product ?: $this->visibleProducts()->where('barcode', $data['code'])->first();
         if (!$product) return response()->json(['message' => 'Barcode not found.'], 404);
         return response()->json(['product' => $product->only(['id', 'name', 'sku', 'barcode', 'quantity', 'sales_price', 'tax_rate']), 'barcode_type' => $barcode?->type ?? 'barcode']);
     }
@@ -59,13 +79,13 @@ class ProductController extends Controller
     {
         $productScope = Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'));
         $data = $request->validate(['product_id' => ['required', 'integer', $productScope]]);
-        $product = Product::with('barcodes')->findOrFail($data['product_id']);
+        $product = $this->visibleProducts()->with('barcodes')->findOrFail($data['product_id']);
         $qrImages = $product->barcodes->where('type', 'qrcode')->mapWithKeys(fn ($barcode): array => [$barcode->id => app(QrCodeService::class)->pngDataUri($barcode->code)])->all();
         return view('backend.product.barcode_print', compact('product', 'qrImages'));
     }
     public function ProductAll(){
 
-        $product = Product::with(['attachments' => fn ($query) => $query->where('attachment_type', 'image')->where('is_primary', true)->latest('id')])->latest()->get();
+        $product = $this->visibleProducts()->with(['attachments' => fn ($query) => $query->where('attachment_type', 'image')->where('is_primary', true)->latest('id')])->latest()->get();
         return view('backend.product.product_all',compact('product'));
 
     } // End Method 
@@ -73,11 +93,11 @@ class ProductController extends Controller
 
     public function ProductAdd(){
 
-        $supplier = Supplier::orderBy('id','desc')->get();
-        $category = Category::orderBy('id','desc')->get();
-        $unit = Unit::orderBy('id','desc')->get();
-        $brands = Brand::orderBy('name')->get();
-        $taxRates = TaxRate::where('is_active', true)->orderBy('name')->get();
+        $supplier = $this->visibleMaster(Supplier::class)->orderBy('id','desc')->get();
+        $category = $this->visibleMaster(Category::class)->orderBy('id','desc')->get();
+        $unit = $this->visibleMaster(Unit::class)->orderBy('id','desc')->get();
+        $brands = $this->visibleMaster(Brand::class)->orderBy('name')->get();
+        $taxRates = $this->visibleMaster(TaxRate::class)->where('is_active', true)->orderBy('name')->get();
         return view('backend.product.product_add',compact('supplier','category','unit','brands','taxRates'));
     } // End Method 
 
@@ -103,7 +123,7 @@ class ProductController extends Controller
             'min_stock' => $request->min_stock ?? 0,
             'max_stock' => $request->max_stock,
             'reorder_level' => $request->reorder_level ?? 0,
-            'tax_rate' => $request->filled('tax_rate') ? $request->tax_rate : (float) (Category::whereKey($request->category_id)->value('tax_rate') ?? 0),
+            'tax_rate' => $request->filled('tax_rate') ? $request->tax_rate : (float) ($this->visibleMaster(Category::class)->whereKey($request->category_id)->value('tax_rate') ?? 0),
             'tax_rate_id' => $request->tax_rate_id,
             'tracking_type' => $request->tracking_type,
             'product_type' => $request->input('product_type', 'stock'),
@@ -133,12 +153,12 @@ class ProductController extends Controller
 
     public function ProductEdit($id){
 
-        $supplier = Supplier::orderBy('id','desc')->get();
-        $category = Category::orderBy('id','desc')->get();
-        $unit = Unit::orderBy('id','desc')->get();
-        $brands = Brand::orderBy('name')->get();
-        $taxRates = TaxRate::where('is_active', true)->orderBy('name')->get();
-        $product = Product::findOrFail($id);
+        $supplier = $this->visibleMaster(Supplier::class)->orderBy('id','desc')->get();
+        $category = $this->visibleMaster(Category::class)->orderBy('id','desc')->get();
+        $unit = $this->visibleMaster(Unit::class)->orderBy('id','desc')->get();
+        $brands = $this->visibleMaster(Brand::class)->orderBy('name')->get();
+        $taxRates = $this->visibleMaster(TaxRate::class)->where('is_active', true)->orderBy('name')->get();
+        $product = $this->companyProduct((int) $id);
         $attachments = $product->attachments()->latest()->get();
         return view('backend.product.product_edit',compact('product','supplier','category','unit','brands','attachments','taxRates'));
     } // End Method 
@@ -148,7 +168,7 @@ class ProductController extends Controller
     public function ProductUpdate(Request $request){
 
         $request->validate([
-            'id' => ['required', 'integer', 'exists:products,id'],
+            'id' => ['required', 'integer', Rule::exists('products', 'id')->where('company_id', $this->companyId())],
             'name' => ['required', 'string', 'max:255'],
             'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', Auth::user()?->company_id)->orWhereNull('company_id'))],
             'unit_id' => ['required', 'integer', Rule::exists('units', 'id')->where(fn ($query) => $query->where('company_id', Auth::user()?->company_id)->orWhereNull('company_id'))],
@@ -172,7 +192,7 @@ class ProductController extends Controller
         ]);
 
         $product_id = $request->id;
-        $product = Product::findOrFail($product_id);
+        $product = $this->companyProduct((int) $product_id);
         try { app(\App\Services\ProductLifecycleService::class)->assertTransitionAllowed($product, $request->only(['is_stock_item', 'lifecycle_status'])); }
         catch (\RuntimeException $exception) { return redirect()->back()->withInput()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
 
@@ -191,7 +211,7 @@ class ProductController extends Controller
             'min_stock' => $request->min_stock ?? 0,
             'max_stock' => $request->max_stock,
             'reorder_level' => $request->reorder_level ?? 0,
-            'tax_rate' => $request->filled('tax_rate') ? $request->tax_rate : (float) (Category::whereKey($request->category_id)->value('tax_rate') ?? 0),
+            'tax_rate' => $request->filled('tax_rate') ? $request->tax_rate : (float) ($this->visibleMaster(Category::class)->whereKey($request->category_id)->value('tax_rate') ?? 0),
             'tax_rate_id' => $request->tax_rate_id,
             'tracking_type' => $request->tracking_type,
             'product_type' => $request->input('product_type', 'stock'),
@@ -219,7 +239,7 @@ class ProductController extends Controller
 
 
     public function ProductDelete($id){
-       $product = Product::findOrFail($id);
+       $product = $this->companyProduct((int) $id);
        if ($product->purchases()->exists() || $product->invoiceDetails()->exists() || $product->quantity > 0) {
             return redirect()->back()->with(['message' => 'This product cannot be deleted because it has stock or transaction history.', 'alert-type' => 'error']);
        }
@@ -229,7 +249,7 @@ class ProductController extends Controller
 
     public function ProductExport(Request $request, ProductSpreadsheetService $spreadsheet): Response
     {
-        $rows = Product::orderBy('id')->get()->map(fn ($product) => [$product->id, $product->name, $product->sku, $product->barcode, $product->supplier_id, $product->unit_id, $product->category_id, $product->brand_id, $product->hsn_sac_code, $product->purchase_price, $product->sales_price, $product->min_stock, $product->max_stock, $product->reorder_level, $product->tax_rate, $product->tax_rate_id, $product->weight_kg, $product->length_m, $product->width_m, $product->height_m, $product->tracking_type, $product->product_type, $product->lifecycle_status, $product->can_purchase ? 1 : 0, $product->can_sell ? 1 : 0, $product->is_stock_item ? 1 : 0, $product->status]);
+        $rows = $this->visibleProducts()->orderBy('id')->get()->map(fn ($product) => [$product->id, $product->name, $product->sku, $product->barcode, $product->supplier_id, $product->unit_id, $product->category_id, $product->brand_id, $product->hsn_sac_code, $product->purchase_price, $product->sales_price, $product->min_stock, $product->max_stock, $product->reorder_level, $product->tax_rate, $product->tax_rate_id, $product->weight_kg, $product->length_m, $product->width_m, $product->height_m, $product->tracking_type, $product->product_type, $product->lifecycle_status, $product->can_purchase ? 1 : 0, $product->can_sell ? 1 : 0, $product->is_stock_item ? 1 : 0, $product->status]);
         if ($request->query('format') === 'csv') return response()->streamDownload(function () use ($rows): void { $handle = fopen('php://output', 'w'); fputcsv($handle, ProductSpreadsheetService::HEADERS); foreach ($rows as $row) fputcsv($handle, $row); fclose($handle); }, 'products-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
         return response($spreadsheet->write(ProductSpreadsheetService::HEADERS, $rows), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="products-'.now()->format('Ymd-His').'.xlsx"']);
     }
@@ -241,62 +261,14 @@ class ProductController extends Controller
         $extension = strtolower($request->file('file')->getClientOriginalExtension());
         try { $importRows = app(ProductSpreadsheetService::class)->read($request->file('file')->getRealPath(), $extension); }
         catch (\Throwable $exception) { return back()->withInput()->with(['message' => 'Import rejected: '.$exception->getMessage(), 'alert-type' => 'error']); }
-        $headers = array_keys($importRows[0] ?? []);
-        $required = ['name', 'unit_id', 'category_id'];
-        $errors = [];
-        $rows = [];
-        foreach ($required as $field) if (!in_array($field, $headers, true)) $errors[] = "Header {$field} is required.";
-        if (count($headers) !== count(array_unique($headers))) $errors[] = 'CSV headers must be unique.';
-        $seenSkus = [];
-        $seenBarcodes = [];
-        $line = 1;
-        foreach ($importRows as $row) {
-            $line++;
-            if (count(array_filter($row, fn ($value) => trim((string) $value) !== '')) === 0) continue;
-            foreach ($required as $field) if (blank($row[$field] ?? null)) $errors[] = "Row {$line}: {$field} is required.";
-            if (!empty($row['tracking_type']) && !in_array($row['tracking_type'], ['none', 'batch', 'serial'], true)) $errors[] = "Row {$line}: tracking_type must be none, batch, or serial.";
-            if (!empty($row['product_type']) && !in_array($row['product_type'], ['stock', 'service', 'consumable', 'asset', 'bundle'], true)) $errors[] = "Row {$line}: product_type is invalid.";
-            if (!empty($row['lifecycle_status']) && !in_array($row['lifecycle_status'], ['draft', 'active', 'discontinued', 'blocked', 'archived'], true)) $errors[] = "Row {$line}: lifecycle_status is invalid.";
-            foreach (['can_purchase', 'can_sell', 'is_stock_item'] as $flag) if ($row[$flag] !== null && $row[$flag] !== '' && !in_array((string) $row[$flag], ['0', '1'], true)) $errors[] = "Row {$line}: {$flag} must be 0 or 1.";
-            foreach (['purchase_price', 'sales_price', 'min_stock', 'max_stock', 'reorder_level', 'tax_rate', 'weight_kg', 'length_m', 'width_m', 'height_m'] as $field) {
-                if ($row[$field] !== null && $row[$field] !== '' && !is_numeric($row[$field])) $errors[] = "Row {$line}: {$field} must be numeric.";
-                if ($row[$field] !== null && $row[$field] !== '' && is_numeric($row[$field]) && (float) $row[$field] < 0) $errors[] = "Row {$line}: {$field} cannot be negative.";
-            }
-            if (is_numeric($row['max_stock'] ?? null) && is_numeric($row['min_stock'] ?? null) && (float) $row['max_stock'] < (float) $row['min_stock']) $errors[] = "Row {$line}: max_stock cannot be below min_stock.";
-            if (is_numeric($row['tax_rate'] ?? null) && ((float) $row['tax_rate'] < 0 || (float) $row['tax_rate'] > 100)) $errors[] = "Row {$line}: tax_rate must be between 0 and 100.";
-            if (!empty($row['status']) && !in_array((string) $row['status'], ['0', '1'], true)) $errors[] = "Row {$line}: status must be 0 or 1.";
-            foreach (['supplier_id' => Supplier::class, 'unit_id' => Unit::class, 'category_id' => Category::class, 'brand_id' => Brand::class, 'tax_rate_id' => TaxRate::class] as $field => $model) {
-                if (!empty($row[$field]) && !$model::whereKey($row[$field])->exists()) $errors[] = "Row {$line}: {$field} does not exist.";
-            }
-            if (!empty($row['id']) && !Product::whereKey($row['id'])->exists()) $errors[] = "Row {$line}: product id does not exist.";
-            if (!empty($row['sku']) && Product::where('sku', $row['sku'])->when($row['id'] ?? null, fn ($query) => $query->where('id', '!=', $row['id']))->exists()) $errors[] = "Row {$line}: SKU already exists.";
-            if (!empty($row['barcode']) && Product::where('barcode', $row['barcode'])->when($row['id'] ?? null, fn ($query) => $query->where('id', '!=', $row['id']))->exists()) $errors[] = "Row {$line}: barcode already exists.";
-            if (!empty($row['sku']) && in_array($row['sku'], $seenSkus, true)) $errors[] = "Row {$line}: SKU is duplicated in this file.";
-            if (!empty($row['barcode']) && in_array($row['barcode'], $seenBarcodes, true)) $errors[] = "Row {$line}: barcode is duplicated in this file.";
-            if (!empty($row['sku'])) $seenSkus[] = $row['sku'];
-            if (!empty($row['barcode'])) $seenBarcodes[] = $row['barcode'];
-            $rows[] = $row;
-        }
+        $validated = app(\App\Services\ProductImportService::class)->validateRows($importRows, auth()->user()?->company_id);
+        $rows = $validated['rows']; $errors = $validated['errors'];
         if ($dryRun) {
             session(['product_import.errors' => $errors]);
             return view('backend.product.import_preview', compact('rows', 'errors'));
         }
         if ($errors) return back()->withInput()->with(['message' => 'Import rejected: '.implode(' ', $errors), 'alert-type' => 'error']);
-        DB::transaction(function () use ($rows): void {
-            foreach ($rows as $row) {
-                $payload = collect($row)->only(['name', 'sku', 'barcode', 'supplier_id', 'unit_id', 'category_id', 'brand_id', 'hsn_sac_code', 'purchase_price', 'sales_price', 'min_stock', 'max_stock', 'reorder_level', 'tax_rate', 'tax_rate_id', 'weight_kg', 'length_m', 'width_m', 'height_m', 'tracking_type', 'product_type', 'lifecycle_status', 'can_purchase', 'can_sell', 'is_stock_item', 'status'])->filter(fn ($value) => $value !== null && $value !== '')->all();
-                $payload['status'] = $payload['status'] ?? 1;
-                $payload['product_type'] = $payload['product_type'] ?? 'stock'; $payload['lifecycle_status'] = $payload['lifecycle_status'] ?? 'active'; $payload['can_purchase'] = (int) ($payload['can_purchase'] ?? 1); $payload['can_sell'] = (int) ($payload['can_sell'] ?? 1); $payload['is_stock_item'] = (int) ($payload['is_stock_item'] ?? 1);
-                if (!empty($row['id'])) {
-                    $product = Product::findOrFail($row['id']);
-                    app(\App\Services\ProductLifecycleService::class)->assertTransitionAllowed($product, $payload);
-                    $product->update($payload + ['updated_by' => auth()->id()]);
-                } else {
-                    if (empty($payload['sku'])) $payload['sku'] = $this->nextSku(auth()->user()?->company_id);
-                    Product::create($payload + ['company_id' => auth()->user()?->company_id, 'quantity' => 0, 'created_by' => auth()->id()]);
-                }
-            }
-        });
+        app(\App\Services\ProductImportService::class)->importRows($rows, auth()->user()?->company_id, auth()->id());
         return redirect()->route('product.all')->with(['message' => count($rows).' products imported successfully.', 'alert-type' => 'success']);
     }
 

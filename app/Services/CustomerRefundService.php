@@ -6,6 +6,7 @@ use App\Models\AccountMapping;
 use App\Models\CustomerRefund;
 use App\Models\InventoryReturn;
 use App\Models\JournalEntry;
+use App\Services\AuditService;
 use Illuminate\Support\Facades\DB;
 
 class CustomerRefundService
@@ -28,6 +29,23 @@ class CustomerRefundService
             if ($cash && $receivable) app(AccountingService::class)->post(['company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))), 'date' => now()->toDateString(), 'description' => 'Customer refund '.$refund->refund_no], [['account_id' => $receivable, 'debit' => $baseAmount, 'credit' => 0], ['account_id' => $cash, 'debit' => 0, 'credit' => $baseAmount]], $refund);
             $refund->update(['base_amount' => $baseAmount]);
             $refund->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);
+            return $refund->fresh();
+        });
+    }
+
+    public function settle(CustomerRefund $refund, string $reference): CustomerRefund
+    {
+        return DB::transaction(function () use ($refund, $reference): CustomerRefund {
+            $refund = CustomerRefund::lockForUpdate()->findOrFail($refund->id);
+            if ($refund->settlement_status === 'settled') {
+                if ($refund->settlement_reference === $reference) return $refund->fresh();
+                throw new \RuntimeException('This refund has already been settled with a different reference.');
+            }
+            if ($refund->status !== 'approved') throw new \RuntimeException('Only approved customer refunds can be settled.');
+            if (CustomerRefund::where('company_id', $refund->company_id)->where('settlement_reference', $reference)->where('id', '<>', $refund->id)->exists()) throw new \RuntimeException('The settlement reference is already used by another customer refund.');
+            $before = $refund->only(['settlement_status', 'settlement_reference', 'settled_at', 'settled_by']);
+            $refund->update(['settlement_status' => 'settled', 'settlement_reference' => $reference, 'settled_at' => now(), 'settled_by' => auth()->id()]);
+            app(AuditService::class)->record('customer_refund.settled', $refund, $before, $refund->fresh()->only(['settlement_status', 'settlement_reference', 'settled_at', 'settled_by']));
             return $refund->fresh();
         });
     }

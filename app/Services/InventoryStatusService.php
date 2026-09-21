@@ -43,6 +43,20 @@ class InventoryStatusService
                     : ($transfer->from_status === 'available' ? 'quarantine_in' : 'quarantine_out');
                 app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, (float) ($product->purchase_price ?? 0), $transfer->location_id, $transfer, $transfer->reason);
             }
+            $recoveryQuantity = (float) ($transfer->recovery_quantity ?? 0);
+            if ($transfer->recovery_product_id && (int) $transfer->recovery_product_id === (int) $transfer->product_id) throw new \RuntimeException('Recovery product must differ from the disposition product.');
+            if ($transfer->to_status !== 'scrap' && ($transfer->recovery_product_id || $recoveryQuantity > 0.000001 || $transfer->recovery_unit_cost !== null)) throw new \RuntimeException('Recovery material is only valid for scrap disposition.');
+            if ($transfer->recovery_product_id && $recoveryQuantity <= 0.000001) throw new \RuntimeException('Recovery quantity must be greater than zero when a recovery product is selected.');
+            if (!$transfer->recovery_product_id && $recoveryQuantity > 0.000001) throw new \RuntimeException('A recovery product is required when recovery quantity is provided.');
+            if ($transfer->recovery_product_id) {
+                $recovery = Product::where(function ($query) use ($transfer): void { $query->where('company_id', $transfer->company_id)->orWhereNull('company_id'); })->lockForUpdate()->findOrFail($transfer->recovery_product_id);
+                app(ProductLifecycleService::class)->assertStockManaged($recovery);
+                $recoveryUnitCost = $transfer->recovery_unit_cost !== null ? (float) $transfer->recovery_unit_cost : (float) ($product->purchase_price ?? 0);
+                $recovery->quantity = (float) $recovery->quantity + $recoveryQuantity;
+                $recovery->purchase_price = $recoveryUnitCost;
+                $recovery->save();
+                app(InventoryLedgerService::class)->post($recovery->id, 'receipt', $recoveryQuantity, $recoveryUnitCost, $transfer->location_id, $transfer, 'Inventory status disposition recovery');
+            }
         });
     }
 

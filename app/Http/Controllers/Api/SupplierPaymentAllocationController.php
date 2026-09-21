@@ -21,7 +21,7 @@ class SupplierPaymentAllocationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('supplier_payments', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'supplier_id' => ['required', 'integer', Rule::exists('suppliers', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'purchase_invoice_id' => ['nullable', 'integer', Rule::exists('purchase_invoices', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'payment_date' => ['required', 'date'], 'amount' => ['required', 'numeric', 'gt:0'], 'method' => ['required', 'in:cash,bank,card,transfer,other'],

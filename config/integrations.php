@@ -15,8 +15,28 @@ return [
         'trim',
         explode(',', (string) env('ERP_CARRIER_TRACKING_ADAPTERS', ''))
     ))),
+    'carrier_tracking_http_endpoint' => env('ERP_CARRIER_TRACKING_HTTP_ENDPOINT'),
+    'carrier_tracking_http_token' => env('ERP_CARRIER_TRACKING_HTTP_TOKEN'),
+    'carrier_tracking_http_timeout' => (int) env('ERP_CARRIER_TRACKING_HTTP_TIMEOUT', 30),
+    'carrier_tracking_http_retries' => (int) env('ERP_CARRIER_TRACKING_HTTP_RETRIES', 2),
+    'carrier_tracking_http_retry_sleep' => (int) env('ERP_CARRIER_TRACKING_HTTP_RETRY_SLEEP', 0),
     'bank_statement_adapters' => array_values(array_filter(array_map(
         'trim',
         explode(',', (string) env('ERP_BANK_STATEMENT_ADAPTERS', ''))
     ))),
+    'bank_statement_http_endpoint' => env('ERP_BANK_STATEMENT_HTTP_ENDPOINT'),
+    'bank_statement_http_token' => env('ERP_BANK_STATEMENT_HTTP_TOKEN'),
+    'bank_statement_http_timeout' => (int) env('ERP_BANK_STATEMENT_HTTP_TIMEOUT', 30),
+    'bank_statement_http_retries' => (int) env('ERP_BANK_STATEMENT_HTTP_RETRIES', 2),
+    'bank_statement_http_retry_sleep' => (int) env('ERP_BANK_STATEMENT_HTTP_RETRY_SLEEP', 0),
+    'e_invoice_adapters' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) env('ERP_E_INVOICE_ADAPTERS', ''))
+    ))),
+    'e_invoice_http_endpoint' => env('ERP_E_INVOICE_HTTP_ENDPOINT'),
+    'e_invoice_http_token' => env('ERP_E_INVOICE_HTTP_TOKEN'),
+    'e_invoice_http_timeout' => (int) env('ERP_E_INVOICE_HTTP_TIMEOUT', 30),
+    'e_invoice_http_retries' => (int) env('ERP_E_INVOICE_HTTP_RETRIES', 2),
+    'e_invoice_http_retry_sleep' => (int) env('ERP_E_INVOICE_HTTP_RETRY_SLEEP', 0),
+    'e_invoice_callback_secret' => env('ERP_E_INVOICE_CALLBACK_SECRET'),
 ];

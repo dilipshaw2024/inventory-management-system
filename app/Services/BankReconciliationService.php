@@ -19,11 +19,11 @@ class BankReconciliationService
         $from = Carbon::parse($line->transaction_date)->subDays(7)->startOfDay();
         $to = Carbon::parse($line->transaction_date)->addDays(7)->endOfDay();
         $tolerance = 0.000001;
-        $rows = $this->companyScope(Payment::with('customer'), $companyId)->whereBetween('paid_amount', [$amount - $tolerance, $amount + $tolerance])
+        $rows = $this->companyScope(Payment::with('customer'), $companyId)->where('approval_status', 'approved')->whereBetween('paid_amount', [$amount - $tolerance, $amount + $tolerance])
             ->where('paid_amount', '>', 0)->where(fn ($query) => $query->where('is_reversed', false)->orWhereNull('is_reversed'))
             ->whereBetween('created_at', [$from, $to])->get()->map(fn (Payment $payment): array => [
                 'target_type' => 'customer_payment', 'target_id' => $payment->id, 'amount' => (float) $payment->paid_amount,
-                'date' => $payment->created_at?->toDateString(), 'label' => 'Customer receipt #'.$payment->id,
+                'date' => ($payment->payment_date ?: $payment->created_at)?->toDateString(), 'label' => 'Customer receipt #'.$payment->id,
                 'party' => $payment->customer?->name,
             ]);
         $rows = $rows->merge($this->companyScope(SupplierPayment::with('supplier'), $companyId)->where(function ($query) use ($amount, $tolerance): void {
@@ -48,7 +48,8 @@ class BankReconciliationService
                 default => throw new \InvalidArgumentException('Unsupported reconciliation target.'),
             };
             if ($line->company_id && $model->company_id && (int) $line->company_id !== (int) $model->company_id) throw new \RuntimeException('Bank line and payment belong to different companies.');
-            if (($model->status ?? $model->paid_status) !== 'approved' && $type === 'supplier_payment') throw new \RuntimeException('Only approved supplier payments can be matched.');
+            if ($type === 'supplier_payment' && $model->status !== 'approved') throw new \RuntimeException('Only approved supplier payments can be matched.');
+            if ($type === 'customer_payment' && ($model->approval_status ?? 'approved') !== 'approved') throw new \RuntimeException('Only approved customer payments can be matched.');
             if ($type === 'customer_payment' && (float) $model->paid_amount <= 0) throw new \RuntimeException('Customer payment has no amount to match.');
             $targetAmount = (float) ($type === 'supplier_payment' ? ($model->base_amount ?: $model->amount) : $model->paid_amount);
             if (abs(abs((float) $line->amount) - $targetAmount) > 0.000001) throw new \RuntimeException('Statement amount does not match the selected payment.');

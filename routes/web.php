@@ -338,10 +338,17 @@ Route::middleware(['auth', 'permission:purchasing.manage'])->controller(Supplier
     Route::get('/', 'index')->name('index');
     Route::post('/', 'store')->name('store')->middleware('permission:purchasing.manage');
     Route::post('/{id}/deactivate', 'deactivate')->name('deactivate')->middleware('permission:purchasing.manage');
+    Route::post('/{id}/approve', 'approve')->name('approve')->middleware('permission:purchasing.manage');
+    Route::post('/{id}/reject', 'reject')->name('reject')->middleware('permission:purchasing.manage');
 });
 
 Route::middleware(['auth', 'permission:reports.view'])->get('/procurement/supplier-performance', [SupplierPerformanceController::class, 'index'])->name('procurement.supplier.performance');
 Route::middleware(['auth', 'permission:reports.export'])->get('/procurement/supplier-performance/export', [SupplierPerformanceController::class, 'export'])->name('procurement.supplier.performance.export');
+Route::middleware(['auth', 'permission:purchasing.manage'])->controller(\App\Http\Controllers\SupplierCorrectiveActionController::class)->prefix('procurement/supplier-corrective-actions')->name('procurement.supplier.corrective.')->group(function () {
+    Route::get('/', 'index')->name('index');
+    Route::post('/', 'store')->name('store');
+    Route::patch('/{id}', 'update')->name('update');
+});
 Route::middleware(['auth', 'permission:reports.view'])->get('/reports/inventory-analytics', [InventoryAnalyticsController::class, 'index'])->name('reports.inventory.analytics');
 Route::middleware(['auth', 'permission:reports.view'])->get('/reports/sales', [SalesReportController::class, 'index'])->name('reports.sales');
 Route::middleware(['auth', 'permission:reports.export'])->get('/reports/sales/export', [SalesReportController::class, 'export'])->name('reports.sales.export');
@@ -493,6 +500,9 @@ Route::middleware('auth')->controller(DataRetentionController::class)->prefix('e
     Route::post('/holds/{id}/release', 'releaseHold')->name('holds.release')->middleware('permission:users.manage');
     Route::get('/archives/export', 'exportArchives')->name('archives.export')->middleware('permission:users.manage');
     Route::post('/preview', 'preview')->name('preview')->middleware('permission:users.manage');
+    Route::post('/purge-requests', 'requestPurge')->name('purge-requests.store')->middleware('permission:users.manage');
+    Route::post('/purge-requests/{id}/approve', 'decidePurge')->defaults('decision', 'approve')->name('purge-requests.approve')->middleware('permission:users.manage');
+    Route::post('/purge-requests/{id}/reject', 'decidePurge')->defaults('decision', 'reject')->name('purge-requests.reject')->middleware('permission:users.manage');
 });
 Route::middleware('auth')->controller(ProductController::class)->prefix('product/barcodes')->name('product.barcodes.')->group(function () {
     Route::get('/', 'barcodes')->name('index');
@@ -538,6 +548,8 @@ Route::middleware(['auth', 'permission:users.manage'])->controller(ApprovalDeleg
     Route::post('/{id}/deactivate', 'deactivate')->name('deactivate');
 });
 Route::middleware(['auth', 'permission:reports.view'])->get('/planning/demand-forecast', [DemandForecastController::class, 'index'])->name('planning.demand.forecast');
+Route::middleware(['auth', 'permission:reports.view'])->get('/planning/replenishment-scenario', [DemandForecastController::class, 'scenario'])->name('planning.replenishment.scenario');
+Route::middleware(['auth', 'permission:inventory.post'])->post('/planning/replenishment-scenario/save', [DemandForecastController::class, 'saveScenario'])->name('planning.replenishment.scenario.save');
 Route::middleware(['auth', 'permission:inventory.post'])->post('/planning/demand-forecast/override', [DemandForecastController::class, 'storeOverride'])->name('planning.demand.forecast.override');
 Route::middleware(['auth', 'permission:inventory.view'])->get('/warehouse/put-away', [PutAwayController::class, 'index'])->name('warehouse.put.away');
 Route::middleware(['auth', 'permission:inventory.post'])->post('/warehouse/put-away', [PutAwayController::class, 'confirm'])->name('warehouse.put.away.confirm');
@@ -554,6 +566,8 @@ Route::middleware(['auth', 'permission:inventory.view'])->controller(StockCountC
     Route::post('/{id}/approve', 'approve')->name('approve')->middleware('permission:inventory.approve');
     Route::post('/{id}/reject', 'reject')->name('reject')->middleware('permission:inventory.approve');
     Route::post('/{id}/request-recount', 'requestRecount')->name('request-recount')->middleware('permission:inventory.approve');
+    Route::post('/{id}/assign-counters', 'assignCounters')->name('assign-counters')->middleware('permission:inventory.approve');
+    Route::post('/{id}/assignments/{assignmentId}/complete', 'completeCounter')->name('assignments.complete')->middleware('permission:inventory.post');
 });
 
 Route::middleware(['auth', 'permission:inventory.view'])->controller(InventoryStatusController::class)->prefix('inventory/status')->name('inventory.status.')->group(function () {
@@ -610,6 +624,7 @@ Route::middleware(['auth', 'permission:reports.view'])->controller(ReceivablesCo
 Route::middleware(['auth', 'permission:inventory.view'])->controller(ProductVariantController::class)->prefix('product')->name('product.')->group(function () {
     Route::get('/variants', 'index')->name('variants');
     Route::post('/variants', 'storeVariant')->name('variants.store')->middleware('permission:inventory.post');
+    Route::patch('/variants/{id}', 'updateVariant')->name('variants.update')->middleware('permission:inventory.post');
     Route::post('/attributes', 'storeAttribute')->name('attributes.store')->middleware('permission:inventory.post');
     Route::post('/attributes/values', 'storeValue')->name('attributes.values.store')->middleware('permission:inventory.post');
 });
@@ -680,10 +695,13 @@ Route::middleware(['auth', 'permission:service.manage'])->controller(ServiceMain
     Route::post('/order', 'order')->name('order')->middleware('permission:service.manage');
     Route::post('/order/{id}/status', 'updateOrderStatus')->name('order.status')->middleware('permission:service.manage');
     Route::get('/order/{id}/parts', 'parts')->name('parts')->middleware('permission:service.manage');
+    Route::post('/order/{id}/parts/reserve', 'reservePart')->name('parts.reserve')->middleware('permission:service.manage');
     Route::post('/order/{id}/parts', 'consumePart')->name('parts.consume')->middleware('permission:service.manage');
     Route::post('/order/{id}/parts/{partId}/return', 'returnPart')->name('parts.return')->middleware('permission:service.manage');
     Route::get('/warranty-claims', 'warrantyClaims')->name('warranty.claims');
     Route::post('/warranty-claims', 'warrantyClaim')->name('warranty.claims.store')->middleware('permission:service.manage');
+    Route::post('/warranty-claims/{id}/decision', 'warrantyClaimDecision')->name('warranty.claims.decision')->middleware('permission:service.manage');
+    Route::post('/warranty-claims/{id}/settle', 'settleWarrantyClaim')->name('warranty.claims.settle')->middleware('permission:service.manage');
     Route::get('/asset/{id}/spare-parts', 'spareParts')->name('asset.spare-parts');
     Route::post('/asset/{id}/spare-parts', 'storeSparePart')->name('asset.spare-parts.store')->middleware('permission:service.manage');
 });
@@ -698,6 +716,7 @@ Route::middleware(['auth', 'permission:hr.view'])->controller(\App\Http\Controll
     Route::post('/pay-runs', 'storePayRun')->name('pay-runs.store')->middleware('permission:hr.manage');
     Route::post('/pay-runs/{id}/approve', 'approvePayRun')->name('pay-runs.approve')->middleware('permission:hr.manage');
     Route::post('/pay-runs/{id}/pay', 'payPayRun')->name('pay-runs.pay')->middleware('permission:hr.manage');
+    Route::post('/pay-runs/{id}/reverse-payment', 'reversePayRun')->name('pay-runs.reverse-payment')->middleware('permission:hr.manage');
     Route::post('/payroll-rules', 'storePayrollRule')->name('payroll-rules.store')->middleware('permission:hr.manage');
     Route::post('/payroll-rules/{id}/deactivate', 'deactivatePayrollRule')->name('payroll-rules.deactivate')->middleware('permission:hr.manage');
 });
@@ -721,13 +740,24 @@ Route::middleware(['auth', 'permission:manufacturing.manage'])->controller(Manuf
     Route::post('/work-centers', 'storeWorkCenter')->name('work-centers.store')->middleware('permission:manufacturing.manage');
     Route::post('/routings', 'storeRouting')->name('routings.store')->middleware('permission:manufacturing.manage');
     Route::post('/boms', 'storeBom')->name('boms.store')->middleware('permission:manufacturing.manage');
+    Route::post('/boms/{id}/approve', 'approveBom')->name('boms.approve')->middleware('permission:manufacturing.manage');
+    Route::post('/boms/{id}/reject', 'rejectBom')->name('boms.reject')->middleware('permission:manufacturing.manage');
     Route::get('/orders', 'orders')->name('orders');
+    Route::get('/production-variance', 'productionVariance')->name('production-variance');
+    Route::get('/scrap', 'scrap')->name('scrap');
+    Route::get('/scrap/add', 'createScrap')->name('scrap.create');
+    Route::post('/scrap', 'storeScrap')->name('scrap.store')->middleware('permission:manufacturing.manage');
+    Route::post('/scrap/{id}/approve', 'approveScrap')->name('scrap.approve')->middleware('permission:manufacturing.manage');
+    Route::post('/scrap/{id}/reject', 'rejectScrap')->name('scrap.reject')->middleware('permission:manufacturing.manage');
     Route::get('/orders/add', 'createOrder')->name('orders.create');
     Route::post('/orders', 'storeOrder')->name('orders.store')->middleware('permission:manufacturing.manage');
     Route::post('/orders/{id}/release', 'release')->name('orders.release')->middleware('permission:inventory.approve');
     Route::post('/orders/{id}/schedule', 'schedule')->name('orders.schedule')->middleware('permission:manufacturing.manage');
     Route::post('/orders/{id}/complete', 'complete')->name('orders.complete')->middleware('permission:inventory.approve');
     Route::post('/orders/{id}/cancel', 'cancel')->name('orders.cancel')->middleware('permission:manufacturing.manage');
+    Route::post('/orders/{id}/pause', 'pause')->name('orders.pause')->middleware('permission:manufacturing.manage');
+    Route::post('/orders/{id}/resume', 'resume')->name('orders.resume')->middleware('permission:manufacturing.manage');
+    Route::post('/orders/{id}/close', 'close')->name('orders.close')->middleware('permission:manufacturing.manage');
     Route::get('/orders/{id}/operations', 'operations')->name('orders.operations');
     Route::post('/operations/{id}/start', 'startOperation')->name('operations.start')->middleware('permission:manufacturing.manage');
     Route::post('/operations/{id}/complete', 'completeOperation')->name('operations.complete')->middleware('permission:manufacturing.manage');

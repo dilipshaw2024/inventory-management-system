@@ -34,7 +34,7 @@ class StockController extends Controller
             ->when($validated['category_id'] ?? null, fn ($query, $id) => $query->where('category_id', $id))
             ->orderBy('id','desc')->get();
         $ids = $allData->pluck('id');
-        $reserved = StockReservation::whereIn('product_id', $ids)->where('status', 'active')
+        $reserved = StockReservation::whereIn('product_id', $ids)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))
             ->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))
             ->selectRaw('product_id, COALESCE(SUM(quantity - released_quantity), 0) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
         $quality = InventoryStatusBalance::whereIn('product_id', $ids)->whereIn('status', ['blocked', 'quarantine', 'damaged'])
@@ -102,6 +102,7 @@ class StockController extends Controller
     } // End Method
 
     public function MovementReport(Request $request){
+        $companyId = auth()->user()?->company_id;
         $validated = $request->validate([
             'product_id' => ['nullable', 'integer', $this->owned('products')],
             'movement_type' => ['nullable', 'string', 'in:opening,receipt,issue,transfer_in,transfer_out,adjustment_in,adjustment_out,return_in,return_out,scrap,quarantine_in,quarantine_out,reservation,release'],
@@ -109,11 +110,12 @@ class StockController extends Controller
             'to' => ['nullable', 'date', 'after_or_equal:from'],
         ]);
 
-        $movements = InventoryMovement::with(['product', 'location', 'creator'])
+        $movements = InventoryMovement::withoutGlobalScopes()->with(['product', 'location', 'creator'])
             ->from('inventory_movements as ledger_rows')
             ->select('ledger_rows.*')
             ->selectSub($this->movementBalanceQuery($validated['from'] ?? null, false), 'opening_balance')
             ->selectSub($this->movementBalanceQuery($validated['to'] ?? now()->toDateString(), true), 'closing_balance')
+            ->where(fn ($query) => $query->where('ledger_rows.company_id', $companyId)->orWhereNull('ledger_rows.company_id'))
             ->when($validated['product_id'] ?? null, fn ($query, $id) => $query->where('product_id', $id))
             ->when($validated['movement_type'] ?? null, fn ($query, $type) => $query->where('movement_type', $type))
             ->when($validated['from'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '>=', $date))
@@ -126,12 +128,14 @@ class StockController extends Controller
 
     public function MovementExport(Request $request): StreamedResponse
     {
-        $validated = $request->validate(['product_id' => ['nullable', 'integer', 'exists:products,id'], 'movement_type' => ['nullable', 'string', 'in:opening,receipt,issue,transfer_in,transfer_out,adjustment_in,adjustment_out,return_in,return_out,scrap,quarantine_in,quarantine_out,reservation,release'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from']]);
-        $movements = InventoryMovement::with(['product', 'location', 'creator'])
+        $companyId = auth()->user()?->company_id;
+        $validated = $request->validate(['product_id' => ['nullable', 'integer', $this->owned('products')], 'movement_type' => ['nullable', 'string', 'in:opening,receipt,issue,transfer_in,transfer_out,adjustment_in,adjustment_out,return_in,return_out,scrap,quarantine_in,quarantine_out,reservation,release'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from']]);
+        $movements = InventoryMovement::withoutGlobalScopes()->with(['product', 'location', 'creator'])
             ->from('inventory_movements as ledger_rows')
             ->select('ledger_rows.*')
             ->selectSub($this->movementBalanceQuery($validated['from'] ?? null, false), 'opening_balance')
             ->selectSub($this->movementBalanceQuery($validated['to'] ?? now()->toDateString(), true), 'closing_balance')
+            ->where(fn ($query) => $query->where('ledger_rows.company_id', $companyId)->orWhereNull('ledger_rows.company_id'))
             ->when($validated['product_id'] ?? null, fn ($query, $id) => $query->where('product_id', $id))->when($validated['movement_type'] ?? null, fn ($query, $type) => $query->where('movement_type', $type))->when($validated['from'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '>=', $date))->when($validated['to'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '<=', $date))->latest('posted_at')->latest('id')->cursor();
         return response()->streamDownload(function () use ($movements): void { $handle = fopen('php://output', 'w'); fputcsv($handle, ['Date', 'Product', 'Movement', 'Quantity', 'Unit cost', 'Opening balance', 'Closing balance', 'Reference', 'Location', 'User']); foreach ($movements as $movement) fputcsv($handle, [$movement->posted_at, $movement->product?->name, $movement->movement_type, $movement->quantity, $movement->unit_cost, $movement->opening_balance, $movement->closing_balance, $movement->reference_no, $movement->location?->code, $movement->creator?->name]); fclose($handle); }, 'stock-ledger-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
     }
@@ -140,10 +144,11 @@ class StockController extends Controller
     {
         $in = "('opening','receipt','transfer_in','adjustment_in','return_in','quarantine_out','release')";
         $out = "('issue','transfer_out','adjustment_out','return_out','scrap','quarantine_in')";
-        return InventoryMovement::query()
+        return InventoryMovement::withoutGlobalScopes()
             ->selectRaw("COALESCE(SUM(CASE WHEN movement_type IN $in THEN quantity WHEN movement_type IN $out THEN -quantity ELSE 0 END), 0)")
             ->whereColumn('product_id', 'ledger_rows.product_id')
             ->whereRaw('(location_id = ledger_rows.location_id OR (location_id IS NULL AND ledger_rows.location_id IS NULL))')
+            ->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))
             ->when($date, fn ($query) => $query->whereDate('posted_at', $inclusive ? '<=' : '<', $date));
     }
 

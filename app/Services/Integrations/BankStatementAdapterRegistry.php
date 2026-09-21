@@ -18,6 +18,9 @@ class BankStatementAdapterRegistry
 
     public function register(BankStatementAdapter $adapter): void { $this->adapters[$adapter->key()] = $adapter; }
 
+    /** @return list<string> */
+    public function keys(): array { return array_keys($this->adapters); }
+
     public function resolve(string $key): BankStatementAdapter
     {
         $key = strtolower(trim($key));

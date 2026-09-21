@@ -11,12 +11,17 @@ use App\Models\Routing;
 use App\Models\RoutingOperation;
 use App\Models\WorkCenter;
 use App\Models\InventoryLocation;
+use App\Models\Unit;
+use App\Models\ProductionScrapRecord;
 use App\Services\AuditService;
 use App\Services\ProductionService;
 use App\Services\NumberingSequenceService;
 use App\Services\ProductionOperationService;
 use App\Services\BomRevisionService;
+use App\Services\UomConversionService;
+use App\Services\ProductionScrapService;
 use App\Services\ProductionSchedulingService;
+use App\Services\ProductionVarianceService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Carbon\Carbon;
@@ -36,7 +41,7 @@ class ManufacturingController extends Controller
     public function routing()
     {
         $routings = Routing::with(['bom.product', 'operations.workCenter'])->latest()->paginate(25);
-        $boms = BillOfMaterial::with('product')->where('is_active', true)->orderBy('name')->get();
+        $boms = BillOfMaterial::with('product')->where('is_active', true)->where('approval_status', 'approved')->orderBy('name')->get();
         $workCenters = WorkCenter::where('is_active', true)->orderBy('name')->get();
         return view('admin.erp.routings', compact('routings', 'boms', 'workCenters'));
     }
@@ -64,9 +69,10 @@ class ManufacturingController extends Controller
 
     public function boms()
     {
-        $boms = BillOfMaterial::with(['product', 'lines.component'])->latest()->paginate(25);
+        $boms = BillOfMaterial::with(['product', 'lines.component', 'lines.uom'])->latest()->paginate(25);
         $products = Product::where('status', 1)->orderBy('name')->get();
-        return view('admin.erp.boms', compact('boms', 'products'));
+        $units = Unit::where('status', 1)->orderBy('name')->get();
+        return view('admin.erp.boms', compact('boms', 'products', 'units'));
     }
 
     public function storeBom(Request $request)
@@ -85,6 +91,8 @@ class ManufacturingController extends Controller
             'quantity' => ['required', 'array'],
             'quantity.0' => ['required', 'numeric', 'gt:0'],
             'quantity.*' => ['nullable', 'numeric', 'gt:0', 'required_with:component_product_id.*'],
+            'uom_id' => ['nullable', 'array'],
+            'uom_id.*' => ['nullable', 'integer', $this->companyExists('units')],
             'scrap_percent' => ['nullable', 'array'],
             'scrap_percent.*' => ['nullable', 'numeric', 'min:0', 'max:100'],
             'byproduct_product_id' => ['nullable', 'array'], 'byproduct_product_id.*' => ['nullable', $this->companyExists('products'), 'different:product_id'],
@@ -94,14 +102,23 @@ class ManufacturingController extends Controller
         if (array_sum(array_map('floatval', $data['byproduct_cost_share'] ?? [])) > 100.000001) {
             return back()->withErrors(['byproduct_cost_share' => 'By-product cost shares cannot exceed 100%.'])->withInput();
         }
+        foreach ($data['component_product_id'] as $index => $componentId) {
+            if (!$componentId || empty($data['uom_id'][$index])) continue;
+            $component = Product::findOrFail($componentId);
+            try {
+                app(UomConversionService::class)->toStock($component, (float) $data['quantity'][$index], (int) $data['uom_id'][$index], 'manufacturing');
+            } catch (\InvalidArgumentException $exception) {
+                return back()->withErrors(['uom_id' => $exception->getMessage()])->withInput();
+            }
+        }
         if ($data['is_active'] ?? true) {
             try { app(BomRevisionService::class)->assertNoActiveOverlap((int) $data['product_id'], $data['effective_from'] ?? null, $data['effective_until'] ?? null, auth()->user()?->company_id); }
             catch (\RuntimeException $exception) { return back()->withErrors(['effective_from' => $exception->getMessage()])->withInput(); }
         }
-        $bom = BillOfMaterial::create(collect($data)->except(['component_product_id', 'quantity', 'scrap_percent', 'byproduct_product_id', 'byproduct_quantity', 'byproduct_cost_share'])->all() + ['version' => $data['version'] ?? '1', 'company_id' => auth()->user()?->company_id]);
+        $bom = BillOfMaterial::create(collect($data)->except(['component_product_id', 'quantity', 'uom_id', 'scrap_percent', 'byproduct_product_id', 'byproduct_quantity', 'byproduct_cost_share'])->all() + ['version' => $data['version'] ?? '1', 'company_id' => auth()->user()?->company_id, 'approval_status' => 'pending', 'created_by' => auth()->id()]);
         foreach ($data['component_product_id'] as $index => $componentId) {
             if (!$componentId) continue;
-            BomLine::create(['company_id' => auth()->user()?->company_id, 'bom_id' => $bom->id, 'component_product_id' => $componentId, 'quantity' => $data['quantity'][$index], 'scrap_percent' => $data['scrap_percent'][$index] ?? 0]);
+            BomLine::create(['company_id' => auth()->user()?->company_id, 'bom_id' => $bom->id, 'component_product_id' => $componentId, 'uom_id' => $data['uom_id'][$index] ?? null, 'quantity' => $data['quantity'][$index], 'scrap_percent' => $data['scrap_percent'][$index] ?? 0]);
         }
         foreach ($data['byproduct_product_id'] ?? [] as $index => $productId) {
             if (!$productId) continue;
@@ -111,16 +128,88 @@ class ManufacturingController extends Controller
         return back()->with(['message' => 'Bill of material created.', 'alert-type' => 'success']);
     }
 
+    public function approveBom(int $id)
+    {
+        $bom = BillOfMaterial::whereKey($id)->with('product')->firstOrFail();
+        if (($bom->approval_status ?? 'approved') === 'approved') return back()->with(['message' => 'BOM is already approved.', 'alert-type' => 'info']);
+        if ($bom->created_by && (int) $bom->created_by === (int) auth()->id()) return back()->withErrors(['bom' => 'The BOM creator cannot approve the same revision.']);
+        try {
+            if ($bom->is_active) app(BomRevisionService::class)->assertNoActiveOverlap($bom->product_id, $bom->effective_from?->toDateString(), $bom->effective_until?->toDateString(), auth()->user()?->company_id, $bom->id);
+            $before = $bom->only(['approval_status', 'approved_by', 'approved_at']);
+            $bom->update(['approval_status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now(), 'rejection_reason' => null, 'rejected_by' => null, 'rejected_at' => null]);
+            app(AuditService::class)->record('bom.approved', $bom, $before, $bom->fresh()->only(['approval_status', 'approved_by', 'approved_at']));
+        } catch (\Throwable $e) { return back()->withErrors(['bom' => $e->getMessage()]); }
+        return back()->with(['message' => 'BOM revision approved.', 'alert-type' => 'success']);
+    }
+
+    public function rejectBom(Request $request, int $id)
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        $bom = BillOfMaterial::whereKey($id)->firstOrFail();
+        if (($bom->approval_status ?? 'approved') === 'approved') return back()->withErrors(['bom' => 'An approved BOM must be replaced with a new revision instead of rejected.']);
+        $before = $bom->only(['approval_status', 'rejection_reason', 'rejected_by', 'rejected_at']);
+        $bom->update(['approval_status' => 'rejected', 'rejection_reason' => $data['reason'], 'rejected_by' => auth()->id(), 'rejected_at' => now()]);
+        app(AuditService::class)->record('bom.rejected', $bom, $before, $bom->fresh()->only(['approval_status', 'rejection_reason', 'rejected_by', 'rejected_at']));
+        return back()->with(['message' => 'BOM revision rejected.', 'alert-type' => 'warning']);
+    }
+
     public function orders()
     {
         $orders = ProductionOrder::with(['product', 'bom', 'operations'])->latest()->paginate(25);
         return view('admin.erp.production_orders', compact('orders'));
     }
 
+    public function productionVariance(Request $request)
+    {
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'status' => ['nullable', 'in:draft,released,in_progress,paused,completed,closed,cancelled']]);
+        $rows = app(ProductionVarianceService::class)->report((int) auth()->user()?->company_id, $data['from'] ?? null, $data['to'] ?? null, $data['status'] ?? null);
+        return view('admin.erp.production_variance', ['rows' => $rows, 'filters' => $data]);
+    }
+
+    public function scrap()
+    {
+        $scrap = ProductionScrapRecord::with(['productionOrder', 'product', 'location'])->latest()->paginate(25);
+        $scrapTotals = ProductionScrapRecord::where('status', 'approved')->selectRaw('COALESCE(SUM(quantity), 0) AS quantity, COALESCE(SUM(quantity * COALESCE(unit_cost, 0)), 0) AS scrap_value, COALESCE(SUM(recovery_quantity * COALESCE(recovery_unit_cost, 0)), 0) AS recovery_value')->first();
+        return view('admin.erp.production_scrap', compact('scrap', 'scrapTotals'));
+    }
+
+    public function createScrap()
+    {
+        $orders = ProductionOrder::whereIn('status', ['released', 'in_progress', 'paused', 'completed'])->with('product')->latest()->get();
+        $products = Product::where('status', 1)->orderBy('name')->get();
+        $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
+        return view('admin.erp.production_scrap_create', compact('orders', 'products', 'locations'));
+    }
+
+    public function storeScrap(Request $request)
+    {
+        $data = $request->validate(['production_order_id' => ['required', $this->companyExists('production_orders')], 'product_id' => ['required', $this->companyExists('products')], 'recovery_product_id' => ['nullable', 'integer', $this->companyExists('products'), 'different:product_id'], 'recovery_quantity' => ['nullable', 'numeric', 'gt:0'], 'recovery_unit_cost' => ['nullable', 'numeric', 'min:0'], 'location_id' => ['nullable', 'integer', $this->locationExists()], 'quantity' => ['required', 'numeric', 'gt:0'], 'unit_cost' => ['nullable', 'numeric', 'min:0'], 'batch_no' => ['nullable', 'string', 'max:100'], 'serial_numbers' => ['nullable', 'string', 'max:10000'], 'reason' => ['required', 'string', 'max:2000']]);
+        $order = ProductionOrder::whereKey($data['production_order_id'])->firstOrFail();
+        if (in_array($order->status, ['cancelled', 'closed'], true)) return back()->withErrors(['production_order_id' => 'Scrap cannot be recorded against a cancelled or closed production order.'])->withInput();
+        $scrap = ProductionScrapRecord::create($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id(), 'status' => 'pending']);
+        app(AuditService::class)->record('production_scrap.created', $scrap, null, $scrap->toArray());
+        return redirect()->route('manufacturing.scrap')->with(['message' => 'Production scrap submitted for approval.', 'alert-type' => 'success']);
+    }
+
+    public function approveScrap(int $id)
+    {
+        try { app(ProductionScrapService::class)->approve($id); }
+        catch (\Throwable $e) { return back()->withErrors(['scrap' => $e->getMessage()]); }
+        return back()->with(['message' => 'Production scrap approved and posted.', 'alert-type' => 'success']);
+    }
+
+    public function rejectScrap(Request $request, int $id)
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        try { app(ProductionScrapService::class)->reject($id, $data['reason']); }
+        catch (\Throwable $e) { return back()->withErrors(['scrap' => $e->getMessage()]); }
+        return back()->with(['message' => 'Production scrap rejected.', 'alert-type' => 'warning']);
+    }
+
     public function createOrder(Request $request)
     {
-        $boms = BillOfMaterial::with('product')->where('is_active', true)->orderBy('name')->get();
-        $selectedBomId = $request->integer('bom_id') ?: null;
+        $boms = BillOfMaterial::with('product')->where('is_active', true)->where('approval_status', 'approved')->orderBy('name')->get();
+        $selectedBomId = (int) $request->input('bom_id') ?: null;
         $suggestedQuantity = $request->input('quantity');
         $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
         return view('admin.erp.production_order_create', compact('boms', 'locations', 'selectedBomId', 'suggestedQuantity'));
@@ -131,7 +220,7 @@ class ManufacturingController extends Controller
         $data = $request->validate(['bom_id' => ['required', $this->companyExists('bills_of_materials')], 'location_id' => ['nullable', 'integer', $this->locationExists()], 'planned_quantity' => ['required', 'numeric', 'gt:0'], 'planned_date' => ['required', 'date'], 'description' => ['nullable', 'string'], 'output_batch_no' => ['nullable', 'string', 'max:100'], 'output_serial_numbers' => ['nullable', 'string', 'max:10000'], 'output_manufacturing_date' => ['nullable', 'date'], 'output_expiry_date' => ['nullable', 'date'], 'output_best_before_date' => ['nullable', 'date'], 'output_warranty_until' => ['nullable', 'date']]);
         $bom = BillOfMaterial::findOrFail($data['bom_id']);
         $plannedDate = Carbon::parse($data['planned_date'])->toDateString();
-        if (!$bom->is_active || ($bom->effective_from && $bom->effective_from->gt($plannedDate)) || ($bom->effective_until && $bom->effective_until->lt($plannedDate))) return back()->withErrors(['bom_id' => 'The selected BOM is inactive or not effective on the planned production date.'])->withInput();
+        if (!$bom->is_active || ($bom->approval_status ?? 'approved') !== 'approved' || ($bom->effective_from && $bom->effective_from->gt($plannedDate)) || ($bom->effective_until && $bom->effective_until->lt($plannedDate))) return back()->withErrors(['bom_id' => 'The selected BOM is inactive, unapproved, or not effective on the planned production date.'])->withInput();
         $bomSnapshot = app(\App\Services\BomExplosionService::class)->snapshot($bom, auth()->user()?->company_id, $plannedDate);
         $order = ProductionOrder::create($data + ['company_id' => auth()->user()?->company_id, 'product_id' => $bom->product_id, 'bom_version' => $bom->version ?: '1', 'bom_snapshot' => $bomSnapshot, 'order_no' => app(NumberingSequenceService::class)->nextOrFallback('production_order', 'MO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'created_by' => auth()->id()]);
         app(AuditService::class)->record('production_order.created', $order, null, $order->toArray());
@@ -159,6 +248,29 @@ class ManufacturingController extends Controller
         $data = $request->validate(['produced_quantity' => ['nullable', 'numeric', 'gt:0']]);
         try { $order = app(ProductionService::class)->complete($id, isset($data['produced_quantity']) ? (float) $data['produced_quantity'] : null); return back()->with(['message' => $order->status === 'completed' ? 'Production order completed and stock posted.' : 'Partial production received and order remains in progress.', 'alert-type' => 'success']); }
         catch (\Throwable $e) { return back()->withErrors(['production' => $e->getMessage()]); }
+    }
+
+    public function pause(Request $request, int $id)
+    {
+        $data = $request->validate(['pause_reason' => ['required', 'string', 'max:2000']]);
+        try { app(ProductionService::class)->pause($id, $data['pause_reason']); }
+        catch (\Throwable $e) { return back()->withErrors(['production' => $e->getMessage()]); }
+        return back()->with(['message' => 'Production order paused; component reservations remain held.', 'alert-type' => 'success']);
+    }
+
+    public function resume(int $id)
+    {
+        try { app(ProductionService::class)->resume($id); }
+        catch (\Throwable $e) { return back()->withErrors(['production' => $e->getMessage()]); }
+        return back()->with(['message' => 'Production order resumed.', 'alert-type' => 'success']);
+    }
+
+    public function close(Request $request, int $id)
+    {
+        $data = $request->validate(['close_reason' => ['required', 'string', 'max:2000']]);
+        try { app(ProductionService::class)->close($id, $data['close_reason']); }
+        catch (\Throwable $e) { return back()->withErrors(['production' => $e->getMessage()]); }
+        return back()->with(['message' => 'Completed production order closed.', 'alert-type' => 'success']);
     }
 
     public function cancel(Request $request, int $id)

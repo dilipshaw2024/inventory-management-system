@@ -57,4 +57,43 @@ class SerialStockIntegrationTest extends TestCase
         $response->assertOk()->assertJsonPath('data.0.id', $batch->id)->assertJsonPath('data.0.stock_quantity', 4);
         $this->assertSame(1, $response->json('meta.total'));
     }
+
+    public function test_inventory_api_exposes_batch_traceability_with_direction_filter(): void
+    {
+        $company = Company::create(['name' => 'Trace Tenant', 'code' => 'TRACE-TENANT']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Trace Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Trace Goods', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Traceable goods', 'sku' => 'TRACE-001', 'tracking_type' => 'batch', 'quantity' => 2, 'status' => 1]);
+        $batch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'TRACE-LOT-001']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 5, 'unit_cost' => 3, 'batch_id' => $batch->id, 'reason' => 'Trace receipt']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 2, 'unit_cost' => 3, 'batch_id' => $batch->id, 'reason' => 'Trace issue']);
+        $token = $user->createToken('trace-read-test', ['inventory:read'])->plainTextToken;
+
+        $response = $this->withToken($token)->getJson('/api/inventory/batches/'.$batch->id.'/traceability?direction=outbound');
+
+        $response->assertOk()->assertJsonPath('data.0.batch_id', $batch->id)->assertJsonPath('data.0.movement_type', 'issue');
+        $this->assertSame(1, $response->json('total'));
+    }
+
+    public function test_inventory_api_exposes_serial_chain_of_custody(): void
+    {
+        $company = Company::create(['name' => 'Serial Trace Tenant', 'code' => 'SERIAL-TRACE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Serial Trace Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Serial Trace Goods', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Serial traceable item', 'sku' => 'SERIAL-TRACE-001', 'tracking_type' => 'serial', 'quantity' => 1, 'status' => 1]);
+        $batch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'SERIAL-TRACE-LOT']);
+        $serial = InventorySerial::create(['product_id' => $product->id, 'batch_id' => $batch->id, 'serial_no' => 'SN-TRACE-001', 'status' => 'issued']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 1, 'unit_cost' => 9, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'reason' => 'Serial trace receipt']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 1, 'unit_cost' => 9, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'reason' => 'Serial trace issue']);
+        $token = $user->createToken('serial-trace-read-test', ['inventory:read'])->plainTextToken;
+
+        $response = $this->withToken($token)->getJson('/api/inventory/serials/'.$serial->id.'/traceability?direction=outbound');
+
+        $response->assertOk()->assertJsonPath('data.0.serial_id', $serial->id)->assertJsonPath('data.0.movement_type', 'issue');
+        $this->assertSame(1, $response->json('total'));
+    }
 }

@@ -34,21 +34,41 @@ use Illuminate\Support\Facades\DB;
 
 class SalesFulfillmentController extends Controller
 {
-    public function orders() { $orders = SalesOrder::with(['customer', 'promotion'])->latest()->paginate(30); return view('backend.invoice.order_all', compact('orders')); }
-    public function createOrder(Request $request) { $customers = Customer::where('status', 1)->orderBy('name')->get(); $products = Product::where('status', 1)->orderBy('name')->get(); $units = Unit::where('status', 1)->orderBy('name')->get(); $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get(); $stores = Store::where('is_active', true)->with('branch')->orderBy('name')->get(); $selectedCustomerId = $request->integer('customer_id') ?: null; $selectedProductId = $request->integer('product_id') ?: null; $suggestedQuantity = $request->input('quantity'); $suggestedPrice = $request->input('price'); return view('backend.invoice.order_add', compact('customers', 'products', 'units', 'locations', 'stores', 'selectedCustomerId', 'selectedProductId', 'suggestedQuantity', 'suggestedPrice')); }
+    private function companyId(): int
+    {
+        $companyId = (int) (auth()->user()?->company_id ?? 0);
+        abort_unless($companyId, 422, 'A company is required for sales fulfillment.');
+        return $companyId;
+    }
+
+    private function companyOrder(int $id): SalesOrder
+    {
+        return SalesOrder::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
+    private function companyDelivery(int $id): Delivery
+    {
+        return Delivery::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
+    public function orders() { $orders = SalesOrder::where('company_id', $this->companyId())->with(['customer', 'promotion'])->latest()->paginate(30); return view('backend.invoice.order_all', compact('orders')); }
+    public function createOrder(Request $request) { $companyId = $this->companyId(); $customers = Customer::where('status', 1)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('name')->get(); $products = Product::where('status', 1)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('name')->get(); $units = Unit::where('status', 1)->orderBy('name')->get(); $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('code')->get(); $stores = Store::where('is_active', true)->whereHas('branch', fn ($query) => $query->where('company_id', $companyId))->with('branch')->orderBy('name')->get(); $selectedCustomerId = (int) $request->input('customer_id') ?: null; $selectedProductId = (int) $request->input('product_id') ?: null; $suggestedQuantity = $request->input('quantity'); $suggestedPrice = $request->input('price'); return view('backend.invoice.order_add', compact('customers', 'products', 'units', 'locations', 'stores', 'selectedCustomerId', 'selectedProductId', 'suggestedQuantity', 'suggestedPrice')); }
     public function storeOrder(SalesOrderRequest $request)
     {
+        $companyId = $this->companyId();
         $promotionCode = $request->input('promotion_code');
         if ($promotionCode !== null && $promotionCode !== '') $request->validate(['promotion_code' => ['string', 'max:80']]);
-        $store = $request->filled('store_id') ? Store::with('warehouse')->findOrFail($request->integer('store_id')) : null;
-        if ($store?->warehouse_id && $request->filled('location_id') && !InventoryLocation::whereKey($request->integer('location_id'))->whereHas('warehouse', fn ($query) => $query->whereKey($store->warehouse_id))->exists()) return back()->withErrors(['location_id' => 'The fulfillment location must belong to the store warehouse.'])->withInput();
-        if ($request->filled('location_id')) InventoryLocation::whereKey($request->integer('location_id'))->firstOrFail();
-        DB::transaction(function () use ($request, $promotionCode): void {
-            $order = SalesOrder::create($request->only(['customer_id', 'store_id', 'date', 'requested_date', 'description', 'allow_backorders']) + ['company_id' => auth()->user()?->company_id, 'location_id' => $request->location_id, 'currency_code' => strtoupper($request->currency_code ?: (auth()->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $request->exchange_rate ?: 1, 'order_no' => $request->order_no ?: app(NumberingSequenceService::class)->nextOrFallback('sales_order', 'SO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'status' => 'submitted', 'created_by' => auth()->id()]);
+        $store = $request->filled('store_id') ? Store::whereHas('branch', fn ($query) => $query->where('company_id', $companyId))->with('warehouse')->findOrFail((int) $request->input('store_id')) : null;
+        if ($store?->warehouse_id && $request->filled('location_id') && !InventoryLocation::whereKey((int) $request->input('location_id'))->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->whereHas('warehouse', fn ($query) => $query->whereKey($store->warehouse_id))->exists()) return back()->withErrors(['location_id' => 'The fulfillment location must belong to the store warehouse.'])->withInput();
+        if ($request->filled('location_id') && !InventoryLocation::whereKey((int) $request->input('location_id'))->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->exists()) abort(422, 'The fulfillment location is outside the current company.');
+        DB::transaction(function () use ($request, $promotionCode, $companyId): void {
+            $order = SalesOrder::create($request->only(['customer_id', 'store_id', 'date', 'requested_date', 'description', 'allow_backorders']) + ['company_id' => $companyId, 'location_id' => $request->location_id, 'currency_code' => strtoupper($request->currency_code ?: (auth()->user()?->company?->base_currency ?? 'USD')), 'exchange_rate' => $request->exchange_rate ?: 1, 'order_no' => $request->order_no ?: app(NumberingSequenceService::class)->nextOrFallback('sales_order', 'SO-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, auth()->user()?->branch_id), 'status' => 'submitted', 'created_by' => auth()->id()]);
             $lineRows = [];
             foreach ($request->product_id as $index => $productId) {
-                $product = Product::findOrFail($productId);
+                $product = Product::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($productId);
                 app(ProductLifecycleService::class)->assertSellable($product);
+                $preferredBatchId = !empty($request->batch_id[$index]) ? (int) $request->batch_id[$index] : null;
+                if ($preferredBatchId !== null && (!in_array($product->tracking_type, ['batch', 'lot'], true) || !InventoryBatch::whereKey($preferredBatchId)->where('product_id', $product->id)->exists())) abort(422, 'The selected batch does not belong to the selected batch-tracked product.');
                 $uomId = $request->uom_id[$index] ?? null;
                 $enteredQty = (float) $request->ordered_qty[$index];
                 $stockQty = app(UomConversionService::class)->toStock($product, $enteredQty, $uomId ? (int) $uomId : null, 'sales');
@@ -59,11 +79,11 @@ class SalesFulfillmentController extends Controller
                     $unitPrice = (float) $priceAgreement->unit_price;
                     $discount = $stockQty * $unitPrice * ((float) $priceAgreement->discount_percent / 100);
                 }
-                $lineRows[] = ['product_id' => (int) $productId, 'uom_id' => $uomId, 'uom_quantity' => $enteredQty, 'quantity' => $stockQty, 'unit_price' => $unitPrice, 'discount' => $discount];
+                $lineRows[] = ['product_id' => (int) $productId, 'batch_id' => $preferredBatchId, 'uom_id' => $uomId, 'uom_quantity' => $enteredQty, 'quantity' => $stockQty, 'unit_price' => $unitPrice, 'discount' => $discount];
             }
             $promotionResult = app(PromotionService::class)->applyToLines($promotionCode, $lineRows, (int) $order->customer_id, $order->date->toDateString());
             if ($promotionResult['promotion']) $order->update(['promotion_id' => $promotionResult['promotion']->id]);
-            foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line['product_id'], 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
+            foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line['product_id'], 'batch_id' => $line['batch_id'] ?? null, 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
             app(AuditService::class)->record('sales_order.created', $order, null, $order->toArray());
         });
         return redirect()->route('fulfillment.orders')->with(['message' => 'Sales order submitted.', 'alert-type' => 'success']);
@@ -71,7 +91,7 @@ class SalesFulfillmentController extends Controller
     public function approveOrder(int $id)
     {
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(SalesOrder::class, $id);
-        $order = SalesOrder::with(['lines', 'customer'])->findOrFail($id);
+        $order = SalesOrder::where('company_id', $this->companyId())->with(['lines', 'customer'])->findOrFail($id);
         if ($order->status !== 'submitted') return back()->with(['message' => 'Only submitted orders can be approved.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($order); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         try { app(\App\Services\SalesDiscountPolicyService::class)->assertCanApprove($order); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
@@ -91,7 +111,7 @@ class SalesFulfillmentController extends Controller
         $data = $request->validate(['cancellation_reason' => ['required', 'string', 'max:2000']]);
         try {
             DB::transaction(function () use ($data, $id): void {
-                $order = SalesOrder::with('lines')->lockForUpdate()->findOrFail($id);
+                $order = SalesOrder::where('company_id', $this->companyId())->with('lines')->lockForUpdate()->findOrFail($id);
                 if ($order->status === 'cancelled') throw new \RuntimeException('This sales order has already been cancelled.');
                 if ($order->status === 'delivered') throw new \RuntimeException('Fully delivered orders cannot be cancelled; use a return workflow.');
                 if (!in_array($order->status, ['submitted', 'approved', 'partially_delivered'], true)) throw new \RuntimeException('Only submitted or open sales orders can be cancelled.');
@@ -108,7 +128,7 @@ class SalesFulfillmentController extends Controller
     public function rejectOrder(Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $order = SalesOrder::findOrFail($id);
+        $order = $this->companyOrder($id);
         if ($order->status !== 'submitted') return back()->with(['message' => 'Only submitted sales orders can be rejected.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($order); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $before = $order->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);
@@ -116,15 +136,15 @@ class SalesFulfillmentController extends Controller
         app(AuditService::class)->record('sales_order.rejected', $order, $before, $order->fresh()->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']));
         return back()->with(['message' => 'Sales order rejected.', 'alert-type' => 'success']);
     }
-    public function deliveries() { $deliveries = Delivery::with(['salesOrder.customer', 'operations', 'lines.product'])->latest()->paginate(30); return view('backend.invoice.delivery_all', compact('deliveries')); }
-    public function createDelivery() { $orders = SalesOrder::whereIn('status', ['approved', 'partially_delivered'])->with(['customer', 'lines.product'])->latest()->get(); $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get(); $units = \App\Models\Unit::where('status', 1)->orderBy('name')->get(['id', 'name']); return view('backend.invoice.delivery_add', compact('orders', 'locations', 'units')); }
+    public function deliveries() { $deliveries = Delivery::where('company_id', $this->companyId())->with(['salesOrder.customer', 'operations', 'lines.product'])->latest()->paginate(30); return view('backend.invoice.delivery_all', compact('deliveries')); }
+    public function createDelivery() { $companyId = $this->companyId(); $orders = SalesOrder::where('company_id', $companyId)->whereIn('status', ['approved', 'partially_delivered'])->with(['customer', 'lines.product'])->latest()->get(); $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('code')->get(); $units = \App\Models\Unit::where('status', 1)->orderBy('name')->get(['id', 'name']); return view('backend.invoice.delivery_add', compact('orders', 'locations', 'units')); }
     public function storeDelivery(DeliveryRequest $request)
     {
         $request->validate(['location_id' => ['nullable', 'integer', 'exists:inventory_locations,id']]);
         DB::transaction(function () use ($request): void {
-            $order = SalesOrder::whereIn('status', ['approved', 'partially_delivered'])->findOrFail($request->sales_order_id);
-            if ($request->filled('location_id')) InventoryLocation::whereKey($request->integer('location_id'))->firstOrFail();
-            if ($order->location_id && $request->filled('location_id') && (int) $order->location_id !== $request->integer('location_id')) throw new \RuntimeException('Delivery location must match the sales-order fulfillment location.');
+            $order = SalesOrder::where('company_id', $this->companyId())->whereIn('status', ['approved', 'partially_delivered'])->findOrFail($request->sales_order_id);
+            if ($request->filled('location_id') && !InventoryLocation::whereKey((int) $request->input('location_id'))->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->exists()) abort(422, 'The delivery location is outside the current company.');
+            if ($order->location_id && $request->filled('location_id') && (int) $order->location_id !== (int) $request->input('location_id')) throw new \RuntimeException('Delivery location must match the sales-order fulfillment location.');
             $delivery = Delivery::create($request->only(['date', 'delivery_address', 'carrier', 'tracking_no', 'package_count', 'total_weight', 'weight_unit', 'length', 'width', 'height', 'proof_of_delivery', 'description']) + ['company_id' => $order->company_id ?: auth()->user()?->company_id, 'delivery_no' => $request->delivery_no ?: app(NumberingSequenceService::class)->nextOrFallback('delivery', 'DN-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'sales_order_id' => $order->id, 'location_id' => $request->location_id ?: $order->location_id, 'created_by' => auth()->id()]);
             foreach ($request->line_id as $index => $lineId) {
                 $line = $order->lines()->whereKey($lineId)->firstOrFail();
@@ -145,15 +165,16 @@ class SalesFulfillmentController extends Controller
     {
         $confirmedQuantities = request()->input($type === 'pack' ? 'packed_quantity' : 'picked_quantity');
         if (in_array($type, ['pick', 'pack'], true) && $confirmedQuantities !== null) request()->validate([$type === 'pack' ? 'packed_quantity' : 'picked_quantity' => ['array'], ($type === 'pack' ? 'packed_quantity' : 'picked_quantity').'.*' => ['numeric', 'min:0']]);
-        try { $delivery = Delivery::findOrFail($id); if ($delivery->fulfillment_status === 'cancelled') throw new \RuntimeException('Cancelled deliveries cannot be operated.'); app(WarehouseFulfillmentService::class)->complete($delivery, $type, is_array($confirmedQuantities) ? $confirmedQuantities : null); app(AuditService::class)->record('delivery.'.$type.'.completed', $delivery, null, ['operation_type' => $type, 'confirmed_quantities' => $confirmedQuantities]); return back()->with(['message' => ucfirst($type).' operation completed.', 'alert-type' => 'success']); }
+        try { $delivery = $this->companyDelivery($id); if ($delivery->fulfillment_status === 'cancelled') throw new \RuntimeException('Cancelled deliveries cannot be operated.'); app(WarehouseFulfillmentService::class)->complete($delivery, $type, is_array($confirmedQuantities) ? $confirmedQuantities : null); app(AuditService::class)->record('delivery.'.$type.'.completed', $delivery, null, ['operation_type' => $type, 'confirmed_quantities' => $confirmedQuantities]); return back()->with(['message' => ucfirst($type).' operation completed.', 'alert-type' => 'success']); }
         catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
     }
 
     public function confirmDelivered(int $id)
     {
-        $delivery = Delivery::with('operations')->findOrFail($id);
+        $delivery = Delivery::where('company_id', $this->companyId())->with('operations')->findOrFail($id);
         if ($delivery->fulfillment_status === 'cancelled' || $delivery->status !== 'approved' || !$delivery->operations->firstWhere('operation_type', 'dispatch')) return back()->with(['message' => 'Only dispatched deliveries can be marked delivered.', 'alert-type' => 'error']);
         $delivery->update(['fulfillment_status' => 'delivered', 'delivered_at' => now()]);
+        app(WarehouseFulfillmentService::class)->markDelivered($delivery, $delivery->delivered_at);
         app(AuditService::class)->record('delivery.delivered', $delivery, ['fulfillment_status' => $delivery->getOriginal('fulfillment_status')], ['fulfillment_status' => 'delivered', 'delivered_at' => now()->toISOString()]);
         return back()->with(['message' => 'Delivery marked as delivered.', 'alert-type' => 'success']);
     }
@@ -162,12 +183,13 @@ class SalesFulfillmentController extends Controller
         $request->validate(['cancellation_reason' => ['required', 'string', 'max:2000']]);
         try {
             DB::transaction(function () use ($request, $id): void {
-                $delivery = Delivery::with(['lines.salesOrderLine', 'lines.product', 'salesOrder.lines'])->lockForUpdate()->findOrFail($id);
+                $delivery = Delivery::where('company_id', $this->companyId())->with(['lines.salesOrderLine', 'lines.product', 'salesOrder.lines'])->lockForUpdate()->findOrFail($id);
                 $before = $delivery->only(['status', 'fulfillment_status', 'cancellation_reason']);
                 $reason = $request->string('cancellation_reason')->toString();
                 if ($delivery->fulfillment_status === 'cancelled') throw new \RuntimeException('This delivery has already been cancelled.');
                 if ($delivery->status === 'pending' && ($delivery->fulfillment_status ?: 'pending') === 'pending') {
                     $delivery->update(['fulfillment_status' => 'cancelled', 'cancellation_reason' => $reason, 'cancelled_by' => auth()->id(), 'cancelled_at' => now()]);
+                    app(WarehouseFulfillmentService::class)->markCancelled($delivery);
                 } elseif ($delivery->status === 'approved' && $delivery->fulfillment_status === 'dispatched') {
                     foreach ($delivery->lines as $line) {
                         $product = Product::lockForUpdate()->findOrFail($line->product_id);
@@ -198,6 +220,7 @@ class SalesFulfillmentController extends Controller
                     }
                     app(StockReservationService::class)->reserveSalesOrder($delivery->salesOrder->fresh(['lines']));
                     $delivery->update(['fulfillment_status' => 'cancelled', 'cancellation_reason' => $reason, 'cancelled_by' => auth()->id(), 'cancelled_at' => now()]);
+                    app(WarehouseFulfillmentService::class)->markCancelled($delivery);
                     $order = $delivery->salesOrder->fresh(['lines']);
                     $order->update(['status' => $order->lines->contains(fn ($line) => (float) $line->delivered_qty > 0) ? 'partially_delivered' : 'approved']);
                 } else {
@@ -215,7 +238,7 @@ class SalesFulfillmentController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(Delivery::class, $id);
         try {
             DB::transaction(function () use ($id): void {
-                $delivery = Delivery::with(['lines.salesOrderLine', 'lines.product', 'salesOrder'])->lockForUpdate()->findOrFail($id);
+                $delivery = Delivery::where('company_id', $this->companyId())->with(['lines.salesOrderLine', 'lines.product', 'salesOrder'])->lockForUpdate()->findOrFail($id);
                 if ($delivery->status !== 'pending' || ($delivery->fulfillment_status ?: 'pending') !== 'pending') throw new \RuntimeException('This delivery has already been processed.');
                 if ($delivery->salesOrder->location_id && (int) $delivery->salesOrder->location_id !== (int) $delivery->location_id) throw new \RuntimeException('Delivery location does not match the sales-order fulfillment location.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($delivery);
@@ -262,7 +285,7 @@ class SalesFulfillmentController extends Controller
                 }
                 $delivery->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);
                 app(WarehouseFulfillmentService::class)->markDispatched($delivery);
-                $order = SalesOrder::with('lines')->findOrFail($delivery->sales_order_id);
+                $order = SalesOrder::where('company_id', $this->companyId())->with('lines')->findOrFail($delivery->sales_order_id);
                 $order->update(['status' => $order->lines->every(fn ($line) => (float) $line->delivered_qty >= (float) $line->ordered_qty) ? 'delivered' : 'partially_delivered']);
                 app(AuditService::class)->record('delivery.approved', $delivery, ['status' => 'pending'], ['status' => 'approved']);
             });
@@ -273,7 +296,7 @@ class SalesFulfillmentController extends Controller
     public function rejectDelivery(Request $request, int $id)
     {
         $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
-        $delivery = Delivery::findOrFail($id);
+        $delivery = $this->companyDelivery($id);
         if ($delivery->status !== 'pending' || ($delivery->fulfillment_status ?: 'pending') !== 'pending') return back()->with(['message' => 'Only pending deliveries can be rejected.', 'alert-type' => 'error']);
         try { app(\App\Services\ApprovalGuard::class)->assertDifferent($delivery); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $before = $delivery->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);

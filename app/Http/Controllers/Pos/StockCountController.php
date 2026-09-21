@@ -10,6 +10,8 @@ use App\Models\StockCountLine;
 use App\Models\StockCountSchedule;
 use App\Models\InventoryMovement;
 use App\Models\Branch;
+use App\Models\User;
+use App\Models\StockCountAssignment;
 use App\Services\AuditService;
 use App\Services\InventoryLedgerService;
 use App\Services\NumberingSequenceService;
@@ -21,10 +23,11 @@ class StockCountController extends Controller
 {
     public function index()
     {
-        $counts = StockCount::with(['location', 'creator'])->latest()->paginate(30);
+        $counts = StockCount::with(['location', 'creator', 'assignments.user', 'assignments.assigner'])->latest()->paginate(30);
         $schedules = StockCountSchedule::with('location')->latest()->get();
         $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get();
-        return view('backend.stock.count_all', compact('counts', 'schedules', 'locations'));
+        $counterUsers = User::where('company_id', auth()->user()?->company_id)->where('is_active', true)->orderBy('name')->get(['id', 'name', 'email']);
+        return view('backend.stock.count_all', compact('counts', 'schedules', 'locations', 'counterUsers'));
     }
 
     public function create()
@@ -118,6 +121,41 @@ class StockCountController extends Controller
         return back()->with(['message' => 'Recount requested. A different user must enter the second count.', 'alert-type' => 'success']);
     }
 
+    public function assignCounters(Request $request, int $id)
+    {
+        $companyId = auth()->user()?->company_id;
+        $data = $request->validate(['counter_user_ids' => ['required', 'array', 'min:1', 'max:20'], 'counter_user_ids.*' => ['required', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('is_active', true))]]);
+        if (collect($data['counter_user_ids'])->duplicates()->isNotEmpty()) return back()->with(['message' => 'Each counter can only be assigned once.', 'alert-type' => 'error']);
+        try {
+            DB::transaction(function () use ($companyId, $data, $id): void {
+                $count = StockCount::where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+                if ($count->status !== 'submitted') throw new \RuntimeException('Only submitted counts can have counters assigned.');
+                foreach ($data['counter_user_ids'] as $userId) {
+                    $assignment = $count->assignments()->where('user_id', $userId)->first();
+                    if ($assignment?->status === 'completed') throw new \RuntimeException('A completed counter assignment cannot be reassigned.');
+                    $count->assignments()->updateOrCreate(['user_id' => $userId], ['company_id' => $companyId, 'assigned_by' => auth()->id(), 'status' => 'assigned', 'assigned_at' => now(), 'completed_at' => null]);
+                }
+                $count->assignments()->where('status', 'assigned')->whereNotIn('user_id', array_map('intval', $data['counter_user_ids']))->update(['status' => 'revoked', 'completed_at' => null]);
+                app(AuditService::class)->record('stock_count.counters_assigned', $count, null, ['counter_user_ids' => array_map('intval', $data['counter_user_ids'])]);
+            });
+        } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
+        return back()->with(['message' => 'Stock-count counters assigned.', 'alert-type' => 'success']);
+    }
+
+    public function completeCounter(int $id, int $assignmentId)
+    {
+        try {
+            DB::transaction(function () use ($id, $assignmentId): void {
+                $assignment = StockCountAssignment::where('id', $assignmentId)->where('stock_count_id', $id)->where('company_id', auth()->user()?->company_id)->lockForUpdate()->firstOrFail();
+                if ((int) $assignment->user_id !== (int) auth()->id()) throw new \RuntimeException('Only the assigned counter can complete this assignment.');
+                if ($assignment->status !== 'assigned') throw new \RuntimeException('This counter assignment is not active.');
+                $assignment->update(['status' => 'completed', 'completed_at' => now()]);
+                app(AuditService::class)->record('stock_count.counter_completed', $assignment, ['status' => 'assigned'], ['status' => 'completed', 'completed_at' => now()->toISOString()]);
+            });
+        } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
+        return back()->with(['message' => 'Counter assignment completed.', 'alert-type' => 'success']);
+    }
+
     public function approve(int $id)
     {
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(StockCount::class, $id);
@@ -126,6 +164,8 @@ class StockCountController extends Controller
                 $count = StockCount::with('lines')->lockForUpdate()->findOrFail($id);
                 if ($count->status !== 'submitted') throw new \RuntimeException('This stock count has already been processed.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($count);
+                $varianceRequiringRecount = app(\App\Services\StockCountVariancePolicyService::class)->requiringRecount($count);
+                if ($varianceRequiringRecount) throw new \RuntimeException('Stock-count variance exceeds the configured '.$varianceRequiringRecount['threshold_percent'].'% recount threshold; request an independent recount before approval.');
                 foreach ($count->lines as $line) {
                     if ($count->recount_required && $line->recounted_quantity === null) throw new \RuntimeException('Every line must have a completed recount before approval.');
                     $product = Product::lockForUpdate()->findOrFail($line->product_id);

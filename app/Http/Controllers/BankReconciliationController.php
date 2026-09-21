@@ -20,7 +20,7 @@ class BankReconciliationController extends Controller
     {
         $accounts = BankAccount::with('glAccount')->where('is_active', true)->orderBy('name')->get();
         $lines = BankStatementLine::with('bankAccount')->latest('transaction_date')->latest('id')->paginate(50);
-        $payments = Payment::where('is_reversed', false)->where('paid_amount', '>', 0)->latest()->limit(100)->get();
+        $payments = Payment::where('approval_status', 'approved')->where('is_reversed', false)->where('paid_amount', '>', 0)->latest()->limit(100)->get();
         $supplierPayments = SupplierPayment::where('status', 'approved')->where('is_reversed', false)->latest()->limit(100)->get();
         $glAccounts = ChartOfAccount::where('is_active', true)->orderBy('code')->get();
         return view('backend.accounting.bank_reconciliation', compact('accounts', 'lines', 'payments', 'supplierPayments', 'glAccounts'));

@@ -11,6 +11,7 @@ use App\Models\StockReservation;
 use App\Models\SalesOrder;
 use App\Models\SalesOrderLine;
 use App\Models\Customer;
+use App\Models\PriceList;
 use App\Models\Store;
 use App\Models\Delivery;
 use App\Models\DeliveryLine;
@@ -29,9 +30,12 @@ use App\Models\Branch;
 use App\Models\InventoryMovement;
 use App\Models\InventoryTransfer;
 use App\Models\StockCount;
+use App\Models\StockCountLine;
+use App\Models\StockCountAssignment;
 use App\Models\InventoryBatch;
 use App\Models\InventoryReconciliationSnapshot;
 use App\Models\InventoryCostLayerAdjustment;
+use App\Models\InventoryCostRevaluationRun;
 use App\Models\JournalEntry;
 use App\Services\AuditService;
 use App\Services\InventoryAvailabilityService;
@@ -44,12 +48,15 @@ use App\Services\SerialLifecycleService;
 use App\Services\WarehouseFulfillmentService;
 use App\Services\ProductLifecycleService;
 use App\Services\InventoryAdjustmentApprovalService;
+use App\Services\InventoryLedgerService;
 use App\Services\InventoryDocumentApprovalService;
 use App\Services\ApprovalGuard;
 use App\Services\TaxCalculationService;
 use App\Services\TaxRateResolver;
 use App\Services\CurrencyConversionService;
 use App\Services\AutomaticAccountingService;
+use App\Services\InventoryCostingService;
+use App\Services\InventoryCostRevaluationService;
 use App\Models\Payment;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -63,7 +70,7 @@ class InventoryIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('deliveries', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'sales_order_id' => ['required', 'integer', $owned('sales_orders')], 'date' => ['required', 'date'], 'location_id' => ['nullable', 'integer'],
             'delivery_address' => ['nullable', 'string', 'max:2000'], 'carrier' => ['nullable', 'string', 'max:255'], 'tracking_no' => ['nullable', 'string', 'max:255'],
             'description' => ['nullable', 'string', 'max:2000'], 'lines' => ['required', 'array', 'min:1'],
@@ -166,7 +173,9 @@ class InventoryIntegrationController extends Controller
                 throw new \RuntimeException('Only dispatched deliveries can be marked delivered.');
             }
             $before = $delivery->only(['fulfillment_status', 'delivered_at', 'proof_of_delivery']);
-            $delivery->update(['fulfillment_status' => 'delivered', 'delivered_at' => $data['delivered_at'] ?? now(), 'proof_of_delivery' => $data['proof_of_delivery'] ?? $delivery->proof_of_delivery]);
+            $deliveredAt = $data['delivered_at'] ?? now();
+            $delivery->update(['fulfillment_status' => 'delivered', 'delivered_at' => $deliveredAt, 'proof_of_delivery' => $data['proof_of_delivery'] ?? $delivery->proof_of_delivery]);
+            app(WarehouseFulfillmentService::class)->markDelivered($delivery, $deliveredAt);
             app(AuditService::class)->record('delivery.delivered', $delivery, $before, $delivery->only(['fulfillment_status', 'delivered_at', 'proof_of_delivery']));
             return $delivery->fresh();
         });
@@ -216,12 +225,14 @@ class InventoryIntegrationController extends Controller
         $promotionCode = $request->input('promotion_code');
         $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('sales_orders', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'customer_id' => ['required', 'integer', $owned('customers')], 'store_id' => ['nullable', 'integer', $owned('stores')],
+            'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'sales'))],
             'location_id' => ['nullable', 'integer'], 'date' => ['required', 'date'], 'requested_date' => ['nullable', 'date', 'after_or_equal:date'],
             'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'],
             'allow_backorders' => ['nullable', 'boolean'], 'description' => ['nullable', 'string', 'max:2000'], 'promotion_code' => ['nullable', 'string', 'max:80'], 'promotion_codes' => ['nullable', 'array', 'max:10'], 'promotion_codes.*' => ['string', 'max:80', 'distinct'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')],
+            'lines.*.batch_id' => ['nullable', 'integer'],
             'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
             'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'], 'lines.*.discount_amount' => ['nullable', 'numeric', 'min:0'],
         ]);
@@ -233,9 +244,13 @@ class InventoryIntegrationController extends Controller
         $store = !empty($data['store_id']) ? $this->companyScope(Store::query(), $companyId)->findOrFail($data['store_id']) : null;
         if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
         $promotionCodes = $data['promotion_codes'] ?? ($promotionCode ? [$promotionCode] : []);
-        $order = DB::transaction(function () use ($data, $companyId, $customer, $store, $request, $promotionCodes): SalesOrder {
+        $priceList = !empty($data['price_list_id']) ? PriceList::where('company_id', $companyId)->where('list_type', 'sales')->findOrFail($data['price_list_id']) : null;
+        if ($priceList && (!$priceList->is_active || ($priceList->starts_on && $priceList->starts_on->toDateString() > $data['date']) || ($priceList->ends_on && $priceList->ends_on->toDateString() < $data['date']))) abort(422, 'The selected sales price list is not active for the order date.');
+        if ($priceList && $priceList->currency_code !== strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD'))) abort(422, 'The selected sales price list currency does not match the order currency.');
+        $order = DB::transaction(function () use ($data, $companyId, $customer, $store, $priceList, $request, $promotionCodes): SalesOrder {
             $order = SalesOrder::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null, 'customer_id' => $customer->id,
+                'price_list_id' => $priceList?->id,
                 'store_id' => $store?->id, 'location_id' => $data['location_id'] ?? null, 'date' => $data['date'],
                 'requested_date' => $data['requested_date'] ?? null, 'description' => $data['description'] ?? null,
                 'allow_backorders' => $data['allow_backorders'] ?? false, 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')),
@@ -246,22 +261,24 @@ class InventoryIntegrationController extends Controller
             foreach ($data['lines'] as $line) {
                 $product = Product::findOrFail($line['product_id']);
                 app(ProductLifecycleService::class)->assertSellable($product);
+                $preferredBatchId = !empty($line['batch_id']) ? (int) $line['batch_id'] : null;
+                if ($preferredBatchId !== null && (!in_array($product->tracking_type, ['batch', 'lot'], true) || !$this->companyScope(InventoryBatch::query(), $companyId)->whereKey($preferredBatchId)->where('product_id', $product->id)->exists())) abort(422, 'The selected batch does not belong to the selected batch-tracked product.');
                 $enteredQuantity = (float) $line['quantity']; $uomId = $line['uom_id'] ?? null;
                 $stockQuantity = app(UomConversionService::class)->toStock($product, $enteredQuantity, $uomId ? (int) $uomId : null, 'sales');
                 $unitPrice = array_key_exists('unit_price', $line) && $line['unit_price'] !== null ? (float) $line['unit_price'] : 0;
                 $discount = (float) ($line['discount_amount'] ?? 0);
-                $agreement = app(CustomerProductPriceService::class)->bestFor($product, $customer, $stockQuantity, now()->toDateString(), $order->currency_code);
+                $agreement = app(CustomerProductPriceService::class)->bestFor($product, $customer, $stockQuantity, $order->date->toDateString(), $order->currency_code, $order->price_list_id);
                 if ($agreement && $unitPrice <= 0) { $unitPrice = (float) $agreement->unit_price; $discount = $stockQuantity * $unitPrice * ((float) $agreement->discount_percent / 100); }
                 if ($uomId) $unitPrice /= max($stockQuantity / $enteredQuantity, 0.000001);
-                $lineRows[] = ['product_id' => (int) $product->id, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'quantity' => $stockQuantity, 'unit_price' => $unitPrice, 'discount' => $discount];
+                $lineRows[] = ['product_id' => (int) $product->id, 'batch_id' => $preferredBatchId, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'quantity' => $stockQuantity, 'unit_price' => $unitPrice, 'discount' => $discount];
             }
             $promotionResult = app(PromotionService::class)->applyCodesToLines($promotionCodes, $lineRows, (int) $order->customer_id, $order->date->toDateString());
             if ($promotionResult['promotion']) $order->update(['promotion_id' => $promotionResult['promotion']->id, 'promotion_ids' => collect($promotionResult['promotions'])->pluck('id')->values()->all()]);
-            foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line['product_id'], 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
+            foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line['product_id'], 'batch_id' => $line['batch_id'] ?? null, 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
             app(AuditService::class)->record('sales_order.created', $order, null, $order->toArray());
             return $order;
         });
-        return response()->json(['data' => $order->load('customer', 'lines.product'), 'status' => 'pending_approval'], 201);
+        return response()->json(['data' => $order->load('customer', 'priceList', 'lines.product'), 'status' => 'pending_approval'], 201);
     }
 
     public function approveSalesOrder(int $id): JsonResponse
@@ -309,11 +326,11 @@ class InventoryIntegrationController extends Controller
         $data = $request->validate([
             'q' => ['nullable', 'string', 'max:150'], 'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'], 'can_purchase' => ['nullable', 'boolean'],
-            'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'],
+            'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'], 'is_variant' => ['nullable', 'boolean'], 'parent_product_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         $boolean = static fn ($value): bool => (bool) filter_var($value, FILTER_VALIDATE_BOOLEAN);
-        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes']), $companyId)
+        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes', 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value']), $companyId)
             ->when($data['q'] ?? null, function ($query, string $search): void {
                 $query->where(function ($nested) use ($search): void {
                     $nested->where('name', 'like', "%{$search}%")
@@ -326,6 +343,8 @@ class InventoryIntegrationController extends Controller
             ->when(array_key_exists('can_purchase', $data), fn ($query) => $query->where('can_purchase', $boolean($data['can_purchase'])))
             ->when(array_key_exists('can_sell', $data), fn ($query) => $query->where('can_sell', $boolean($data['can_sell'])))
             ->when(array_key_exists('is_stock_item', $data), fn ($query) => $query->where('is_stock_item', $boolean($data['is_stock_item'])))
+            ->when(array_key_exists('is_variant', $data), fn ($query) => $query->where('is_variant', $boolean($data['is_variant'])))
+            ->when($data['parent_product_id'] ?? null, fn ($query, $parentId) => $query->where('parent_product_id', $parentId))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
 
@@ -335,13 +354,13 @@ class InventoryIntegrationController extends Controller
     public function stock(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
-        $locationId = $request->integer('location_id') ?: null;
+        $locationId = (int) $request->input('location_id') ?: null;
         if ($locationId !== null && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($locationId)->exists()) abort(422, 'Location is not authorized for this company.');
         $products = $this->companyScope(Product::query(), $companyId)->when($request->input('product_id'), fn ($query, $id) => $query->whereKey($id))
             ->when($request->input('sku'), fn ($query, $sku) => $query->where('sku', $sku))
             ->orderBy('id')->get();
         $ids = $products->pluck('id');
-        $reserved = $this->companyScope(StockReservation::query(), $companyId)->whereIn('product_id', $ids)->where('status', 'active')->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))->selectRaw('product_id, SUM(quantity - released_quantity) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
+        $reserved = $this->companyScope(StockReservation::query(), $companyId)->whereIn('product_id', $ids)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))->selectRaw('product_id, SUM(quantity - released_quantity) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
         $quality = $this->companyScope(InventoryStatusBalance::query(), $companyId)->whereIn('product_id', $ids)->whereIn('status', ['blocked', 'quarantine', 'damaged'])->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))->selectRaw('product_id, SUM(quantity) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
         $onHand = $this->companyScope(InventoryMovement::query(), $companyId)->whereIn('product_id', $ids)->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))->selectRaw("product_id, COALESCE(SUM(CASE WHEN movement_type IN ('opening','receipt','transfer_in','adjustment_in','return_in','quarantine_out','release') THEN quantity WHEN movement_type IN ('issue','transfer_out','adjustment_out','return_out','scrap','quarantine_in') THEN -quantity ELSE 0 END), 0) AS quantity")->groupBy('product_id')->pluck('quantity', 'product_id');
         $available = app(InventoryAvailabilityService::class)->availableMany($products, true, $locationId, $companyId);
@@ -354,6 +373,36 @@ class InventoryIntegrationController extends Controller
             'on_hand' => $onHand->has($product->id) ? (float) $onHand[$product->id] : (float) ($locationId === null ? $product->quantity : 0), 'reserved' => (float) ($reserved[$product->id] ?? 0),
             'quality_hold' => (float) ($quality[$product->id] ?? 0), 'available' => (float) ($available[$product->id] ?? 0),
         ])->values());
+    }
+
+    public function negativeStockExceptions(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $in = ['opening', 'receipt', 'transfer_in', 'adjustment_in', 'return_in', 'quarantine_out', 'release'];
+        $out = ['issue', 'transfer_out', 'adjustment_out', 'return_out', 'scrap', 'quarantine_in'];
+        $movements = $this->companyScope(InventoryMovement::query(), $companyId)
+            ->when($data['product_id'] ?? null, fn ($query, $id) => $query->where('product_id', $id))
+            ->when(array_key_exists('location_id', $data), fn ($query) => $query->where('location_id', $data['location_id']))
+            ->selectRaw('product_id, location_id, COALESCE(SUM(CASE WHEN movement_type IN ('.implode(',', array_fill(0, count($in), '?')).') THEN quantity WHEN movement_type IN ('.implode(',', array_fill(0, count($out), '?')).') THEN -quantity ELSE 0 END), 0) AS balance', array_merge($in, $out))
+            ->groupBy('product_id', 'location_id')->havingRaw('balance < 0')->get();
+        $rows = $movements->map(function ($movement): array {
+            $product = Product::find($movement->product_id);
+            $location = $movement->location_id ? InventoryLocation::find($movement->location_id) : null;
+            return ['product_id' => (int) $movement->product_id, 'product' => $product, 'location_id' => $movement->location_id, 'location' => $location, 'ledger_balance' => round((float) $movement->balance, 6), 'source' => 'ledger'];
+        })->values();
+        $knownProducts = $rows->pluck('product_id')->all();
+        $legacy = $this->companyScope(Product::query(), $companyId)->where('quantity', '<', 0)->when($data['product_id'] ?? null, fn ($query, $id) => $query->whereKey($id))->get();
+        foreach ($legacy as $product) {
+            if (in_array((int) $product->id, $knownProducts, true)) continue;
+            $rows->push(['product_id' => $product->id, 'product' => $product, 'location_id' => null, 'location' => null, 'ledger_balance' => null, 'legacy_balance' => round((float) $product->quantity, 6), 'source' => 'legacy_product_balance']);
+        }
+        $rows = $rows->sortBy(fn (array $row): string => ($row['product']?->name ?: '').'|'.($row['location']?->code ?: ''))->values();
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
+        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'summary' => ['exception_count' => $rows->count(), 'ledger_exception_count' => $rows->where('source', 'ledger')->count(), 'legacy_exception_count' => $rows->where('source', 'legacy_product_balance')->count()], 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
     }
 
     public function valuation(Request $request): JsonResponse
@@ -400,6 +449,83 @@ class InventoryIntegrationController extends Controller
         return app(IntegrationCursorService::class)->paginate($valuation, $request, 'inventory.valuation', (int) ($data['per_page'] ?? 50));
     }
 
+    public function revaluationPreview(Request $request, InventoryCostingService $costing): JsonResponse
+    {
+        $data = $request->validate(['product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'as_of' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for inventory revaluation preview.');
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
+        $rows = $costing->revaluationPreviewForCompany((int) $companyId, $data['as_of'] ?? null, $data['product_id'] ?? null, $data['location_id'] ?? null);
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
+        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'summary' => ['product_count' => $rows->count(), 'revaluation_product_count' => $rows->where('revaluation_required', true)->count(), 'variance_amount' => round((float) $rows->sum('variance_amount'), 6)], 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'read_only' => true, 'generated_at' => now()->toISOString()]]);
+    }
+
+    public function revaluationRuns(Request $request): JsonResponse
+    {
+        $data = $request->validate(['status' => ['nullable', 'in:pending,approved,rejected'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $runs = $this->companyScope(InventoryCostRevaluationRun::with(['lines.product', 'requester', 'approver', 'rejector']), $request->user()?->company_id)
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($runs, $request, 'inventory.cost-revaluation-runs', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function createRevaluationRun(Request $request, InventoryCostRevaluationService $revaluations): JsonResponse
+    {
+        $data = $request->validate(['external_reference' => ['nullable', 'string', 'max:150'], 'as_of' => ['nullable', 'date'], 'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer']]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for inventory revaluation.');
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
+        if (!empty($data['external_reference'])) {
+            $existing = $this->companyScope(InventoryCostRevaluationRun::with('lines'), $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing, 'status' => 'duplicate_ignored']);
+        }
+        try {
+            $run = $revaluations->create((int) $companyId, $data['as_of'] ?? now()->toDateString(), $data['external_reference'] ?? null, $data['product_id'] ?? null, $data['location_id'] ?? null, $request->user()?->id);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $run, 'status' => 'pending'], 201);
+    }
+
+    public function approveRevaluationRun(Request $request, int $id, InventoryCostRevaluationService $revaluations): JsonResponse
+    {
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for inventory revaluation.');
+        try {
+            $run = $revaluations->approve($companyId, $id, (int) $request->user()->id);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $run, 'status' => 'approved']);
+    }
+
+    public function rejectRevaluationRun(Request $request, int $id, InventoryCostRevaluationService $revaluations): JsonResponse
+    {
+        $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for inventory revaluation.');
+        try {
+            $run = $revaluations->reject($companyId, $id, (int) $request->user()->id, $data['rejection_reason']);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $run, 'status' => 'rejected']);
+    }
+
+    public function reverseRevaluationRun(Request $request, int $id, InventoryCostRevaluationService $revaluations): JsonResponse
+    {
+        $data = $request->validate(['reversal_reason' => ['required', 'string', 'max:2000']]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for inventory revaluation.');
+        try {
+            $run = $revaluations->reverse($companyId, $id, (int) $request->user()->id, $data['reversal_reason']);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $run, 'status' => 'reversed']);
+    }
+
     public function movements(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -436,13 +562,311 @@ class InventoryIntegrationController extends Controller
             'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
-        $counts = $this->companyScope(StockCount::with(['location:id,code,name', 'creator:id,name,email', 'approver:id,name,email', 'recountRequester:id,name,email', 'lines.product:id,name,sku', 'lines.recounter:id,name,email']), $companyId)
+        $counts = $this->companyScope(StockCount::with(['location:id,code,name', 'creator:id,name,email', 'approver:id,name,email', 'recountRequester:id,name,email', 'lines.product:id,name,sku', 'lines.recounter:id,name,email', 'assignments.user:id,name,email', 'assignments.assigner:id,name,email']), $companyId)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when(array_key_exists('location_id', $data), fn ($query) => $query->where('location_id', $data['location_id']))
             ->when(array_key_exists('recount_required', $data), fn ($query) => $query->where('recount_required', (bool) $data['recount_required']))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($counts, $request, 'inventory.counts', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function countReconciliationSummary(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'status' => ['nullable', 'in:draft,submitted,approved,rejected'],
+            'location_id' => ['nullable', 'integer'],
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) {
+            abort(422, 'Location is not authorized for this company.');
+        }
+        $counts = $this->companyScope(StockCount::with(['location:id,code,name', 'lines.product:id,name,sku,quantity']), $companyId)
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when(array_key_exists('location_id', $data), fn ($query) => $query->where('location_id', $data['location_id']))
+            ->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('count_date', '>=', $date))
+            ->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('count_date', '<=', $date))
+            ->orderBy('count_date')->orderBy('id')->get();
+        $rows = $counts->map(function (StockCount $count): array {
+            $lineRows = $count->lines->map(function (StockCountLine $line) use ($count): array {
+                $current = $count->location_id
+                    ? $this->locationBalance((int) $line->product_id, (int) $count->location_id)
+                    : (float) $line->product->quantity;
+                $counted = $count->recount_required && $line->recounted_quantity !== null
+                    ? (float) $line->recounted_quantity
+                    : (float) $line->counted_quantity;
+                $system = (float) $line->system_quantity;
+                return ['current' => $current, 'counted' => $counted, 'system' => $system, 'variance' => $counted - $current, 'stale' => abs($current - $system) > 0.000001];
+            });
+            return [
+                'id' => (int) $count->id,
+                'count_no' => $count->count_no,
+                'status' => $count->status,
+                'count_date' => $count->count_date?->toDateString(),
+                'location' => $count->location,
+                'recount_required' => (bool) $count->recount_required,
+                'line_count' => $lineRows->count(),
+                'stale_line_count' => $lineRows->where('stale', true)->count(),
+                'variance_line_count' => $lineRows->filter(fn (array $line): bool => abs($line['variance']) > 0.000001)->count(),
+                'signed_variance_quantity' => round((float) $lineRows->sum('variance'), 6),
+                'absolute_variance_quantity' => round((float) $lineRows->sum(fn (array $line): float => abs($line['variance'])), 6),
+                'current_quantity' => round((float) $lineRows->sum('current'), 6),
+                'counted_quantity' => round((float) $lineRows->sum('counted'), 6),
+            ];
+        })->values();
+        $perPage = (int) ($data['per_page'] ?? 50);
+        $page = max(1, (int) $request->input('page', 1));
+        $pageRows = $rows->forPage($page, $perPage)->values();
+        return response()->json([
+            'data' => $pageRows,
+            'summary' => [
+                'count_count' => $rows->count(),
+                'line_count' => (int) $rows->sum('line_count'),
+                'stale_line_count' => (int) $rows->sum('stale_line_count'),
+                'variance_line_count' => (int) $rows->sum('variance_line_count'),
+                'signed_variance_quantity' => round((float) $rows->sum('signed_variance_quantity'), 6),
+                'absolute_variance_quantity' => round((float) $rows->sum('absolute_variance_quantity'), 6),
+            ],
+            'meta' => [
+                'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(),
+                'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'read_only' => true,
+            ],
+        ]);
+    }
+
+    public function countReconciliation(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $count = $this->companyScope(StockCount::with(['location:id,code,name', 'lines.product:id,name,sku,quantity']), $companyId)->findOrFail($id);
+        $rows = $count->lines->map(function (StockCountLine $line) use ($count): array {
+            $current = $count->location_id
+                ? $this->locationBalance((int) $line->product_id, (int) $count->location_id)
+                : (float) $line->product->quantity;
+            $counted = $count->recount_required && $line->recounted_quantity !== null
+                ? (float) $line->recounted_quantity
+                : (float) $line->counted_quantity;
+            $system = (float) $line->system_quantity;
+            return [
+                'product_id' => (int) $line->product_id,
+                'product_name' => $line->product?->name,
+                'sku' => $line->product?->sku,
+                'system_quantity_at_count' => $system,
+                'current_system_quantity' => $current,
+                'counted_quantity' => $counted,
+                'movement_drift' => $current - $system,
+                'current_variance_quantity' => $counted - $current,
+                'is_stale' => abs($current - $system) > 0.000001,
+            ];
+        })->values();
+        return response()->json([
+            'data' => $rows,
+            'count' => ['id' => $count->id, 'count_no' => $count->count_no, 'status' => $count->status, 'count_date' => $count->count_date?->toDateString(), 'location' => $count->location],
+            'summary' => ['line_count' => $rows->count(), 'stale_line_count' => $rows->where('is_stale', true)->count(), 'current_variance_quantity' => round((float) $rows->sum('current_variance_quantity'), 6)],
+            'read_only' => true,
+        ]);
+    }
+
+    public function createCount(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $ownedProduct = Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $data = $request->validate([
+            'count_no' => ['nullable', 'string', 'max:80', Rule::unique('stock_counts', 'count_no')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
+            'count_date' => ['required', 'date'],
+            'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
+            'description' => ['nullable', 'string', 'max:2000'],
+            'lines' => ['required', 'array', 'min:1'],
+            'lines.*.product_id' => ['required', 'integer', $ownedProduct],
+            'lines.*.counted_quantity' => ['required', 'numeric', 'min:0'],
+            'lines.*.unit_cost' => ['nullable', 'numeric', 'min:0'],
+        ]);
+
+        if (!empty($data['external_reference'])) {
+            $existing = $this->companyScope(StockCount::query(), $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing->load(['location', 'lines.product']), 'status' => 'duplicate_ignored']);
+        }
+
+        $count = DB::transaction(function () use ($data, $companyId): StockCount {
+            $count = StockCount::create([
+                'company_id' => $companyId,
+                'external_reference' => $data['external_reference'] ?? null,
+                'count_no' => $data['count_no'] ?: app(NumberingSequenceService::class)->nextOrFallback('stock_count', 'CNT-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, auth()->user()?->branch_id),
+                'count_date' => $data['count_date'],
+                'location_id' => $data['location_id'] ?? null,
+                'description' => $data['description'] ?? null,
+                'status' => 'submitted',
+                'created_by' => auth()->id(),
+            ]);
+            foreach ($data['lines'] as $line) {
+                $product = $this->companyScope(Product::query(), $companyId)->findOrFail($line['product_id']);
+                $system = $count->location_id
+                    ? $this->locationBalance((int) $product->id, (int) $count->location_id)
+                    : (float) $product->quantity;
+                $counted = (float) $line['counted_quantity'];
+                StockCountLine::create([
+                    'stock_count_id' => $count->id,
+                    'product_id' => $product->id,
+                    'system_quantity' => $system,
+                    'counted_quantity' => $counted,
+                    'variance_quantity' => $counted - $system,
+                    'unit_cost' => array_key_exists('unit_cost', $line) && $line['unit_cost'] !== null ? $line['unit_cost'] : $product->purchase_price,
+                ]);
+            }
+            app(AuditService::class)->record('stock_count.created', $count, null, $count->toArray());
+            return $count;
+        });
+
+        return response()->json(['data' => $count->load(['location', 'lines.product']), 'status' => 'pending_approval'], 201);
+    }
+
+    public function assignCountCounters(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'assignments' => ['required', 'array', 'min:1', 'max:20'],
+            'assignments.*.user_id' => ['required', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('is_active', true))],
+            'assignments.*.notes' => ['nullable', 'string', 'max:2000'],
+        ]);
+        $userIds = collect($data['assignments'])->pluck('user_id')->map(fn ($id): int => (int) $id);
+        if ($userIds->duplicates()->isNotEmpty()) return response()->json(['message' => 'Each counter can only be assigned once.'], 422);
+
+        try {
+            $count = DB::transaction(function () use ($data, $companyId, $id, $userIds): StockCount {
+                $count = $this->companyScope(StockCount::query(), $companyId)->lockForUpdate()->findOrFail($id);
+                if ($count->status !== 'submitted') throw new \RuntimeException('Only submitted counts can have counters assigned.');
+                $before = $count->assignments()->get()->map(fn (StockCountAssignment $assignment) => $assignment->only(['user_id', 'status']))->values()->all();
+                foreach ($data['assignments'] as $input) {
+                    $assignment = $count->assignments()->where('user_id', $input['user_id'])->first();
+                    if ($assignment?->status === 'completed') throw new \RuntimeException('A completed counter assignment cannot be reassigned.');
+                    $count->assignments()->updateOrCreate(
+                        ['user_id' => $input['user_id']],
+                        ['company_id' => $companyId, 'assigned_by' => auth()->id(), 'status' => 'assigned', 'notes' => $input['notes'] ?? null, 'assigned_at' => now(), 'completed_at' => null]
+                    );
+                }
+                $count->assignments()->where('status', 'assigned')->whereNotIn('user_id', $userIds->all())->update(['status' => 'revoked', 'completed_at' => null]);
+                app(AuditService::class)->record('stock_count.counters_assigned', $count, ['assignments' => $before], ['assignments' => $count->assignments()->get()->map(fn (StockCountAssignment $assignment) => $assignment->only(['user_id', 'status']))->values()->all()]);
+                return $count;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $count->load(['assignments.user', 'assignments.assigner']), 'status' => 'counters_assigned']);
+    }
+
+    public function completeCountCounter(Request $request, int $id, int $assignmentId): JsonResponse
+    {
+        $data = $request->validate(['notes' => ['nullable', 'string', 'max:2000']]);
+        try {
+            $assignment = DB::transaction(function () use ($data, $id, $assignmentId): StockCountAssignment {
+                $assignment = StockCountAssignment::where('id', $assignmentId)->where('stock_count_id', $id)->where('company_id', auth()->user()?->company_id)->lockForUpdate()->firstOrFail();
+                if ((int) $assignment->user_id !== (int) auth()->id()) throw new \RuntimeException('Only the assigned counter can complete this assignment.');
+                if ($assignment->status !== 'assigned') throw new \RuntimeException('This counter assignment is not active.');
+                $assignment->update(['status' => 'completed', 'completed_at' => now(), 'notes' => $data['notes'] ?? $assignment->notes]);
+                app(AuditService::class)->record('stock_count.counter_completed', $assignment, ['status' => 'assigned'], $assignment->fresh()->only(['status', 'completed_at', 'notes']));
+                return $assignment;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $assignment->load(['user', 'assigner']), 'status' => 'counter_completed']);
+    }
+
+    public function submitCountRecount(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['recount_reason' => ['required', 'string', 'max:2000']]);
+        try {
+            $count = DB::transaction(function () use ($id, $data): StockCount {
+                $count = $this->companyScope(StockCount::query(), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                if ($count->status !== 'submitted') throw new \RuntimeException('Only submitted counts can be sent for recount.');
+                if ((int) $count->created_by === (int) auth()->id()) throw new \RuntimeException('The count creator cannot request their own recount.');
+                $before = $count->only(['recount_required', 'recount_requested_by', 'recount_requested_at', 'recount_reason']);
+                $count->update(['recount_required' => true, 'recount_requested_by' => auth()->id(), 'recount_requested_at' => now(), 'recount_reason' => $data['recount_reason']]);
+                $count->lines()->update(['recounted_quantity' => null, 'recounted_by' => null, 'recounted_at' => null]);
+                app(AuditService::class)->record('stock_count.recount_requested', $count, $before, $count->fresh()->only(array_keys($before)));
+                return $count;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $count->load(['lines.product']), 'status' => 'recount_required']);
+    }
+
+    public function submitCountRecountValues(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer'], 'lines.*.counted_quantity' => ['required', 'numeric', 'min:0']]);
+        try {
+            $count = DB::transaction(function () use ($id, $data): StockCount {
+                $count = $this->companyScope(StockCount::with('lines'), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                if ($count->status !== 'submitted' || !$count->recount_required) throw new \RuntimeException('This count is not awaiting a recount.');
+                if ((int) $count->created_by === (int) auth()->id()) throw new \RuntimeException('The original counter cannot perform the recount.');
+                $values = collect($data['lines'])->keyBy(fn (array $line): int => (int) $line['product_id']);
+                foreach ($count->lines as $line) {
+                    if (!$values->has((int) $line->product_id)) throw new \RuntimeException('A recount quantity is missing for product '.$line->product_id.'.');
+                    $line->update(['recounted_quantity' => $values->get((int) $line->product_id)['counted_quantity'], 'recounted_by' => auth()->id(), 'recounted_at' => now()]);
+                }
+                app(AuditService::class)->record('stock_count.recounted', $count, null, ['recounted_by' => auth()->id()]);
+                return $count;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $count->load(['lines.product']), 'status' => 'pending_approval']);
+    }
+
+    public function approveCount(int $id): JsonResponse
+    {
+        app(ApprovalGuard::class)->assertBeforeTransaction(StockCount::class, $id);
+        try {
+            $count = DB::transaction(function () use ($id): StockCount {
+                $count = $this->companyScope(StockCount::with('lines'), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                if ($count->status !== 'submitted') throw new \RuntimeException('This stock count has already been processed.');
+                app(ApprovalGuard::class)->assertDifferent($count);
+                if ($count->assignments()->where('status', 'assigned')->exists()) throw new \RuntimeException('All assigned counters must complete their assignments before approval.');
+                $varianceRequiringRecount = app(\App\Services\StockCountVariancePolicyService::class)->requiringRecount($count);
+                if ($varianceRequiringRecount) throw new \RuntimeException('Stock-count variance exceeds the configured '.$varianceRequiringRecount['threshold_percent'].'% recount threshold; request an independent recount before approval.');
+                foreach ($count->lines as $line) {
+                    if ($count->recount_required && $line->recounted_quantity === null) throw new \RuntimeException('Every line must have a completed recount before approval.');
+                    $product = $this->companyScope(Product::query(), $count->company_id)->lockForUpdate()->findOrFail($line->product_id);
+                    $system = $count->location_id ? $this->locationBalance((int) $line->product_id, (int) $count->location_id) : (float) $product->quantity;
+                    $counted = $count->recount_required ? (float) $line->recounted_quantity : (float) $line->counted_quantity;
+                    $variance = $counted - $system;
+                    if (abs($variance) < 0.000001) continue;
+                    $product->quantity = (float) $product->quantity + $variance;
+                    $product->save();
+                    app(InventoryLedgerService::class)->post($product->id, $variance > 0 ? 'adjustment_in' : 'adjustment_out', abs($variance), (float) ($line->unit_cost ?? $product->purchase_price ?? 0), $count->location_id, $count, 'Physical stock count variance');
+                    $line->update(['system_quantity' => $system, 'variance_quantity' => $variance]);
+                }
+                $count->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);
+                app(AuditService::class)->record('stock_count.approved', $count, ['status' => 'submitted'], ['status' => 'approved']);
+                return $count;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $count->load(['location', 'lines.product']), 'status' => 'approved']);
+    }
+
+    public function rejectCount(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['rejection_reason' => ['required', 'string', 'max:2000']]);
+        try {
+            $count = DB::transaction(function () use ($id, $data): StockCount {
+                $count = $this->companyScope(StockCount::query(), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                if ($count->status !== 'submitted') throw new \RuntimeException('Only submitted counts can be rejected.');
+                app(ApprovalGuard::class)->assertDifferent($count);
+                $before = $count->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);
+                $count->update(['status' => 'rejected', 'rejection_reason' => $data['rejection_reason'], 'rejected_by' => auth()->id(), 'rejected_at' => now()]);
+                app(AuditService::class)->record('stock_count.rejected', $count, $before, $count->only(array_keys($before)));
+                return $count;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $count->load(['location', 'lines.product']), 'status' => 'rejected']);
     }
 
     public function documents(Request $request): JsonResponse
@@ -467,7 +891,7 @@ class InventoryIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('inventory_documents', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'document_no' => ['nullable', 'string', 'max:100', Rule::unique('inventory_documents', 'document_no')->where(fn ($query) => $query->where('company_id', $companyId))],
             'document_type' => ['required', 'in:receipt,issue'], 'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
             'department_id' => ['nullable', 'integer', $owned('departments')], 'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
@@ -476,9 +900,14 @@ class InventoryIntegrationController extends Controller
             'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_cost' => ['nullable', 'numeric', 'min:0'],
             'lines.*.department_id' => ['nullable', 'integer', $owned('departments')], 'lines.*.cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
             'lines.*.batch_no' => ['nullable', 'string', 'max:100'], 'lines.*.serial_numbers' => ['nullable', 'string', 'max:5000'],
+            'lines.*.batch_allocations' => ['nullable', 'array', 'min:1'], 'lines.*.batch_allocations.*.batch_no' => ['required', 'string', 'max:100'], 'lines.*.batch_allocations.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.batch_allocations.*.serial_numbers' => ['nullable', 'array'], 'lines.*.batch_allocations.*.serial_numbers.*' => ['string', 'max:255'],
             'lines.*.manufacturing_date' => ['nullable', 'date'], 'lines.*.expiry_date' => ['nullable', 'date'],
             'lines.*.best_before_date' => ['nullable', 'date'], 'lines.*.warranty_until' => ['nullable', 'date'],
         ]);
+        foreach ($data['lines'] as $line) {
+            if (!empty($line['batch_allocations']) && $data['document_type'] !== 'issue') abort(422, 'Batch allocations are supported for issue documents only.');
+            if (!empty($line['batch_allocations']) && !empty($line['batch_no'])) abort(422, 'Use batch_allocations or batch_no, not both, on an issue line.');
+        }
         if (!empty($data['external_reference'])) {
             $existing = $this->companyScope(InventoryDocument::query(), $companyId)->where('external_reference', $data['external_reference'])->first();
             if ($existing) return response()->json(['data' => $existing->load(['location', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), 'status' => 'duplicate_ignored']);
@@ -486,7 +915,7 @@ class InventoryIntegrationController extends Controller
         $document = DB::transaction(function () use ($data, $companyId, $request): InventoryDocument {
             $document = InventoryDocument::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
-                'document_no' => $data['document_no'] ?: strtoupper($data['document_type']).'-'.now()->format('YmdHis').'-'.random_int(100, 999),
+                'document_no' => ($data['document_no'] ?? null) ?: strtoupper($data['document_type']).'-'.now()->format('YmdHis').'-'.random_int(100, 999),
                 'document_type' => $data['document_type'], 'location_id' => $data['location_id'] ?? null,
                 'department_id' => $data['department_id'] ?? null, 'cost_center_id' => $data['cost_center_id'] ?? null,
                 'date' => $data['date'], 'description' => $data['description'], 'inspection_status' => ($data['document_type'] === 'receipt' && !empty($data['inspection_required'])) ? 'pending' : 'not_required',
@@ -496,6 +925,7 @@ class InventoryIntegrationController extends Controller
                 'inventory_document_id' => $document->id, 'product_id' => $line['product_id'], 'quantity' => $line['quantity'],
                 'department_id' => $line['department_id'] ?? null, 'cost_center_id' => $line['cost_center_id'] ?? null,
                 'unit_cost' => $line['unit_cost'] ?? null, 'batch_no' => $line['batch_no'] ?? null, 'serial_numbers' => $line['serial_numbers'] ?? null,
+                'batch_allocations' => $line['batch_allocations'] ?? null,
                 'manufacturing_date' => $line['manufacturing_date'] ?? null, 'expiry_date' => $line['expiry_date'] ?? null,
                 'best_before_date' => $line['best_before_date'] ?? null, 'warranty_until' => $line['warranty_until'] ?? null,
             ]);
@@ -556,7 +986,7 @@ class InventoryIntegrationController extends Controller
         $locationScope = \App\Services\InventoryLocationRuleService::existsForCompany($companyId);
         $data = $request->validate([
             'adjustment_no' => ['nullable', 'string', 'max:100', Rule::unique('inventory_adjustments', 'adjustment_no')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
-            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('inventory_adjustments', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'external_reference' => ['nullable', 'string', 'max:150'],
             'date' => ['required', 'date'], 'reason_code' => ['required', 'string', 'max:100'],
             'description' => ['nullable', 'string', 'max:2000'], 'lines' => ['required', 'array', 'min:1'],
             'lines.*.product_id' => ['required', 'integer', $owned('products')],
@@ -710,12 +1140,14 @@ class InventoryIntegrationController extends Controller
         $data = $request->validate([
             'status' => ['nullable', 'string', 'max:40'],
             'order_status' => ['nullable', 'in:draft,submitted,approved,partially_delivered,delivered,cancelled,rejected'],
+            'package_status' => ['nullable', 'in:packed,dispatched,delivered,cancelled'],
             'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
-        $deliveries = $this->companyScope(Delivery::with(['salesOrder.customer', 'location', 'lines.product', 'operations']), $request->user()?->company_id)
+        $deliveries = $this->companyScope(Delivery::with(['salesOrder.customer', 'location', 'lines.product', 'operations', 'packages.lines.product']), $request->user()?->company_id)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where(fn ($scope) => $scope->where('fulfillment_status', $status)->orWhere('status', $status)))
             ->when($data['order_status'] ?? null, fn ($query, $status) => $query->whereHas('salesOrder', fn ($order) => $order->where('status', $status)))
+            ->when($data['package_status'] ?? null, fn ($query, $status) => $query->whereHas('packages', fn ($package) => $package->where('status', $status)))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($deliveries, $request, 'sales.deliveries', (int) ($data['per_page'] ?? 50));
@@ -825,7 +1257,7 @@ class InventoryIntegrationController extends Controller
             if ($paid > $total + 0.000001) throw new \RuntimeException('Paid amount cannot exceed the invoice total.');
             $invoice->update(['subtotal_amount' => $netSubtotal, 'tax_amount' => $taxTotal, 'total_amount' => $total, 'promotion_id' => $promotionResult['promotion']?->id, 'promotion_ids' => collect($promotionResult['promotions'])->pluck('id')->values()->all()]);
             Payment::create([
-                'invoice_id' => $invoice->id, 'customer_id' => $customer->id, 'currency_code' => $currency, 'exchange_rate' => $exchangeRate,
+                'invoice_id' => $invoice->id, 'customer_id' => $customer->id, 'payment_date' => $data['date'], 'currency_code' => $currency, 'exchange_rate' => $exchangeRate,
                 'paid_status' => $data['paid_status'], 'discount_amount' => $discount, 'total_amount' => $total,
                 'paid_amount' => $paid, 'due_amount' => $total - $paid, 'base_amount' => $paid * (float) ($exchangeRate ?: 1),
             ]);
@@ -875,7 +1307,7 @@ class InventoryIntegrationController extends Controller
                     app(AuditService::class)->record('promotion.redeemed', $redeemed, ['usage_count' => max(0, (int) $redeemed->usage_count - 1)], ['usage_count' => $redeemed->usage_count, 'invoice_id' => $invoice->id]);
                 }
                 app(AutomaticAccountingService::class)->postSalesInvoice($invoice);
-                if ($payment = Payment::where('invoice_id', $invoice->id)->first()) app(AutomaticAccountingService::class)->postCustomerPayment($payment);
+                if ($payment = Payment::where('invoice_id', $invoice->id)->where('approval_status', 'approved')->first()) app(AutomaticAccountingService::class)->postCustomerPayment($payment);
                 app(AuditService::class)->record('invoice.approved', $invoice, ['status' => 0], ['status' => 1]);
                 return $invoice->fresh();
             });
@@ -982,6 +1414,13 @@ class InventoryIntegrationController extends Controller
     private function companyScope($query, ?int $companyId)
     {
         return $query->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id'));
+    }
+
+    private function locationBalance(int $productId, int $locationId): float
+    {
+        $in = ['opening', 'receipt', 'transfer_in', 'adjustment_in', 'return_in', 'quarantine_out', 'release'];
+        $out = ['issue', 'transfer_out', 'adjustment_out', 'return_out', 'scrap', 'quarantine_in'];
+        return (float) InventoryMovement::where('product_id', $productId)->where('location_id', $locationId)->get()->sum(fn ($movement) => in_array($movement->movement_type, $in, true) ? (float) $movement->quantity : (in_array($movement->movement_type, $out, true) ? -(float) $movement->quantity : 0));
     }
 
     private function formatContactAddress(CustomerContact $contact): string

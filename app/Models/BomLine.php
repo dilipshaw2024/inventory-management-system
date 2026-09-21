@@ -12,4 +12,5 @@ class BomLine extends Model
     protected $casts = ['quantity' => 'decimal:6', 'scrap_percent' => 'decimal:4'];
     public function bom() { return $this->belongsTo(BillOfMaterial::class, 'bom_id'); }
     public function component() { return $this->belongsTo(Product::class, 'component_product_id'); }
+    public function uom() { return $this->belongsTo(Unit::class, 'uom_id'); }
 }

@@ -10,7 +10,7 @@ class CostCenterBudget extends Model
     use BelongsToCompany;
 
     protected $guarded = [];
-    protected $casts = ['period_start' => 'date', 'period_end' => 'date', 'budget_amount' => 'decimal:6'];
+    protected $casts = ['period_start' => 'date', 'period_end' => 'date', 'budget_amount' => 'decimal:6', 'is_active' => 'boolean'];
 
     public function costCenter() { return $this->belongsTo(CostCenter::class); }
     public function fiscalYear() { return $this->belongsTo(FiscalYear::class); }

@@ -9,9 +9,15 @@ use App\Models\PriceListItem;
 
 class CustomerProductPriceService
 {
-    public function bestFor(Product $product, ?Customer $customer, float $quantity, string $date, ?string $currencyCode = null): ?\Illuminate\Database\Eloquent\Model
+    public function bestFor(Product $product, ?Customer $customer, float $quantity, string $date, ?string $currencyCode = null, ?int $priceListId = null): ?\Illuminate\Database\Eloquent\Model
     {
         $base = fn ($query) => $query->where('product_id', $product->id)->where('is_active', true)->where('minimum_quantity', '<=', $quantity)->when($currencyCode, fn ($scope) => $scope->where('currency_code', strtoupper($currencyCode)))->where(fn ($scope) => $scope->whereNull('starts_on')->orWhereDate('starts_on', '<=', $date))->where(fn ($scope) => $scope->whereNull('ends_on')->orWhereDate('ends_on', '>=', $date));
+        if ($priceListId !== null) {
+            $selected = PriceListItem::query()->where('product_id', $product->id)->where('price_list_id', $priceListId)->where('is_active', true)->where('minimum_quantity', '<=', $quantity)
+                ->whereHas('priceList', fn ($query) => $query->where('list_type', 'sales')->where('is_active', true)->when($currencyCode, fn ($scope) => $scope->where('currency_code', strtoupper($currencyCode)))->where(fn ($scope) => $scope->whereNull('starts_on')->orWhereDate('starts_on', '<=', $date))->where(fn ($scope) => $scope->whereNull('ends_on')->orWhereDate('ends_on', '>=', $date)))
+                ->orderByDesc('minimum_quantity')->first();
+            if ($selected) return $selected;
+        }
         if ($customer) {
             $specific = CustomerProductPrice::where($base)->where('customer_id', $customer->id)->orderByDesc('minimum_quantity')->first();
             if ($specific) return $specific;

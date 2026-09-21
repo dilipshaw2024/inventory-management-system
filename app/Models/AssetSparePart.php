@@ -9,7 +9,8 @@ class AssetSparePart extends Model
 {
     use BelongsToCompany;
     protected $guarded = [];
-    protected $casts = ['quantity_per_service' => 'decimal:6', 'minimum_stock' => 'decimal:6', 'maximum_stock' => 'decimal:6'];
+    protected $casts = ['quantity_per_service' => 'decimal:6', 'minimum_stock' => 'decimal:6', 'maximum_stock' => 'decimal:6', 'supplier_unit_cost' => 'decimal:6', 'preferred_supplier' => 'boolean'];
     public function asset() { return $this->belongsTo(ServiceAsset::class); }
     public function product() { return $this->belongsTo(Product::class); }
+    public function supplier() { return $this->belongsTo(Supplier::class); }
 }

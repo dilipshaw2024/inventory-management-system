@@ -10,7 +10,7 @@ class IntegrationWebhookDelivery extends Model
     use BelongsToCompany;
 
     protected $guarded = [];
-    protected $casts = ['payload' => 'array', 'next_attempt_at' => 'datetime', 'delivered_at' => 'datetime'];
+    protected $casts = ['payload' => 'array', 'next_attempt_at' => 'datetime', 'delivered_at' => 'datetime', 'dead_lettered_at' => 'datetime'];
     public function subscription() { return $this->belongsTo(IntegrationWebhookSubscription::class, 'subscription_id'); }
 
     protected static function booted(): void

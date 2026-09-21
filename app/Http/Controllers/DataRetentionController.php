@@ -6,6 +6,7 @@ use App\Models\AuditLog;
 use App\Models\DataRetentionArchive;
 use App\Models\DataRetentionHold;
 use App\Models\DataRetentionPolicy;
+use App\Models\DataRetentionPurgeRequest;
 use App\Models\DocumentRevision;
 use App\Services\AuditService;
 use Illuminate\Http\Request;
@@ -26,7 +27,7 @@ class DataRetentionController extends Controller
     public function storePolicy(Request $request)
     {
         $companyId = auth()->user()?->company_id;
-        $data = $request->validate(['name' => ['required', 'string', 'max:120', Rule::unique('data_retention_policies', 'name')->where(fn ($query) => $query->where('company_id', $companyId))], 'record_type' => ['required', 'in:audit_logs,document_revisions'], 'retention_days' => ['required', 'integer', 'min:1'], 'archive_enabled' => ['nullable', 'boolean'], 'purge_enabled' => ['nullable', 'boolean']]);
+        $data = $request->validate(['name' => ['required', 'string', 'max:120', Rule::unique('data_retention_policies', 'name')->where(fn ($query) => $query->where('company_id', $companyId))], 'record_type' => ['required', 'in:audit_logs,document_revisions,document_attachments'], 'retention_days' => ['required', 'integer', 'min:1'], 'archive_enabled' => ['nullable', 'boolean'], 'purge_enabled' => ['nullable', 'boolean']]);
         $policy = DataRetentionPolicy::create($data + ['company_id' => $companyId, 'archive_enabled' => (bool) ($data['archive_enabled'] ?? true), 'purge_enabled' => (bool) ($data['purge_enabled'] ?? false), 'is_active' => true]);
         app(AuditService::class)->record('retention_policy.created', $policy, null, $policy->toArray());
         return back()->with(['message' => 'Retention policy saved.', 'alert-type' => 'success']);
@@ -35,8 +36,8 @@ class DataRetentionController extends Controller
     public function storeHold(Request $request)
     {
         $companyId = $this->companyId();
-        $data = $request->validate(['record_type' => ['required', 'in:audit_logs,document_revisions'], 'record_id' => ['required', 'integer', 'min:1'], 'reason' => ['required', 'string', 'max:500']]);
-        $model = $data['record_type'] === 'audit_logs' ? AuditLog::class : DocumentRevision::class;
+        $data = $request->validate(['record_type' => ['required', 'in:audit_logs,document_revisions,document_attachments'], 'record_id' => ['required', 'integer', 'min:1'], 'reason' => ['required', 'string', 'max:500']]);
+        $model = match ($data['record_type']) { 'audit_logs' => AuditLog::class, 'document_revisions' => DocumentRevision::class, 'document_attachments' => \App\Models\DocumentAttachment::class };
         if (!$model::whereKey($data['record_id'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->exists()) return back()->withErrors(['record_id' => 'The selected record does not exist.'])->withInput();
         $hold = DataRetentionHold::create($data + ['company_id' => $companyId, 'placed_by' => auth()->id()]);
         app(AuditService::class)->record('retention_hold.placed', $hold, null, $hold->toArray());
@@ -48,10 +49,42 @@ class DataRetentionController extends Controller
         $companyId = $this->companyId();
         $data = $request->validate(['policy_id' => ['required', 'integer']]);
         $policy = DataRetentionPolicy::where('company_id', $companyId)->findOrFail($data['policy_id']);
-        $model = $policy->record_type === 'audit_logs' ? AuditLog::class : DocumentRevision::class;
+        $model = match ($policy->record_type) { 'audit_logs' => AuditLog::class, 'document_revisions' => DocumentRevision::class, 'document_attachments' => \App\Models\DocumentAttachment::class };
         $cutoff = now()->subDays($policy->retention_days);
-        $query = $model::where('created_at', '<', $cutoff)->whereNotExists(function ($subquery) use ($policy): void { $subquery->selectRaw('1')->from('data_retention_holds')->whereColumn('data_retention_holds.record_id', $policy->record_type === 'audit_logs' ? 'audit_logs.id' : 'document_revisions.id')->where('data_retention_holds.record_type', $policy->record_type)->where(function ($scope) use ($policy): void { $scope->where('data_retention_holds.company_id', $policy->company_id)->orWhereNull('data_retention_holds.company_id'); })->whereNull('released_at'); });
+        $table = (new $model)->getTable();
+        $query = $model::where('created_at', '<', $cutoff)->whereNotExists(function ($subquery) use ($policy, $table): void { $subquery->selectRaw('1')->from('data_retention_holds')->whereColumn('data_retention_holds.record_id', $table.'.id')->where('data_retention_holds.record_type', $policy->record_type)->where(function ($scope) use ($policy): void { $scope->where('data_retention_holds.company_id', $policy->company_id)->orWhereNull('data_retention_holds.company_id'); })->whereNull('released_at'); });
         return back()->with(['message' => "Retention preview: {$query->count()} {$policy->record_type} records are eligible after {$cutoff->toDateString()}. No records were changed.", 'alert-type' => 'info']);
+    }
+
+    public function requestPurge(Request $request)
+    {
+        $companyId = $this->companyId();
+        $data = $request->validate(['policy_id' => ['required', 'integer'], 'reason' => ['required', 'string', 'min:5', 'max:2000']]);
+        $policy = DataRetentionPolicy::where('company_id', $companyId)->whereKey($data['policy_id'])->where('is_active', true)->where('purge_enabled', true)->firstOrFail();
+        if (DataRetentionPurgeRequest::where('company_id', $companyId)->where('policy_id', $policy->id)->where('status', 'pending')->exists()) {
+            return back()->withErrors(['policy_id' => 'A purge request for this policy is already pending.'])->withInput();
+        }
+        $purge = DataRetentionPurgeRequest::create([
+            'company_id' => $companyId, 'policy_id' => $policy->id, 'cutoff_at' => now()->subDays($policy->retention_days),
+            'reason' => $data['reason'], 'requested_by' => auth()->id(), 'status' => 'pending',
+        ]);
+        app(AuditService::class)->record('retention_purge.requested', $purge, null, $purge->toArray());
+        return back()->with(['message' => 'Purge request submitted for independent approval.', 'alert-type' => 'success']);
+    }
+
+    public function decidePurge(Request $request, int $id, string $decision)
+    {
+        abort_unless(in_array($decision, ['approve', 'reject'], true), 404);
+        $companyId = $this->companyId();
+        $data = $request->validate(['decision_reason' => ['required', 'string', 'min:5', 'max:2000']]);
+        $purge = DataRetentionPurgeRequest::where('company_id', $companyId)->findOrFail($id);
+        if ($purge->status !== 'pending') return back()->with(['message' => 'Purge request is already decided.', 'alert-type' => 'info']);
+        if ((int) $purge->requested_by === (int) auth()->id()) return back()->withErrors(['decision_reason' => 'The requester cannot decide the same purge request.'])->withInput();
+        $before = $purge->toArray();
+        $status = $decision === 'approve' ? 'approved' : 'rejected';
+        $purge->update(['status' => $status, 'approved_by' => auth()->id(), 'approved_at' => now(), 'decision_reason' => $data['decision_reason']]);
+        app(AuditService::class)->record('retention_purge.'.$status, $purge, $before, $purge->fresh()->toArray());
+        return back()->with(['message' => 'Purge request '.$status.'.', 'alert-type' => $status === 'approved' ? 'success' : 'info']);
     }
 
     public function releaseHold(Request $request, int $id)

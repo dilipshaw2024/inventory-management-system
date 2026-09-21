@@ -11,13 +11,13 @@ use Illuminate\Support\Facades\DB;
 
 class ProductionService
 {
-    public function release(int $id): ProductionOrder
+    public function release(int $id, ?int $companyId = null, ?int $actorId = null): ProductionOrder
     {
-        app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id);
-        return DB::transaction(function () use ($id): ProductionOrder {
-            $order = $this->companyScope(ProductionOrder::with(['bom.lines', 'bom.byproducts']))->lockForUpdate()->findOrFail($id);
+        app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id, $companyId, $actorId);
+        return DB::transaction(function () use ($id, $companyId, $actorId): ProductionOrder {
+            $order = $this->companyScope(ProductionOrder::with(['bom.lines', 'bom.byproducts']), $companyId)->lockForUpdate()->findOrFail($id);
             if ($order->status !== 'draft') throw new \RuntimeException('This production order cannot be released again.');
-            app(ApprovalGuard::class)->assertDifferent($order);
+            app(ApprovalGuard::class)->assertDifferent($order, $actorId, $companyId);
             $requirements = $order->bom_snapshot ? app(BomExplosionService::class)->leafRequirementsFromSnapshot($order->bom_snapshot, (float) $order->planned_quantity) : app(BomExplosionService::class)->leafRequirements($order->bom, (float) $order->planned_quantity, $order->company_id, $order->planned_date?->toDateString());
             foreach ($requirements as $componentId => $required) {
                 $component = $this->companyScope(Product::query(), $order->company_id)->lockForUpdate()->findOrFail($componentId);
@@ -28,7 +28,7 @@ class ProductionService
             app(ProductLifecycleService::class)->assertStockManaged($output);
             app(StockReservationService::class)->reserveProductionOrder($order, $requirements);
             app(ProductionOperationService::class)->initialize($order);
-            $order->update(['status' => 'released', 'approved_by' => auth()->id(), 'approved_at' => now()]);
+            $order->update(['status' => 'released', 'approved_by' => $actorId ?? auth()->id(), 'approved_at' => now()]);
             app(AuditService::class)->record('production_order.released', $order, ['status' => 'draft'], ['status' => 'released']);
             return $order;
         });
@@ -52,7 +52,7 @@ class ProductionService
             foreach ($requirements as $componentId => $required) {
                 $component = $this->companyScope(Product::query(), $order->company_id)->lockForUpdate()->findOrFail($componentId);
                 app(ProductLifecycleService::class)->assertStockManaged($component);
-                $reservations = StockReservation::where('source_type', $order->getMorphClass())->where('source_id', $order->id)->where('product_id', $component->id)->where('status', 'active')->orderBy('id')->lockForUpdate()->get();
+                $reservations = StockReservation::where('source_type', $order->getMorphClass())->where('source_id', $order->id)->where('product_id', $component->id)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->orderBy('id')->lockForUpdate()->get();
                 app(StockReservationService::class)->releaseForSourceRequirements($order, [$component->id => $required]);
                 if (app(InventoryAvailabilityService::class)->available($component, true, $order->location_id, $order->company_id) < $required) throw new \RuntimeException('Insufficient available component stock for '.$component->name.'.');
                 $component->quantity = (float) $component->quantity - $required;
@@ -130,12 +130,55 @@ class ProductionService
         });
     }
 
+    public function pause(int $id, string $reason): ProductionOrder
+    {
+        app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id);
+        return DB::transaction(function () use ($id, $reason): ProductionOrder {
+            $order = $this->companyScope(ProductionOrder::query())->lockForUpdate()->findOrFail($id);
+            if (!in_array($order->status, ['released', 'in_progress'], true)) throw new \RuntimeException('Only released or in-progress production orders can be paused.');
+            app(ApprovalGuard::class)->assertDifferent($order);
+            $before = $order->only(['status', 'pause_reason', 'paused_by', 'paused_at', 'paused_from_status']);
+            $order->update(['status' => 'paused', 'pause_reason' => $reason, 'paused_by' => auth()->id(), 'paused_at' => now(), 'paused_from_status' => $before['status']]);
+            app(AuditService::class)->record('production_order.paused', $order, $before, $order->fresh()->only(['status', 'pause_reason', 'paused_by', 'paused_at', 'paused_from_status']));
+            return $order->fresh();
+        });
+    }
+
+    public function resume(int $id): ProductionOrder
+    {
+        app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id);
+        return DB::transaction(function () use ($id): ProductionOrder {
+            $order = $this->companyScope(ProductionOrder::query())->lockForUpdate()->findOrFail($id);
+            if ($order->status !== 'paused') throw new \RuntimeException('Only paused production orders can be resumed.');
+            app(ApprovalGuard::class)->assertDifferent($order);
+            $resumeStatus = in_array($order->paused_from_status, ['released', 'in_progress'], true) ? $order->paused_from_status : 'released';
+            $before = $order->only(['status', 'pause_reason', 'paused_by', 'paused_at', 'paused_from_status']);
+            $order->update(['status' => $resumeStatus, 'pause_reason' => null, 'paused_by' => null, 'paused_at' => null, 'paused_from_status' => null]);
+            app(AuditService::class)->record('production_order.resumed', $order, $before, $order->fresh()->only(['status', 'pause_reason', 'paused_by', 'paused_at', 'paused_from_status']));
+            return $order->fresh();
+        });
+    }
+
+    public function close(int $id, string $reason): ProductionOrder
+    {
+        app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id);
+        return DB::transaction(function () use ($id, $reason): ProductionOrder {
+            $order = $this->companyScope(ProductionOrder::query())->lockForUpdate()->findOrFail($id);
+            if ($order->status !== 'completed') throw new \RuntimeException('Only completed production orders can be closed.');
+            app(ApprovalGuard::class)->assertDifferent($order);
+            $before = $order->only(['status', 'close_reason', 'closed_by', 'closed_at']);
+            $order->update(['status' => 'closed', 'close_reason' => $reason, 'closed_by' => auth()->id(), 'closed_at' => now()]);
+            app(AuditService::class)->record('production_order.closed', $order, $before, $order->fresh()->only(['status', 'close_reason', 'closed_by', 'closed_at']));
+            return $order->fresh();
+        });
+    }
+
     public function cancel(int $id, string $reason): ProductionOrder
     {
         app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id);
         return DB::transaction(function () use ($id, $reason): ProductionOrder {
             $order = $this->companyScope(ProductionOrder::query())->lockForUpdate()->findOrFail($id);
-            if (!in_array($order->status, ['draft', 'released', 'in_progress'], true)) throw new \RuntimeException('Only open production orders can be cancelled.');
+            if (!in_array($order->status, ['draft', 'released', 'in_progress', 'paused'], true)) throw new \RuntimeException('Only open production orders can be cancelled.');
             app(ApprovalGuard::class)->assertDifferent($order);
             $before = $order->only(['status', 'cancellation_reason', 'cancelled_by', 'cancelled_at']);
             app(StockReservationService::class)->releaseForSource($order);

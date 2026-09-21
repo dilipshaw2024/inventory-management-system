@@ -31,6 +31,29 @@
             @endforeach
         </div>
 
+        <div class="row g-3 mb-4">
+            <div class="col-xl-7"><div class="card h-100"><div class="card-body">
+                <div class="inventory-section-heading"><div><span class="inventory-eyebrow text-primary">SALES TREND</span><h4 class="card-title mb-0">Approved sales by month</h4></div><span class="inventory-section-caption">Last {{ count($salesTrend) }} months</span></div>
+                <div class="d-flex align-items-end gap-2 mt-4" style="height: 150px">
+                    @php($maxTrend = max(1, collect($salesTrend)->max('sales')))
+                    @foreach($salesTrend as $trend)
+                        <div class="text-center flex-fill" title="{{ number_format($trend['sales'], 2) }}"><div class="bg-primary rounded-top" style="height: {{ max(4, round(($trend['sales'] / $maxTrend) * 120)) }}px"></div><small class="text-muted d-block mt-2">{{ substr($trend['month'], 5) }}</small></div>
+                    @endforeach
+                </div>
+            </div></div></div>
+            <div class="col-xl-5"><div class="card h-100"><div class="card-body">
+                <div class="inventory-section-heading"><div><span class="inventory-eyebrow text-warning">EXCEPTIONS</span><h4 class="card-title mb-0">Inventory attention</h4></div><a href="{{ route('planning.dashboard') }}" class="small">View planning</a></div>
+                <div class="d-flex justify-content-between border-bottom py-2"><span>Low stock</span><strong>{{ count($exceptionDrilldowns['low_stock'] ?? []) }}</strong></div>
+                @foreach(array_slice($exceptionDrilldowns['low_stock'] ?? [], 0, 3) as $exception)
+                    <div class="d-flex justify-content-between py-1 small"><span class="text-truncate me-2">{{ $exception['name'] }}</span><span class="text-danger">{{ number_format($exception['available_quantity'], 2) }}</span></div>
+                @endforeach
+                <div class="d-flex justify-content-between border-top border-bottom py-2 mt-2"><span>Excess stock</span><strong>{{ count($exceptionDrilldowns['excess_stock'] ?? []) }}</strong></div>
+                @foreach(array_slice($exceptionDrilldowns['excess_stock'] ?? [], 0, 3) as $exception)
+                    <div class="d-flex justify-content-between py-1 small"><span class="text-truncate me-2">{{ $exception['name'] }}</span><span class="text-warning">{{ number_format($exception['excess_quantity'], 2) }}</span></div>
+                @endforeach
+            </div></div></div>
+        </div>
+
         <div class="row g-3">
             <div class="col-xl-8">
                 <div class="card h-100"><div class="card-body">

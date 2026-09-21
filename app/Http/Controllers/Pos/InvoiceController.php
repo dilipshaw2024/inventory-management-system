@@ -32,8 +32,23 @@ use App\Models\Store;
 
 class InvoiceController extends Controller
 {
+    private function companyId(): int
+    {
+        return (int) Auth::user()->company_id;
+    }
+
+    private function visibleProducts()
+    {
+        return Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'));
+    }
+
+    private function companyInvoice(int $id): Invoice
+    {
+        return Invoice::where('company_id', $this->companyId())->findOrFail($id);
+    }
+
     public function InvoiceAll(){
-        $allData = Invoice::orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
+        $allData = Invoice::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
             return view('backend.invoice.invoice_all',compact('allData'));
 
     } // End Method
@@ -42,15 +57,16 @@ class InvoiceController extends Controller
     public function invoiceAdd(){ 
 
 
-        $category = Category::orderBy('id','desc')->get();
-        $costomer = Customer::orderBy('id','desc')->get();
-        $stores = Store::where('is_active', true)->with('branch')->orderBy('name')->get();
-        $invoice_data = Invoice::orderBy('id','desc')->first();
+        $companyId = $this->companyId();
+        $category = Category::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
+        $costomer = Customer::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
+        $stores = Store::where('is_active', true)->whereHas('branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->with('branch')->orderBy('name')->get();
+        $invoice_data = Invoice::where('company_id', $companyId)->orderBy('id','desc')->first();
         if ($invoice_data == null) {
            $firstReg = '0';
            $invoice_no = $firstReg+1;
         }else{
-            $invoice_data = Invoice::orderBy('id','desc')->first()->invoice_no;
+            $invoice_data = Invoice::where('company_id', $companyId)->orderBy('id','desc')->first()->invoice_no;
             $invoice_no = $invoice_data+1;
         }
         $invoice_no = app(NumberingSequenceService::class)->previewOrFallback('sales_invoice', (string) $invoice_no, auth()->user()?->company_id, auth()->user()?->branch_id);
@@ -63,7 +79,7 @@ class InvoiceController extends Controller
 
     public function InvoiceStore(InvoiceRequest $request){
 
-    if ($request->filled('store_id') && !Store::whereKey($request->integer('store_id'))->exists()) abort(403);
+    if ($request->filled('store_id') && !Store::whereKey((int) $request->input('store_id'))->whereHas('branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->exists()) abort(403);
 
     if ($request->category_id == null) {
 
@@ -82,12 +98,12 @@ class InvoiceController extends Controller
         $netTotal = 0;
         $lineTaxes = [];
         $taxMode = $request->input('tax_mode') ?: app(\App\Services\ErpSettingService::class)->get('default_tax_mode', 'exclusive');
-        $customer = $request->integer('customer_id') > 0 ? Customer::find($request->integer('customer_id')) : null;
+        $customer = (int) $request->input('customer_id') > 0 ? Customer::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->find((int) $request->input('customer_id')) : null;
         $taxExempt = (bool) ($customer?->tax_exempt);
         $taxExemptionNumber = $customer?->tax_exemption_number;
 
         foreach ($request->product_id as $key => $productId) {
-            $product = Product::find($productId);
+            $product = $this->visibleProducts()->find($productId);
             if (!$product || (int) $product->category_id !== (int) $request->category_id[$key]) {
                 return redirect()->back()->withInput()->with(['message' => 'One or more invoice products do not match the selected category.', 'alert-type' => 'error']);
             }
@@ -144,7 +160,10 @@ class InvoiceController extends Controller
     $invoice->created_by = Auth::user()->id; 
 
     DB::transaction(function() use($request,$invoice,$discount,$promotion,$estimatedAmount,$netTotal,$taxTotal,$lineTaxes,$taxExempt){
+        $companyId = $this->companyId();
         if ($invoice->save()) {
+           $invoice->company_id = $companyId;
+           $invoice->save();
            $invoice->subtotal_amount = $netTotal;
            $invoice->tax_amount = $taxTotal;
            $invoice->total_amount = $estimatedAmount;
@@ -163,7 +182,7 @@ class InvoiceController extends Controller
               $invoice_details->selling_qty = $request->selling_qty[$i];
               $invoice_details->unit_price = $request->unit_price[$i];
               $invoice_details->selling_price = (float) $request->selling_qty[$i] * (float) $request->unit_price[$i];
-              $invoice_details->tax_rate = $taxExempt ? 0 : ($request->product_id[$i] ? (float) Product::whereKey($request->product_id[$i])->value('tax_rate') : 0);
+              $invoice_details->tax_rate = $taxExempt ? 0 : ($request->product_id[$i] ? (float) $this->visibleProducts()->whereKey($request->product_id[$i])->value('tax_rate') : 0);
               $invoice_details->tax_amount = $lineTaxes[$i] ?? 0;
               $invoice_details->status = '0'; 
               $invoice_details->save(); 
@@ -175,12 +194,13 @@ class InvoiceController extends Controller
                 $customer->mobile_no = $request->mobile_no;
                 $customer->email = $request->email;
                 $customer->created_by = Auth::user()->id;
+                $customer->company_id = $companyId;
                 $customer->save();
                 $customer_id = $customer->id;
             } else{
                 $customer_id = $request->customer_id;
             } 
-            $customer = Customer::findOrFail($customer_id);
+            $customer = Customer::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($customer_id);
             $invoice->due_date = $invoice->due_date ?: Carbon::parse($invoice->date)->addDays((int) ($customer->credit_days ?? 0))->toDateString();
             $invoice->billing_address = $customer->address;
             $invoice->shipping_address = $customer->address;
@@ -191,6 +211,7 @@ class InvoiceController extends Controller
             $payment_details = new PaymentDetail();
 
             $payment->invoice_id = $invoice->id;
+            $payment->company_id = $companyId;
             $payment->customer_id = $customer_id;
             $payment->currency_code = $invoice->currency_code;
             $payment->exchange_rate = $invoice->exchange_rate ?: 1;
@@ -233,7 +254,7 @@ class InvoiceController extends Controller
 
 
     public function PendingList(){
-        $allData = Invoice::orderBy('date','desc')->orderBy('id','desc')->whereIn('status',[0, 2])->get();
+        $allData = Invoice::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->whereIn('status',[0, 2])->get();
             return view('backend.invoice.invoice_pending_list',compact('allData'));
     } // End Method
 
@@ -241,13 +262,13 @@ class InvoiceController extends Controller
 
     public function InvoiceDelete($id){
 
-        $invoice = Invoice::findOrFail($id);
+        $invoice = $this->companyInvoice((int) $id);
         if ((int) $invoice->status === 1) {
             return redirect()->back()->with(['message' => 'Approved invoices cannot be deleted because they affect stock and payment history.', 'alert-type' => 'error']);
         }
         DB::transaction(function () use ($invoice) {
             InvoiceDetail::where('invoice_id',$invoice->id)->delete();
-            Payment::where('invoice_id',$invoice->id)->delete();
+            Payment::where('company_id', $this->companyId())->where('invoice_id',$invoice->id)->delete();
             PaymentDetail::where('invoice_id',$invoice->id)->delete();
             $invoice->delete();
         });
@@ -264,7 +285,7 @@ class InvoiceController extends Controller
 
     public function InvoiceApprove($id){
 
-        $invoice = Invoice::with('invoice_details')->findOrFail($id);
+        $invoice = Invoice::where('company_id', $this->companyId())->with('invoice_details')->findOrFail($id);
         return view('backend.invoice.invoice_approve',compact('invoice'));
 
     }// End Method
@@ -274,7 +295,7 @@ class InvoiceController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(Invoice::class, (int) $id);
         try {
             DB::transaction(function () use ($id) {
-                $invoice = Invoice::lockForUpdate()->with(['invoice_details', 'payment'])->findOrFail($id);
+                $invoice = Invoice::where('company_id', $this->companyId())->lockForUpdate()->with(['invoice_details', 'payment'])->findOrFail($id);
                 if ((int) $invoice->status !== 0) {
                     throw new \RuntimeException('Only pending invoices can be approved.');
                 }
@@ -282,7 +303,7 @@ class InvoiceController extends Controller
                 app(\App\Services\SalesDiscountPolicyService::class)->assertInvoiceCanApprove($invoice);
 
                 foreach ($invoice->invoice_details as $invoiceDetail) {
-                    $product = Product::lockForUpdate()->findOrFail($invoiceDetail->product_id);
+                    $product = $this->visibleProducts()->lockForUpdate()->findOrFail($invoiceDetail->product_id);
                     app(\App\Services\ProductLifecycleService::class)->assertSellable($product);
                     $available = app(\App\Services\InventoryAvailabilityService::class)->available($product, true, null, $invoice->company_id);
                     if ($available < (float) $invoiceDetail->selling_qty) {
@@ -324,7 +345,7 @@ class InvoiceController extends Controller
                     app(AuditService::class)->record('promotion.redeemed', $redeemed, ['usage_count' => max(0, (int) $redeemed->usage_count - 1)], ['usage_count' => $redeemed->usage_count, 'invoice_id' => $invoice->id]);
                 }
                 app(AutomaticAccountingService::class)->postSalesInvoice($invoice);
-                $payment = Payment::where('invoice_id', $invoice->id)->first();
+                $payment = Payment::where('company_id', $this->companyId())->where('invoice_id', $invoice->id)->first();
                 if ($payment) app(AutomaticAccountingService::class)->postCustomerPayment($payment);
                 app(AuditService::class)->record('invoice.approved', $invoice, ['status' => 0], ['status' => 1]);
             });
@@ -346,7 +367,7 @@ class InvoiceController extends Controller
 
         try {
             DB::transaction(function () use ($id, $data): void {
-                $invoice = Invoice::lockForUpdate()->findOrFail($id);
+                $invoice = Invoice::where('company_id', $this->companyId())->lockForUpdate()->findOrFail($id);
                 if ((int) $invoice->status !== 0) throw new \RuntimeException('Only pending invoices can be rejected.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($invoice);
                 $before = $invoice->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);
@@ -365,13 +386,13 @@ class InvoiceController extends Controller
 
     public function PrintInvoiceList(){
 
-    $allData = Invoice::orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
+    $allData = Invoice::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
        return view('backend.invoice.print_invoice_list',compact('allData'));
     } // End Method
 
 
     public function PrintInvoice($id){
-        $invoice = Invoice::with('invoice_details')->findOrFail($id);
+        $invoice = Invoice::where('company_id', $this->companyId())->with('invoice_details')->findOrFail($id);
         return view('backend.pdf.invoice_pdf',compact('invoice'));
 
     } // End Method
@@ -386,7 +407,7 @@ class InvoiceController extends Controller
 
         $sdate = date('Y-m-d',strtotime($request->start_date));
         $edate = date('Y-m-d',strtotime($request->end_date));
-        $allData = Invoice::whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
+        $allData = Invoice::where('company_id', $this->companyId())->whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
 
 
         $start_date = date('Y-m-d',strtotime($request->start_date));

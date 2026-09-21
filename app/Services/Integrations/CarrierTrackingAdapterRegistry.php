@@ -21,6 +21,9 @@ class CarrierTrackingAdapterRegistry
         $this->adapters[$adapter->key()] = $adapter;
     }
 
+    /** @return list<string> */
+    public function keys(): array { return array_keys($this->adapters); }
+
     public function resolve(string $key): CarrierTrackingAdapter
     {
         $key = strtolower(trim($key));
