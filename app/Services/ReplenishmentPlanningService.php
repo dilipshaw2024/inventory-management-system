@@ -105,7 +105,10 @@ class ReplenishmentPlanningService
             $coveredByTransfer = min($required, (float) $transferCoverage->get((int) $product->id, 0));
             $required = max(0, $required - $coveredByTransfer);
             if ($required <= 0 || !$product->supplier_id) continue;
-            $open = (float) PurchaseOrderLine::where('product_id', $product->id)->whereHas('purchaseOrder', fn ($query) => $query->where('company_id', $companyId)->whereIn('status', ['draft', 'submitted', 'approved', 'partially_received']))->selectRaw('COALESCE(SUM(ordered_qty - received_qty), 0) AS quantity')->value('quantity');
+            $open = (float) PurchaseOrderLine::where('product_id', $product->id)
+                ->whereHas('purchaseOrder', fn ($query) => $query->where('company_id', $companyId)->whereIn('status', ['draft', 'submitted', 'approved', 'partially_received']))
+                ->when($locationId !== null, fn ($query) => $query->where(fn ($locationQuery) => $locationQuery->whereNull('location_id')->orWhere('location_id', $locationId)))
+                ->selectRaw('COALESCE(SUM(ordered_qty - received_qty), 0) AS quantity')->value('quantity');
             $quantity = max(0, $required - $open);
             if ($quantity <= 0) continue;
             $price = app(SupplierProductPriceService::class)->bestFor($product->supplier, $product, $quantity, now()->toDateString(), null)?->unit_price;

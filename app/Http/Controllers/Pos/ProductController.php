@@ -98,7 +98,10 @@ class ProductController extends Controller
         $unit = $this->visibleMaster(Unit::class)->orderBy('id','desc')->get();
         $brands = $this->visibleMaster(Brand::class)->orderBy('name')->get();
         $taxRates = $this->visibleMaster(TaxRate::class)->where('is_active', true)->orderBy('name')->get();
-        return view('backend.product.product_add',compact('supplier','category','unit','brands','taxRates'));
+        $settings = app(\App\Services\ErpSettingService::class);
+        $defaultCostingMethod = $settings->get('default_inventory_costing_method', 'fifo', $this->companyId());
+        $defaultStandardCost = $settings->get('default_standard_cost', null, $this->companyId());
+        return view('backend.product.product_add', compact('supplier','category','unit','brands','taxRates','defaultCostingMethod','defaultStandardCost'));
     } // End Method 
 
 
@@ -128,6 +131,8 @@ class ProductController extends Controller
             'tracking_type' => $request->tracking_type,
             'product_type' => $request->input('product_type', 'stock'),
             'lifecycle_status' => $request->input('lifecycle_status', 'active'),
+            'costing_method' => $request->input('costing_method', app(\App\Services\ErpSettingService::class)->get('default_inventory_costing_method', 'fifo', $companyId)),
+            'standard_cost' => $request->filled('standard_cost') ? $request->standard_cost : app(\App\Services\ErpSettingService::class)->get('default_standard_cost', null, $companyId),
             'can_purchase' => $request->boolean('can_purchase', true),
             'can_sell' => $request->boolean('can_sell', true),
             'is_stock_item' => $request->boolean('is_stock_item', true),
@@ -187,6 +192,8 @@ class ProductController extends Controller
             'tracking_type' => ['required', 'in:none,batch,serial'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'],
             'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
+            'costing_method' => ['nullable', 'in:fifo,weighted_average,moving_average,standard'],
+            'standard_cost' => ['nullable', 'numeric', 'min:0'],
             'can_purchase' => ['nullable', 'boolean'], 'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'],
             'weight_kg' => ['nullable', 'numeric', 'min:0'], 'length_m' => ['nullable', 'numeric', 'min:0'], 'width_m' => ['nullable', 'numeric', 'min:0'], 'height_m' => ['nullable', 'numeric', 'min:0'],
         ]);
@@ -216,6 +223,8 @@ class ProductController extends Controller
             'tracking_type' => $request->tracking_type,
             'product_type' => $request->input('product_type', 'stock'),
             'lifecycle_status' => $request->input('lifecycle_status', 'active'),
+            'costing_method' => $request->input('costing_method', $product->costing_method ?: 'fifo'),
+            'standard_cost' => $request->filled('standard_cost') ? $request->standard_cost : $product->standard_cost,
             'can_purchase' => $request->boolean('can_purchase', true),
             'can_sell' => $request->boolean('can_sell', true),
             'is_stock_item' => $request->boolean('is_stock_item', true),

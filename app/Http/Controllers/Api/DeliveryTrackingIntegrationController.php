@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Delivery;
 use App\Models\DeliveryTrackingEvent;
+use App\Models\CarrierTrackingProviderSetting;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
 use App\Services\Integrations\CarrierTrackingAdapterRegistry;
@@ -18,6 +19,40 @@ use Illuminate\Validation\Rule;
 class DeliveryTrackingIntegrationController extends Controller
 {
     public function __construct(private CarrierTrackingAdapterRegistry $carrierAdapters) {}
+
+    public function carrierTrackingProviders(Request $request): JsonResponse
+    {
+        return response()->json(CarrierTrackingProviderSetting::where('company_id', $request->user()?->company_id)->orderBy('provider')->paginate(min(100, max(1, (int) $request->input('per_page', 50)))));
+    }
+
+    public function storeCarrierTrackingProvider(Request $request): JsonResponse
+    {
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $this->validateCarrierEndpoint($data['connection_config']['endpoint'] ?? null);
+        $data['provider'] = strtolower(trim($data['provider']));
+        if ($data['provider'] !== 'http') abort(422, 'Unsupported carrier tracking provider setting.');
+        $setting = CarrierTrackingProviderSetting::updateOrCreate(['company_id' => $request->user()?->company_id, 'provider' => $data['provider']], ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true]);
+        app(AuditService::class)->record('carrier_tracking_provider.updated', $setting, null, $setting->toArray());
+        return response()->json(['data' => $setting, 'status' => 'configured'], 201);
+    }
+
+    public function updateCarrierTrackingProvider(Request $request, int $id): JsonResponse
+    {
+        $setting = CarrierTrackingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $this->validateCarrierEndpoint($data['connection_config']['endpoint'] ?? null);
+        $setting->update($data);
+        app(AuditService::class)->record('carrier_tracking_provider.updated', $setting, null, $setting->toArray());
+        return response()->json(['data' => $setting->fresh(), 'status' => 'updated']);
+    }
+
+    public function deactivateCarrierTrackingProvider(Request $request, int $id): JsonResponse
+    {
+        $setting = CarrierTrackingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $setting->update(['is_active' => false]);
+        app(AuditService::class)->record('carrier_tracking_provider.deactivated', $setting, ['is_active' => true], ['is_active' => false]);
+        return response()->json(['data' => $setting->fresh(), 'status' => 'deactivated']);
+    }
 
     public function index(Request $request): JsonResponse
     {
@@ -171,7 +206,7 @@ class DeliveryTrackingIntegrationController extends Controller
         $trackingNumber = $data['tracking_number'] ?? $delivery->tracking_no;
         if (!$trackingNumber) return response()->json(['message' => 'A tracking number is required for carrier synchronization.'], 422);
         try {
-            $payloads = $adapter->fetch($trackingNumber, ['tracking_number' => $trackingNumber, 'delivery_id' => $delivery->id]);
+            $payloads = $adapter->fetch($trackingNumber, ['tracking_number' => $trackingNumber, 'delivery_id' => $delivery->id, 'company_id' => $companyId]);
             $events = [];
             $duplicates = 0;
             foreach ($payloads as $payload) {
@@ -279,5 +314,12 @@ class DeliveryTrackingIntegrationController extends Controller
             $delivery->update(['fulfillment_status' => 'dispatched']);
             app(AuditService::class)->record('delivery.dispatched_by_carrier', $delivery, $before, $delivery->fresh()->only(['fulfillment_status']) + ['tracking_event_id' => $event->id]);
         }
+    }
+
+    private function validateCarrierEndpoint(?string $endpoint): void
+    {
+        if ($endpoint === null || trim($endpoint) === '') return;
+        $candidate = str_replace('{tracking_number}', 'tracking-number', trim($endpoint));
+        if (filter_var($candidate, FILTER_VALIDATE_URL) === false) abort(422, 'The carrier tracking endpoint must be a valid URL and may contain {tracking_number}.');
     }
 }

@@ -408,9 +408,12 @@ class InventoryIntegrationController extends Controller
     public function valuation(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
             'product_id' => ['nullable', 'integer'], 'category_id' => ['nullable', 'integer'],
             'location_id' => ['nullable', 'integer'], 'batch_id' => ['nullable', 'integer'],
+            'department_id' => ['nullable', 'integer', $owned('departments')],
+            'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
             'as_of' => ['nullable', 'date'], 'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
@@ -428,7 +431,9 @@ class InventoryIntegrationController extends Controller
                 ->when($asOf, fn ($q) => $q->whereDate('layers.received_at', '<=', $asOf))
                 ->when(!$asOf, fn ($q) => $q->where('layers.remaining_quantity', '>', 0))
                 ->when($data['location_id'] ?? null, fn ($q, $id) => $q->where('layers.location_id', $id))
-                ->when($data['batch_id'] ?? null, fn ($q, $id) => $q->where('layers.batch_id', $id));
+                ->when($data['batch_id'] ?? null, fn ($q, $id) => $q->where('layers.batch_id', $id))
+                ->when($data['department_id'] ?? null, fn ($q, $id) => $q->where('layers.department_id', $id))
+                ->when($data['cost_center_id'] ?? null, fn ($q, $id) => $q->where('layers.cost_center_id', $id));
         };
         $valuation = Product::with('category')->select(['products.id', 'products.name', 'products.sku', 'products.updated_at'])
             ->when($data['product_id'] ?? null, fn ($q, $id) => $q->whereKey($id))
@@ -438,7 +443,9 @@ class InventoryIntegrationController extends Controller
                     $scope->where('products.updated_at', '>=', $date)->orWhereExists(function ($layersQuery) use ($date, $data): void {
                         $layersQuery->selectRaw('1')->from('inventory_cost_layers as changed_layers')->whereColumn('changed_layers.product_id', 'products.id')->where('changed_layers.updated_at', '>=', $date)
                             ->when($data['location_id'] ?? null, fn ($layerQuery, $id) => $layerQuery->where('changed_layers.location_id', $id))
-                            ->when($data['batch_id'] ?? null, fn ($layerQuery, $id) => $layerQuery->where('changed_layers.batch_id', $id));
+                            ->when($data['batch_id'] ?? null, fn ($layerQuery, $id) => $layerQuery->where('changed_layers.batch_id', $id))
+                            ->when($data['department_id'] ?? null, fn ($layerQuery, $id) => $layerQuery->where('changed_layers.department_id', $id))
+                            ->when($data['cost_center_id'] ?? null, fn ($layerQuery, $id) => $layerQuery->where('changed_layers.cost_center_id', $id));
                     });
                 });
             })
@@ -678,12 +685,29 @@ class InventoryIntegrationController extends Controller
             'external_reference' => ['nullable', 'string', 'max:150'],
             'count_date' => ['required', 'date'],
             'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
+            'location_scan_code' => ['nullable', 'string', 'max:120'],
             'description' => ['nullable', 'string', 'max:2000'],
             'lines' => ['required', 'array', 'min:1'],
             'lines.*.product_id' => ['required', 'integer', $ownedProduct],
+            'lines.*.product_scan_code' => ['nullable', 'string', 'max:150'],
             'lines.*.counted_quantity' => ['required', 'numeric', 'min:0'],
             'lines.*.unit_cost' => ['nullable', 'numeric', 'min:0'],
         ]);
+
+        $locationScope = fn ($query) => $query->whereHas('warehouse.branch', fn ($branchQuery) => $branchQuery->where('company_id', $companyId));
+        $location = !empty($data['location_id'])
+            ? InventoryLocation::where($locationScope)->findOrFail($data['location_id'])
+            : null;
+        if (!empty($data['location_scan_code'])) {
+            $scanCode = trim($data['location_scan_code']);
+            $scannedLocation = InventoryLocation::where($locationScope)
+                ->where(fn ($query) => $query->where('code', $scanCode)->orWhereHas('barcodes', fn ($barcodeQuery) => $barcodeQuery->where('code', $scanCode)->where('company_id', $companyId)))
+                ->first();
+            if (!$scannedLocation) abort(422, 'The scanned count location is not available in the current company.');
+            if ($location && (int) $location->id !== (int) $scannedLocation->id) abort(422, 'The scanned count location does not match the selected location.');
+            $location = $scannedLocation;
+            $data['location_id'] = $location->id;
+        }
 
         if (!empty($data['external_reference'])) {
             $existing = $this->companyScope(StockCount::query(), $companyId)->where('external_reference', $data['external_reference'])->first();
@@ -702,7 +726,12 @@ class InventoryIntegrationController extends Controller
                 'created_by' => auth()->id(),
             ]);
             foreach ($data['lines'] as $line) {
-                $product = $this->companyScope(Product::query(), $companyId)->findOrFail($line['product_id']);
+                $product = $this->companyScope(Product::with('barcodes'), $companyId)->findOrFail($line['product_id']);
+                if (!empty($line['product_scan_code'])) {
+                    $scanCode = trim($line['product_scan_code']);
+                    $matches = $product->sku === $scanCode || $product->barcode === $scanCode || $product->barcodes->contains('code', $scanCode);
+                    if (!$matches) abort(422, 'The scanned product does not match '.$product->name.'.');
+                }
                 $system = $count->location_id
                     ? $this->locationBalance((int) $product->id, (int) $count->location_id)
                     : (float) $product->quantity;
@@ -716,7 +745,12 @@ class InventoryIntegrationController extends Controller
                     'unit_cost' => array_key_exists('unit_cost', $line) && $line['unit_cost'] !== null ? $line['unit_cost'] : $product->purchase_price,
                 ]);
             }
-            app(AuditService::class)->record('stock_count.created', $count, null, $count->toArray());
+            app(AuditService::class)->record('stock_count.created', $count, null, $count->toArray() + [
+                'scanner_validation' => [
+                    'location_scan_code' => $data['location_scan_code'] ?? null,
+                    'product_scan_codes' => collect($data['lines'])->pluck('product_scan_code')->filter()->values()->all(),
+                ],
+            ]);
             return $count;
         });
 

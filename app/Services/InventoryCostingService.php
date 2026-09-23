@@ -39,6 +39,7 @@ class InventoryCostingService
 
         return $layers->groupBy('product_id')->map(function (Collection $productLayers, $id) use ($products, $cutoff): ?array {
             $product = $products->get($id);
+            $policy = app(ProductCostingPolicyService::class)->resolve($product, $cutoff ?: now());
             $rows = $productLayers->map(function (InventoryCostLayer $layer) use ($cutoff): array {
                 $consumed = $cutoff
                     ? (float) $layer->consumptions->filter(function ($consumption) use ($cutoff): bool {
@@ -54,14 +55,14 @@ class InventoryCostingService
             if ($rows->isEmpty()) return null;
 
             $totalQuantity = (float) $rows->sum('quantity');
-            $target = $product->costing_method === 'standard'
-                ? (float) ($product->standard_cost ?? 0)
+            $target = $policy['costing_method'] === 'standard'
+                ? (float) ($policy['standard_cost'] ?? 0)
                 : (float) $rows->sum(fn (array $row): float => $row['quantity'] * $row['current_unit_cost']) / max($totalQuantity, 0.000001);
             $lines = $rows->map(function (array $row) use ($target): array {
                 $variance = $row['quantity'] * ($target - $row['current_unit_cost']);
                 return $row + ['target_unit_cost' => round($target, 6), 'variance_amount' => round($variance, 6)];
             })->filter(fn (array $row): bool => abs($row['variance_amount']) > 0.000001)->values();
-            return ['product_id' => (int) $product->id, 'name' => $product->name, 'sku' => $product->sku, 'costing_method' => $product->costing_method, 'as_of' => $cutoff?->toDateString(), 'quantity' => round($totalQuantity, 6), 'current_value' => round((float) $rows->sum(fn (array $row): float => $row['quantity'] * $row['current_unit_cost']), 6), 'target_unit_cost' => round($target, 6), 'target_value' => round($totalQuantity * $target, 6), 'variance_amount' => round((float) $lines->sum('variance_amount'), 6), 'revaluation_required' => $lines->isNotEmpty(), 'lines' => $lines];
+            return ['product_id' => (int) $product->id, 'name' => $product->name, 'sku' => $product->sku, 'costing_method' => $policy['costing_method'], 'policy_id' => $policy['policy_id'], 'as_of' => $cutoff?->toDateString(), 'quantity' => round($totalQuantity, 6), 'current_value' => round((float) $rows->sum(fn (array $row): float => $row['quantity'] * $row['current_unit_cost']), 6), 'target_unit_cost' => round($target, 6), 'target_value' => round($totalQuantity * $target, 6), 'variance_amount' => round((float) $lines->sum('variance_amount'), 6), 'revaluation_required' => $lines->isNotEmpty(), 'lines' => $lines];
         })->filter()->values();
     }
 
@@ -69,7 +70,8 @@ class InventoryCostingService
     {
         if ($quantity <= 0) return;
         $product = Product::whereKey($productId)->first(['id', 'costing_method', 'tracking_type', 'purchase_price', 'standard_cost']);
-        $method = $product?->costing_method ?? 'fifo';
+        $policy = app(ProductCostingPolicyService::class)->resolve($product, $movement?->posted_at);
+        $method = $policy['costing_method'];
         if (in_array($method, ['weighted_average', 'moving_average'], true)) {
             $layers = InventoryCostLayer::where('product_id', $productId)->where('remaining_quantity', '>', 0)->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))->lockForUpdate()->get();
             $oldQuantity = (float) $layers->sum('remaining_quantity'); $oldValue = (float) $layers->sum(fn ($layer) => (float) $layer->remaining_quantity * (float) $layer->unit_cost);
@@ -81,6 +83,8 @@ class InventoryCostingService
             'product_id' => $productId,
             'location_id' => $locationId,
             'batch_id' => $batchId,
+            'department_id' => $movement?->department_id,
+            'cost_center_id' => $movement?->cost_center_id,
             'original_quantity' => $quantity,
             'remaining_quantity' => $quantity,
             'unit_cost' => $unitCost,
@@ -104,10 +108,11 @@ class InventoryCostingService
     {
         if ($quantity <= 0) return 0;
         $product = Product::whereKey($productId)->first(['id', 'costing_method', 'tracking_type', 'purchase_price', 'standard_cost']);
-        $method = $product?->costing_method ?? 'fifo';
+        $policy = app(ProductCostingPolicyService::class)->resolve($product, $movement?->posted_at);
+        $method = $policy['costing_method'];
         if ($method === 'standard') {
-            $standard = Product::whereKey($productId)->value('standard_cost');
-            $cost = $fallbackCost ?? (float) ($standard ?? Product::whereKey($productId)->value('purchase_price') ?? 0);
+            $standard = $policy['standard_cost'];
+            $cost = $fallbackCost ?? (float) ($standard ?? $product?->purchase_price ?? 0);
             if ($movement) {
                 InventoryMovementAllocation::create([
                     'movement_id' => $movement->id,

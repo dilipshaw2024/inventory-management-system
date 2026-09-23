@@ -10,10 +10,13 @@ class FiscalPeriod extends Model
     use BelongsToCompany;
 
     protected $guarded = [];
-    protected $casts = ['starts_on' => 'date', 'ends_on' => 'date', 'closed_at' => 'datetime'];
+    protected $casts = ['starts_on' => 'date', 'ends_on' => 'date', 'closed_at' => 'datetime', 'settled_at' => 'datetime'];
 
     public function company() { return $this->belongsTo(Company::class); }
     public function fiscalYear() { return $this->belongsTo(FiscalYear::class); }
     public function closer() { return $this->belongsTo(User::class, 'closed_by'); }
     public function inventorySnapshot() { return $this->belongsTo(InventoryReconciliationSnapshot::class, 'inventory_snapshot_id'); }
+    public function settlementJournal() { return $this->belongsTo(JournalEntry::class, 'settlement_journal_id'); }
+    public function settlementReversalJournal() { return $this->belongsTo(JournalEntry::class, 'settlement_reversal_journal_id'); }
+    public function settler() { return $this->belongsTo(User::class, 'settled_by'); }
 }

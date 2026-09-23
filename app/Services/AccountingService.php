@@ -91,9 +91,9 @@ class AccountingService
         }
     }
 
-    public function reverse(JournalEntry $entry, ?string $reason = null): JournalEntry
+    public function reverse(JournalEntry $entry, ?string $reason = null, ?string $date = null): JournalEntry
     {
-        return DB::transaction(function () use ($entry, $reason): JournalEntry {
+        return DB::transaction(function () use ($entry, $reason, $date): JournalEntry {
             $entry = JournalEntry::with('lines')->lockForUpdate()->findOrFail($entry->getKey());
             if ($entry->status !== 'posted') {
                 throw new \RuntimeException('Only posted journals can be reversed.');
@@ -105,7 +105,7 @@ class AccountingService
             $reversal = $this->post([
                 'company_id' => $entry->company_id,
                 'entry_no' => 'REV-'.$entry->entry_no.'-'.now()->format('YmdHis'),
-                'date' => now()->toDateString(),
+                'date' => $date ?: now()->toDateString(),
                 'description' => $reason ?: 'Reversal of '.$entry->entry_no,
                 'reversal_of_id' => $entry->id,
                 'consolidation_elimination' => (bool) $entry->consolidation_elimination,

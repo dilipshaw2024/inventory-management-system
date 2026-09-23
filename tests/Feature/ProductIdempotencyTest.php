@@ -32,4 +32,29 @@ class ProductIdempotencyTest extends TestCase
         $replayed->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $created->json('data.id'));
         $this->assertSame(1, Product::where('company_id', $company->id)->count());
     }
+
+    public function test_company_costing_defaults_apply_when_product_payload_omits_costing_fields(): void
+    {
+        $company = Company::create(['name' => 'Product Costing Defaults Co', 'code' => 'PRODUCT-COSTING-DEFAULTS']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Costing Defaults Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Costing Defaults Each', 'code' => 'EA-COSTING-DEFAULTS', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Costing Defaults Category', 'status' => 1]);
+        Sanctum::actingAs($user, ['inventory:write', 'accounting:write']);
+
+        $this->patchJson('/api/accounting/settings', [
+            'default_inventory_costing_method' => 'standard',
+            'default_standard_cost' => 23.75,
+        ])->assertOk()->assertJsonPath('data.default_inventory_costing_method', 'standard');
+
+        $response = $this->postJson('/api/inventory/products', [
+            'external_reference' => 'PRODUCT-COSTING-DEFAULTS-1', 'name' => 'Default Cost Product',
+            'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id,
+            'tracking_type' => 'none', 'product_type' => 'stock', 'status' => true,
+        ]);
+
+        $response->assertCreated()->assertJsonPath('data.costing_method', 'standard');
+        $this->assertEquals(23.75, (float) $response->json('data.standard_cost'));
+        $this->assertDatabaseHas('products', ['id' => $response->json('data.id'), 'costing_method' => 'standard', 'standard_cost' => 23.75]);
+    }
 }

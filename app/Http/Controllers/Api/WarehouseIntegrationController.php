@@ -9,6 +9,8 @@ use App\Models\InventoryTransfer;
 use App\Models\InventoryTransferLine;
 use App\Models\InventoryTransferSerial;
 use App\Models\InventoryTransferAllocation;
+use App\Models\Delivery;
+use App\Models\PickWave;
 use App\Models\Product;
 use App\Models\Warehouse;
 use App\Services\AuditService;
@@ -18,14 +20,326 @@ use App\Services\InventoryLedgerService;
 use App\Services\InventoryLocationCapacityService;
 use App\Services\NumberingSequenceService;
 use App\Services\SerialLifecycleService;
+use App\Services\WarehouseFulfillmentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Str;
 
 class WarehouseIntegrationController extends Controller
 {
+    public function pickList(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'warehouse_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'date' => ['nullable', 'date'],
+            'sort_by' => ['nullable', 'in:location,product,delivery_date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse picking.');
+
+        $deliveries = Delivery::with(['lines.product', 'salesOrder.customer', 'location.warehouse', 'operations'])
+            ->where('company_id', $companyId)
+            ->where('status', 'pending')
+            ->where(fn ($query) => $query->whereNull('fulfillment_status')->orWhere('fulfillment_status', 'pending'))
+            ->whereDoesntHave('operations', fn ($query) => $query->where('operation_type', 'pick')->where('status', 'completed'))
+            ->when($data['warehouse_id'] ?? null, fn ($query, $id) => $query->whereHas('location', fn ($location) => $location->where('warehouse_id', $id)))
+            ->when($data['location_id'] ?? null, fn ($query, $id) => $query->where('location_id', $id))
+            ->when($data['date'] ?? null, fn ($query, $date) => $query->whereDate('date', $date))
+            ->orderBy('date')->orderBy('id')->get();
+
+        $sortBy = $data['sort_by'] ?? 'location';
+        $rows = $deliveries->map(function (Delivery $delivery): array {
+            $lines = $delivery->lines->map(fn ($line): array => [
+                'id' => (int) $line->id,
+                'product_id' => (int) $line->product_id,
+                'product' => $line->product?->name,
+                'sku' => $line->product?->sku,
+                'quantity' => (float) $line->delivered_qty,
+                'uom_id' => $line->uom_id,
+            ])->values();
+            return [
+                'delivery_id' => (int) $delivery->id,
+                'delivery_no' => $delivery->delivery_no,
+                'date' => optional($delivery->date)->toDateString(),
+                'location_id' => $delivery->location_id ? (int) $delivery->location_id : null,
+                'location' => $delivery->location?->code,
+                'warehouse_id' => $delivery->location?->warehouse_id ? (int) $delivery->location->warehouse_id : null,
+                'warehouse' => $delivery->location?->warehouse?->name,
+                'customer_id' => $delivery->salesOrder?->customer_id ? (int) $delivery->salesOrder->customer_id : null,
+                'customer' => $delivery->salesOrder?->customer?->name,
+                'lines' => $lines,
+                'line_count' => $lines->count(),
+                'total_quantity' => (float) $lines->sum('quantity'),
+            ];
+        })->filter(fn (array $row): bool => $row['line_count'] > 0);
+
+        $rows = $rows->sortBy(function (array $row) use ($sortBy): array {
+            $firstProduct = (string) ($row['lines']->first()['product'] ?? '');
+            return match ($sortBy) {
+                'product' => [$firstProduct, (string) ($row['location'] ?? ''), $row['date'] ?? '', $row['delivery_id']],
+                'delivery_date' => [$row['date'] ?? '', (string) ($row['location'] ?? ''), $row['delivery_id']],
+                default => [(string) ($row['location'] ?? 'ZZZ'), $firstProduct, $row['date'] ?? '', $row['delivery_id']],
+            };
+        })->values()->map(function (array $row, int $index): array {
+            $row['pick_sequence'] = $index + 1;
+            return $row;
+        });
+
+        $perPage = (int) ($data['per_page'] ?? 50);
+        $page = max(1, (int) $request->input('page', 1));
+        $paginator = new LengthAwarePaginator($rows->forPage($page, $perPage)->values(), $rows->count(), $perPage, $page, ['path' => LengthAwarePaginator::resolveCurrentPath()]);
+        return response()->json([
+            'data' => $paginator->getCollection(),
+            'meta' => [
+                'current_page' => $paginator->currentPage(), 'per_page' => $paginator->perPage(),
+                'total' => $paginator->total(), 'last_page' => $paginator->lastPage(),
+                'sort_by' => $sortBy, 'warehouse_id' => $data['warehouse_id'] ?? null,
+                'location_id' => $data['location_id'] ?? null,
+                'total_lines' => $rows->sum('line_count'), 'total_quantity' => (float) $rows->sum('total_quantity'),
+            ],
+        ]);
+    }
+
+    public function completePickList(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'wave_id' => ['nullable', 'integer'],
+            'deliveries' => ['required', 'array', 'min:1', 'max:100'],
+            'deliveries.*.delivery_id' => ['required', 'integer', 'distinct'],
+            'deliveries.*.confirmed_quantities' => ['nullable', 'array'],
+            'deliveries.*.confirmed_quantities.*' => ['numeric', 'min:0'],
+            'deliveries.*.scans' => ['nullable', 'array', 'min:1', 'max:500'],
+            'deliveries.*.scans.*.code' => ['required', 'string', 'max:150'],
+            'deliveries.*.scans.*.quantity' => ['required', 'numeric', 'gt:0'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse picking.');
+
+        try {
+            $operations = DB::transaction(function () use ($data, $companyId, $request): array {
+                $deliveryIds = collect($data['deliveries'])->pluck('delivery_id')->map(fn ($id): int => (int) $id)->values();
+                $wave = null;
+                if (!empty($data['wave_id'])) {
+                    $wave = PickWave::where('company_id', $companyId)->lockForUpdate()->findOrFail((int) $data['wave_id']);
+                    if (!in_array($wave->status, ['released', 'in_progress'], true)) {
+                        throw new \RuntimeException('Only released or in-progress pick waves can receive pick confirmations.');
+                    }
+                    $waveDeliveryIds = $wave->deliveries()->pluck('deliveries.id')->map(fn ($id): int => (int) $id);
+                    if ($deliveryIds->diff($waveDeliveryIds)->isNotEmpty()) {
+                        throw new \RuntimeException('Every confirmed delivery must belong to the selected pick wave.');
+                    }
+                }
+                $deliveries = Delivery::with(['lines.product.barcodes', 'operations'])
+                    ->where('company_id', $companyId)
+                    ->whereIn('id', $deliveryIds)
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->get()
+                    ->keyBy('id');
+
+                if ($deliveries->count() !== $deliveryIds->count()) {
+                    throw new \RuntimeException('One or more deliveries are not available in the current company.');
+                }
+
+                $completed = [];
+                foreach ($data['deliveries'] as $item) {
+                    $delivery = $deliveries->get((int) $item['delivery_id']);
+                    if (!empty($item['scans']) && array_key_exists('confirmed_quantities', $item)) {
+                        throw new \RuntimeException('Provide confirmed quantities or scanner codes for a delivery, not both.');
+                    }
+                    $confirmedQuantities = !empty($item['scans'])
+                        ? $this->resolveScanQuantities($delivery, $item['scans'], (int) $companyId)
+                        : ($item['confirmed_quantities'] ?? null);
+                    $operation = app(WarehouseFulfillmentService::class)->complete(
+                        $delivery,
+                        'pick',
+                        $confirmedQuantities
+                    );
+                    app(AuditService::class)->record('delivery.pick.completed', $delivery, null, [
+                        'operation_id' => $operation->id,
+                        'confirmed_quantities' => $operation->confirmed_quantities,
+                        'scans' => $item['scans'] ?? null,
+                        'batch' => true,
+                        'performed_by' => $request->user()?->id,
+                    ]);
+                    $completed[] = $operation->fresh()->load('delivery');
+                }
+
+                if ($wave && $wave->status === 'released') {
+                    $wave->update(['status' => 'in_progress']);
+                    app(AuditService::class)->record('pick_wave.started', $wave, ['status' => 'released'], ['status' => 'in_progress']);
+                }
+
+                return $completed;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+
+        return response()->json([
+            'data' => $operations,
+            'meta' => ['delivery_count' => count($operations), 'operation_type' => 'pick', 'wave_id' => $data['wave_id'] ?? null],
+            'status' => 'completed',
+        ]);
+    }
+
+    public function pickWaves(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'warehouse_id' => ['nullable', 'integer'],
+            'status' => ['nullable', 'in:planned,released,in_progress,completed,cancelled'],
+            'date' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse wave picking.');
+
+        $waves = PickWave::with(['warehouse', 'deliveries.location', 'deliveries.operations'])
+            ->where('company_id', $companyId)
+            ->when($data['warehouse_id'] ?? null, fn ($query, $id) => $query->where('warehouse_id', $id))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['date'] ?? null, fn ($query, $date) => $query->whereDate('wave_date', $date))
+            ->orderByDesc('wave_date')->orderByDesc('id')
+            ->paginate((int) ($data['per_page'] ?? 50));
+
+        return response()->json([
+            'data' => $waves->getCollection()->map(fn (PickWave $wave): array => $this->wavePayload($wave))->values(),
+            'meta' => ['current_page' => $waves->currentPage(), 'per_page' => $waves->perPage(), 'total' => $waves->total(), 'last_page' => $waves->lastPage()],
+        ]);
+    }
+
+    public function createPickWave(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'warehouse_id' => ['required', 'integer'],
+            'delivery_ids' => ['required', 'array', 'min:1', 'max:100'],
+            'delivery_ids.*' => ['required', 'integer', 'distinct'],
+            'wave_date' => ['nullable', 'date'],
+            'external_reference' => ['nullable', 'string', 'max:150'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse wave picking.');
+
+        if (!empty($data['external_reference'])) {
+            $existing = PickWave::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $this->wavePayload($existing->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'duplicate_ignored']);
+        }
+
+        try {
+            $wave = DB::transaction(function () use ($data, $companyId, $request): PickWave {
+                $warehouse = Warehouse::whereKey($data['warehouse_id'])
+                    ->whereHas('branch', fn ($query) => $query->where('company_id', $companyId))
+                    ->firstOrFail();
+                $deliveryIds = collect($data['delivery_ids'])->map(fn ($id): int => (int) $id)->values();
+                $deliveries = Delivery::with(['operations', 'location'])
+                    ->where('company_id', $companyId)
+                    ->whereIn('id', $deliveryIds)
+                    ->lockForUpdate()->get()->keyBy('id');
+                if ($deliveries->count() !== $deliveryIds->count()) throw new \RuntimeException('One or more deliveries are not available in the current company.');
+
+                foreach ($deliveries as $delivery) {
+                    if ($delivery->status !== 'pending' || !in_array($delivery->fulfillment_status ?: 'pending', ['pending'], true)) throw new \RuntimeException('Only pending deliveries can be assigned to a pick wave.');
+                    if ((int) $delivery->location?->warehouse_id !== (int) $warehouse->id) throw new \RuntimeException('Every delivery must belong to the selected warehouse.');
+                    if ($delivery->operations->firstWhere('operation_type', 'pick')?->status === 'completed') throw new \RuntimeException('A delivery with completed picking cannot be assigned to a new wave.');
+                    if ($delivery->pickWaves()->whereIn('pick_waves.status', ['planned', 'released', 'in_progress'])->exists()) throw new \RuntimeException('A delivery is already assigned to an active pick wave.');
+                }
+
+                $fallback = 'PW-'.now()->format('YmdHis').'-'.Str::upper(Str::random(5));
+                $wave = PickWave::create([
+                    'company_id' => $companyId,
+                    'warehouse_id' => $warehouse->id,
+                    'wave_no' => app(\App\Services\NumberingSequenceService::class)->nextOrFallback('pick_wave', $fallback, $companyId, $warehouse->branch_id),
+                    'external_reference' => $data['external_reference'] ?? null,
+                    'wave_date' => $data['wave_date'] ?? now()->toDateString(),
+                    'status' => 'planned',
+                    'created_by' => $request->user()?->id,
+                ]);
+                $wave->deliveries()->attach($deliveryIds->all());
+                app(AuditService::class)->record('pick_wave.created', $wave, null, ['delivery_ids' => $deliveryIds->all(), 'warehouse_id' => $warehouse->id]);
+                return $wave;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+
+        return response()->json(['data' => $this->wavePayload($wave->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'created'], 201);
+    }
+
+    public function releasePickWave(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $wave = PickWave::where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+        if ($wave->status === 'released') return response()->json(['data' => $this->wavePayload($wave->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'already_released']);
+        if ($wave->status !== 'planned') return response()->json(['message' => 'Only planned pick waves can be released.'], 422);
+        $before = $wave->only(['status', 'released_at', 'released_by']);
+        $wave->update(['status' => 'released', 'released_by' => $request->user()?->id, 'released_at' => now()]);
+        app(AuditService::class)->record('pick_wave.released', $wave, $before, $wave->fresh()->only(['status', 'released_at', 'released_by']));
+        return response()->json(['data' => $this->wavePayload($wave->fresh()->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'released']);
+    }
+
+    public function completePickWave(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $wave = PickWave::where('company_id', $companyId)->with(['deliveries.operations'])->lockForUpdate()->findOrFail($id);
+        if ($wave->status === 'completed') return response()->json(['data' => $this->wavePayload($wave->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'already_completed']);
+        if (!in_array($wave->status, ['released', 'in_progress'], true)) return response()->json(['message' => 'Only released or in-progress pick waves can be completed.'], 422);
+        if ($wave->deliveries->contains(fn (Delivery $delivery): bool => $delivery->operations->firstWhere('operation_type', 'pick')?->status !== 'completed')) return response()->json(['message' => 'Every delivery in the wave must complete picking first.'], 422);
+        $before = $wave->only(['status', 'completed_at']);
+        $wave->update(['status' => 'completed', 'completed_at' => now()]);
+        app(AuditService::class)->record('pick_wave.completed', $wave, $before, $wave->fresh()->only(['status', 'completed_at']));
+        return response()->json(['data' => $this->wavePayload($wave->fresh()->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'completed']);
+    }
+
+    public function cancelPickWave(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['cancellation_reason' => ['required', 'string', 'max:2000']]);
+        $companyId = $request->user()?->company_id;
+        $wave = PickWave::where('company_id', $companyId)->with(['deliveries.operations'])->lockForUpdate()->findOrFail($id);
+        if ($wave->status === 'cancelled') return response()->json(['data' => $this->wavePayload($wave->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'already_cancelled']);
+        if ($wave->status === 'completed') return response()->json(['message' => 'Completed pick waves cannot be cancelled.'], 422);
+        if (!in_array($wave->status, ['planned', 'released', 'in_progress'], true)) return response()->json(['message' => 'This pick wave cannot be cancelled in its current state.'], 422);
+        if ($wave->deliveries->contains(fn (Delivery $delivery): bool => $delivery->operations->firstWhere('operation_type', 'pick')?->status === 'completed')) return response()->json(['message' => 'A pick wave cannot be cancelled after picking has started.'], 422);
+        $before = $wave->only(['status', 'cancellation_reason', 'cancelled_by', 'cancelled_at']);
+        $wave->update(['status' => 'cancelled', 'cancellation_reason' => $data['cancellation_reason'], 'cancelled_by' => $request->user()?->id, 'cancelled_at' => now()]);
+        app(AuditService::class)->record('pick_wave.cancelled', $wave, $before, $wave->fresh()->only(['status', 'cancellation_reason', 'cancelled_by', 'cancelled_at']));
+        return response()->json(['data' => $this->wavePayload($wave->fresh()->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'cancelled']);
+    }
+
+    private function wavePayload(PickWave $wave): array
+    {
+        $deliveries = $wave->deliveries ?? collect();
+        return [
+            'id' => (int) $wave->id, 'wave_no' => $wave->wave_no, 'external_reference' => $wave->external_reference,
+            'warehouse_id' => (int) $wave->warehouse_id, 'warehouse' => $wave->warehouse?->name,
+            'wave_date' => optional($wave->wave_date)->toDateString(), 'status' => $wave->status,
+            'released_at' => optional($wave->released_at)->toISOString(), 'completed_at' => optional($wave->completed_at)->toISOString(),
+            'cancelled_at' => optional($wave->cancelled_at)->toISOString(), 'cancellation_reason' => $wave->cancellation_reason,
+            'delivery_count' => $deliveries->count(), 'delivery_ids' => $deliveries->pluck('id')->map(fn ($id): int => (int) $id)->values(),
+            'completed_pick_count' => $deliveries->filter(fn (Delivery $delivery): bool => $delivery->operations?->firstWhere('operation_type', 'pick')?->status === 'completed')->count(),
+        ];
+    }
+
+    private function resolveScanQuantities(Delivery $delivery, array $scans, int $companyId): array
+    {
+        $quantities = [];
+        foreach ($scans as $scan) {
+            $code = trim((string) $scan['code']);
+            $matches = $delivery->lines->filter(function ($line) use ($code): bool {
+                $product = $line->product;
+                return $product && ($product->sku === $code || $product->barcode === $code || $product->barcodes->contains('code', $code));
+            });
+            if ($matches->count() !== 1) throw new \RuntimeException('Scanner code '.$code.' is unknown or ambiguous for this company.');
+            $lineId = (string) $matches->first()->id;
+            $quantities[$lineId] = ($quantities[$lineId] ?? 0) + (float) $scan['quantity'];
+        }
+        return $quantities;
+    }
+
     public function report(Request $request): JsonResponse
     {
         $data = $request->validate(['warehouse_id' => ['nullable', 'integer'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
@@ -149,6 +463,28 @@ class WarehouseIntegrationController extends Controller
         return response()->json(['data' => $slice, 'meta' => ['current_page' => $page, 'per_page' => $perPage, 'total' => $locations->count()]]);
     }
 
+    public function putawayTasks(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'status' => ['nullable', 'in:pending,approved,rejected,in_transit,partially_received,received,cancelled'],
+            'product_id' => ['nullable', 'integer'],
+            'warehouse_id' => ['nullable', 'integer'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse put-away tasks.');
+        $tasks = $this->companyScope(InventoryTransfer::with(['creator:id,name', 'lines.product', 'lines.sourceLocation.warehouse', 'lines.destinationLocation.warehouse']), $companyId)
+            ->where('operation_type', 'putaway')
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['product_id'] ?? null, fn ($query, $productId) => $query->whereHas('lines', fn ($lineQuery) => $lineQuery->where('product_id', $productId)))
+            ->when($data['warehouse_id'] ?? null, fn ($query, $warehouseId) => $query->whereHas('lines.sourceLocation', fn ($locationQuery) => $locationQuery->where('warehouse_id', $warehouseId)))
+            ->latest('id')->paginate((int) ($data['per_page'] ?? 50));
+        return response()->json([
+            'data' => $tasks->getCollection(),
+            'meta' => ['current_page' => $tasks->currentPage(), 'per_page' => $tasks->perPage(), 'total' => $tasks->total(), 'last_page' => $tasks->lastPage()],
+        ]);
+    }
+
     public function createPutawayTask(Request $request): JsonResponse
     {
         if (!$request->user()?->tokenCan('inventory:write') && !$request->user()?->tokenCan('warehouse:write') && !$request->user()?->tokenCan('integration:write')) {
@@ -160,6 +496,9 @@ class WarehouseIntegrationController extends Controller
             'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'source_location_id' => ['required', 'integer'],
             'destination_location_id' => ['required', 'integer', 'different:source_location_id'],
+            'product_scan_code' => ['nullable', 'string', 'max:120'],
+            'source_location_code' => ['nullable', 'string', 'max:120'],
+            'destination_location_code' => ['nullable', 'string', 'max:120'],
             'quantity' => ['required', 'numeric', 'gt:0'],
             'unit_cost' => ['nullable', 'numeric', 'min:0'],
             'date' => ['nullable', 'date'],
@@ -170,20 +509,29 @@ class WarehouseIntegrationController extends Controller
             if ($existing) return response()->json(['data' => $existing->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation', 'lines.allocations.batch', 'lines.allocations.serial'), 'status' => 'duplicate_ignored']);
         }
 
-        $locations = InventoryLocation::with('warehouse')->whereIn('id', [$data['source_location_id'], $data['destination_location_id']])
+        $locations = InventoryLocation::with(['warehouse', 'barcodes'])->whereIn('id', [$data['source_location_id'], $data['destination_location_id']])
             ->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->get()->keyBy('id');
         if ($locations->count() !== 2) abort(422, 'Both locations must belong to the authenticated company.');
         $source = $locations[$data['source_location_id']];
         $destination = $locations[$data['destination_location_id']];
         $product = Product::whereKey($data['product_id'])->firstOrFail();
+        if (!empty($data['product_scan_code'])) {
+            $scanCode = trim($data['product_scan_code']);
+            $matches = $product->sku === $scanCode || $product->barcode === $scanCode || $product->barcodes()->where('code', $scanCode)->exists();
+            if (!$matches) abort(422, 'Product scan code does not match the requested product.');
+        }
+        if (!empty($data['source_location_code']) && !$this->locationScanMatches($source, $data['source_location_code'])) abort(422, 'Source location scan code does not match the requested location.');
+        if (!empty($data['destination_location_code']) && !$this->locationScanMatches($destination, $data['destination_location_code'])) abort(422, 'Destination location scan code does not match the requested location.');
         if ((int) $source->warehouse_id !== (int) $destination->warehouse_id) abort(422, 'Put-away source and destination must belong to the same warehouse.');
         if (!in_array($destination->type, ['bin', 'shelf', 'rack'], true)) abort(422, 'Put-away destination must be a rack, shelf, or bin.');
+        if (app(InventoryAvailabilityService::class)->available($product, false, (int) $source->id, $companyId) + 0.000001 < (float) $data['quantity']) abort(422, 'Put-away quantity exceeds available source stock.');
         app(InventoryLocationCapacityService::class)->assertCanReceive($destination, $product, (float) $data['quantity']);
 
         $transfer = DB::transaction(function () use ($request, $data, $companyId): InventoryTransfer {
             $transfer = InventoryTransfer::create([
                 'company_id' => $companyId,
                 'external_reference' => $data['external_reference'] ?? null,
+                'operation_type' => 'putaway',
                 'transfer_no' => app(NumberingSequenceService::class)->nextOrFallback('inventory_transfer', 'PUT-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
                 'date' => $data['date'] ?? now()->toDateString(),
                 'description' => $data['description'] ?? 'Put-away task created through warehouse integration.',
@@ -199,9 +547,18 @@ class WarehouseIntegrationController extends Controller
                 'unit_cost' => $data['unit_cost'] ?? null,
             ]);
             app(AuditService::class)->record('put_away.task_created', $transfer, null, $transfer->toArray());
+            if (!empty($data['product_scan_code']) || !empty($data['source_location_code']) || !empty($data['destination_location_code'])) {
+                app(AuditService::class)->record('put_away.scan_validated', $transfer, null, collect($data)->only(['product_scan_code', 'source_location_code', 'destination_location_code'])->all());
+            }
             return $transfer;
         });
         return response()->json(['data' => $transfer->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation', 'lines.allocations.batch', 'lines.allocations.serial'), 'status' => 'pending_approval'], 201);
+    }
+
+    private function locationScanMatches(InventoryLocation $location, string $scanCode): bool
+    {
+        $scanCode = trim($scanCode);
+        return $location->code === $scanCode || $location->barcodes->contains('code', $scanCode);
     }
 
     public function createTransfer(Request $request): JsonResponse

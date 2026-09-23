@@ -157,12 +157,17 @@ class DeliveryIntegrationTest extends TestCase
         $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-HTTP-CARRIER', 'date' => now()->toDateString(), 'status' => 'approved']);
         $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-HTTP-CARRIER', 'tracking_no' => 'TRACK-HTTP-1', 'date' => now()->toDateString(), 'status' => 'approved', 'fulfillment_status' => 'dispatched']);
         DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed', 'performed_by' => $user->id, 'completed_at' => now()]);
-        Config::set('integrations.carrier_tracking_http_endpoint', 'https://carrier.test/track/{tracking_number}');
+        Config::set('integrations.carrier_tracking_http_endpoint', null);
+        Sanctum::actingAs($user, ['sales:write', 'sales:read', 'integration:write']);
+        $configured = $this->postJson('/api/integration/carrier-tracking-providers', ['provider' => 'HTTP', 'connection_config' => ['endpoint' => 'https://carrier.test/track/{tracking_number}', 'token' => 'carrier-secret']])
+            ->assertCreated()->assertJsonPath('data.provider', 'http');
+        $this->assertArrayNotHasKey('connection_config', $configured->json('data'));
+        $this->assertNotSame('carrier-secret', (string) $this->app['db']->table('carrier_tracking_provider_settings')->where('id', $configured->json('data.id'))->value('connection_config'));
         Http::fake(['https://carrier.test/track/TRACK-HTTP-1*' => Http::response(['events' => [['status' => 'in_transit', 'occurred_at' => '2026-09-20 12:00:00', 'event_id' => 'HTTP-EVENT-1', 'location' => 'Carrier hub']]], 200)]);
-        Sanctum::actingAs($user, ['sales:write', 'sales:read']);
 
         $response = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/delivery-tracking/sync', ['provider' => 'http']);
         $response->assertOk()->assertJsonPath('status', 'synchronized')->assertJsonPath('summary.recorded', 1)->assertJsonPath('data.0.external_reference', 'HTTP-EVENT-1');
+        Http::assertSent(fn ($request): bool => $request->hasHeader('Authorization', 'Bearer carrier-secret'));
         $this->assertDatabaseHas('delivery_tracking_events', ['company_id' => $company->id, 'provider' => 'http', 'external_reference' => 'HTTP-EVENT-1']);
 
         $this->postJson('/api/integration/deliveries/'.$delivery->id.'/delivery-tracking/sync', ['provider' => 'http'])

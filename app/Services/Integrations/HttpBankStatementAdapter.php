@@ -16,12 +16,14 @@ class HttpBankStatementAdapter implements BankStatementAdapter, BankStatementPol
 
     public function fetch(int $bankAccountId, array $context = []): array
     {
-        $endpoint = (string) config('integrations.bank_statement_http_endpoint');
+        $connection = is_array($context['connection_config'] ?? null) ? $context['connection_config'] : [];
+        unset($context['connection_config']);
+        $endpoint = (string) ($connection['endpoint'] ?? config('integrations.bank_statement_http_endpoint'));
         if ($endpoint === '') throw new RuntimeException('HTTP bank statement endpoint is not configured.');
         $url = str_replace('{bank_account_id}', rawurlencode((string) $bankAccountId), $endpoint);
-        $request = Http::timeout((int) config('integrations.bank_statement_http_timeout', 30))
-            ->retry((int) config('integrations.bank_statement_http_retries', 2), (int) config('integrations.bank_statement_http_retry_sleep', 0));
-        $token = config('integrations.bank_statement_http_token');
+        $request = Http::timeout((int) ($connection['timeout'] ?? config('integrations.bank_statement_http_timeout', 30)))
+            ->retry((int) ($connection['retries'] ?? config('integrations.bank_statement_http_retries', 2)), (int) ($connection['retry_sleep'] ?? config('integrations.bank_statement_http_retry_sleep', 0)));
+        $token = $connection['token'] ?? config('integrations.bank_statement_http_token');
         if ($token) $request = $request->withToken($token);
         $response = $request->get($url, $context);
         if (!$response->successful()) throw new RuntimeException('HTTP bank statement provider returned status '.$response->status().'.');

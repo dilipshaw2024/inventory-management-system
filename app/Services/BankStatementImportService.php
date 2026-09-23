@@ -14,14 +14,14 @@ class BankStatementImportService
 {
     public function __construct(private BankStatementAdapterRegistry $adapters) {}
 
-    public function import(?int $companyId, string $provider, array $rows, ?int $userId = null): array
+    public function import(?int $companyId, string $provider, array $rows, ?int $userId = null, string $source = 'api'): array
     {
         $provider = strtolower(trim($provider ?: 'generic'));
         $adapter = $this->adapters->resolve($provider);
 
-        return DB::transaction(function () use ($companyId, $provider, $adapter, $rows, $userId): array {
+        return DB::transaction(function () use ($companyId, $provider, $adapter, $rows, $userId, $source): array {
             $batch = BankStatementImportBatch::create([
-                'company_id' => $companyId, 'provider' => $provider, 'source' => 'api', 'imported_by' => $userId,
+                'company_id' => $companyId, 'provider' => $provider, 'source' => $source, 'imported_by' => $userId,
                 'total_lines' => count($rows), 'started_at' => now(), 'status' => 'completed',
             ]);
             $results = [];

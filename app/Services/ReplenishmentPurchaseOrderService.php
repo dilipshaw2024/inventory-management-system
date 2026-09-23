@@ -63,6 +63,7 @@ class ReplenishmentPurchaseOrderService
                 ->whereHas('purchaseOrder', fn ($query) => $query
                     ->where('company_id', $companyId)
                     ->whereIn('status', ['draft', 'submitted', 'approved', 'partially_received']))
+                ->when($locationId !== null, fn ($query) => $query->where(fn ($locationQuery) => $locationQuery->whereNull('location_id')->orWhere('location_id', $locationId)))
                 ->lockForUpdate()
                 ->get()
                 ->sum(fn (PurchaseOrderLine $line): float => max(0, (float) $line->ordered_qty - (float) $line->received_qty));

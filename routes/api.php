@@ -22,6 +22,10 @@ Route::middleware(['auth:sanctum', 'throttle:api', 'abilities:integration:read']
     ->get('/integration/providers', [\App\Http\Controllers\Api\IntegrationProviderController::class, 'index']);
 
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group(function (): void {
+    Route::get('/bank-accounts', [\App\Http\Controllers\Api\BankReconciliationController::class, 'bankAccounts'])->middleware('abilities:accounting:read');
+    Route::post('/bank-accounts', [\App\Http\Controllers\Api\BankReconciliationController::class, 'storeBankAccount'])->middleware('abilities:accounting:write');
+    Route::patch('/bank-accounts/{id}', [\App\Http\Controllers\Api\BankReconciliationController::class, 'updateBankAccount'])->middleware('abilities:accounting:write');
+    Route::post('/bank-accounts/{id}/deactivate', [\App\Http\Controllers\Api\BankReconciliationController::class, 'deactivateBankAccount'])->middleware('abilities:accounting:write');
     Route::post('/supplier-payments', [\App\Http\Controllers\Api\SupplierPaymentAllocationController::class, 'storePayment'])->middleware('abilities:accounting:write');
     Route::post('/supplier-payments/{id}/approve', [\App\Http\Controllers\Api\SupplierPaymentAllocationController::class, 'approvePayment'])->middleware('abilities:accounting:write');
     Route::post('/supplier-payments/{id}/reject', [\App\Http\Controllers\Api\SupplierPaymentAllocationController::class, 'rejectPayment'])->middleware('abilities:accounting:write');
@@ -70,6 +74,10 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
     Route::post('/supplier-payments/{id}/reverse', [\App\Http\Controllers\Api\PaymentReversalController::class, 'supplier'])->middleware('abilities:accounting:write');
     Route::get('/accounts', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'accounts'])->middleware('abilities:accounting:read');
     Route::get('/e-invoices', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'eInvoices'])->middleware('abilities:accounting:read');
+    Route::get('/e-invoice-providers', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'eInvoiceProviders'])->middleware('abilities:accounting:read');
+    Route::post('/e-invoice-providers', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'storeEInvoiceProvider'])->middleware('ability:accounting:write,integration:write');
+    Route::patch('/e-invoice-providers/{id}', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'updateEInvoiceProvider'])->middleware('ability:accounting:write,integration:write');
+    Route::post('/e-invoice-providers/{id}/deactivate', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'deactivateEInvoiceProvider'])->middleware('ability:accounting:write,integration:write');
     Route::post('/invoices/{id}/e-invoice', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'prepareEInvoice'])->middleware('abilities:accounting:write');
     Route::post('/e-invoices/{id}/submit', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'submitEInvoice'])->middleware('abilities:accounting:write');
     Route::post('/accounts', [\App\Http\Controllers\Api\AccountingIntegrationController::class, 'storeAccount'])->middleware('ability:accounting:write,integration:write');
@@ -90,12 +98,18 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
     Route::get('/cash-flow', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'cashFlow'])->middleware('abilities:accounting:read');
     Route::get('/tax-reconciliation', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxReconciliation'])->middleware('abilities:accounting:read');
     Route::get('/tax-filings', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxFilings'])->middleware('abilities:accounting:read');
+    Route::get('/tax-filing-providers', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxFilingProviders'])->middleware('abilities:accounting:read');
+    Route::post('/tax-filing-providers', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'storeTaxFilingProvider'])->middleware('ability:accounting:write,integration:write');
+    Route::patch('/tax-filing-providers/{id}', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'updateTaxFilingProvider'])->middleware('ability:accounting:write,integration:write');
+    Route::post('/tax-filing-providers/{id}/deactivate', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'deactivateTaxFilingProvider'])->middleware('ability:accounting:write,integration:write');
     Route::post('/tax-filings', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'storeTaxFiling'])->middleware('abilities:accounting:write');
     Route::get('/tax-filings/{id}/verify', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'verifyTaxFiling'])->middleware('abilities:accounting:read');
     Route::get('/tax-filings/{id}/export', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'exportTaxFiling'])->middleware('abilities:accounting:read');
     Route::post('/tax-filings/{id}/submit', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'submitTaxFiling'])->middleware('abilities:accounting:write');
     Route::post('/tax-filings/{id}/decision', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'decideTaxFiling'])->middleware('abilities:accounting:write');
+    Route::get('/tax-settlements', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxSettlements'])->middleware('abilities:accounting:read');
     Route::post('/tax-settlements', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'settleTax'])->middleware('abilities:accounting:write');
+    Route::post('/tax-settlements/{id}/reverse', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'reverseTaxSettlement'])->middleware('abilities:accounting:write');
     Route::post('/tax-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'storeTaxRate'])->middleware('ability:accounting:write,integration:write');
     Route::patch('/tax-rates/{id}', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'updateTaxRate'])->middleware('ability:accounting:write,integration:write');
     Route::get('/fiscal-years', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'fiscalYears'])->middleware('abilities:accounting:read');
@@ -124,6 +138,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
 
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(function (): void {
     Route::get('/products', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'products'])->middleware('abilities:inventory:read');
+    Route::get('/products/{id}/costing-policies', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'costingPolicies'])->middleware('abilities:inventory:read');
     Route::get('/product-import-jobs', [\App\Http\Controllers\Api\ProductImportJobIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
     Route::post('/product-import-jobs', [\App\Http\Controllers\Api\ProductImportJobIntegrationController::class, 'store'])->middleware('ability:inventory:write,integration:write');
     Route::get('/product-import-jobs/{id}', [\App\Http\Controllers\Api\ProductImportJobIntegrationController::class, 'show'])->middleware('abilities:inventory:read');
@@ -302,6 +317,10 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::get('/deliveries/{deliveryId}/packages', [\App\Http\Controllers\Api\DeliveryPackageIntegrationController::class, 'index'])->middleware('abilities:sales:read');
     Route::post('/deliveries/{deliveryId}/packages', [\App\Http\Controllers\Api\DeliveryPackageIntegrationController::class, 'store'])->middleware('abilities:sales:write');
     Route::get('/delivery-tracking-events', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'index'])->middleware('abilities:sales:read');
+    Route::get('/carrier-tracking-providers', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'carrierTrackingProviders'])->middleware('abilities:sales:read');
+    Route::post('/carrier-tracking-providers', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'storeCarrierTrackingProvider'])->middleware('ability:sales:write,integration:write');
+    Route::patch('/carrier-tracking-providers/{id}', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'updateCarrierTrackingProvider'])->middleware('ability:sales:write,integration:write');
+    Route::post('/carrier-tracking-providers/{id}/deactivate', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'deactivateCarrierTrackingProvider'])->middleware('ability:sales:write,integration:write');
     Route::get('/delivery-tracking-summary', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'slaSummary'])->middleware('abilities:sales:read');
     Route::post('/delivery-tracking-events', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'store'])->middleware('abilities:sales:write');
     Route::get('/reservations/allocation-plan', [\App\Http\Controllers\Api\StockReservationController::class, 'allocationPlan'])->middleware('abilities:inventory:read');
@@ -376,6 +395,9 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::get('/organization/branches', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'branches'])->middleware('abilities:integration:read');
     Route::get('/organization/warehouses', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'warehouses'])->middleware('abilities:integration:read');
     Route::get('/organization/locations', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'locations'])->middleware('abilities:integration:read');
+    Route::get('/organization/locations/{id}/barcodes', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'locationBarcodes'])->middleware('abilities:integration:read');
+    Route::post('/organization/locations/{id}/barcodes', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'storeLocationBarcode'])->middleware('abilities:integration:write');
+    Route::post('/organization/location-barcodes/{id}/deactivate', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'deactivateLocationBarcode'])->middleware('abilities:integration:write');
     Route::post('/organization/location-rules', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'storeLocationRule'])->middleware('ability:inventory:write,integration:write');
     Route::post('/organization/location-rules/{id}/deactivate', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'deactivateLocationRule'])->middleware('ability:inventory:write,integration:write');
     Route::get('/organization/stores', [\App\Http\Controllers\Api\OrganizationIntegrationController::class, 'stores'])->middleware('abilities:integration:read');
@@ -418,6 +440,14 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::post('/security/approval-policies/{id}/deactivate', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'deactivateApprovalPolicy'])->middleware('abilities:integration:write');
     Route::get('/security/audit-logs', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'auditLogs'])->middleware('abilities:integration:read');
     Route::get('/warehouse/putaway/locations', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'putawayLocations'])->middleware('abilities:warehouse:read');
+    Route::get('/warehouse/putaway/tasks', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'putawayTasks'])->middleware('abilities:warehouse:read');
+    Route::get('/warehouse/pick-list', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'pickList'])->middleware('abilities:warehouse:read');
+    Route::post('/warehouse/pick-list/complete', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'completePickList'])->middleware('abilities:warehouse:write');
+    Route::get('/warehouse/pick-waves', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'pickWaves'])->middleware('abilities:warehouse:read');
+    Route::post('/warehouse/pick-waves', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'createPickWave'])->middleware('abilities:warehouse:write');
+    Route::post('/warehouse/pick-waves/{id}/release', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'releasePickWave'])->middleware('abilities:warehouse:write');
+    Route::post('/warehouse/pick-waves/{id}/complete', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'completePickWave'])->middleware('abilities:warehouse:write');
+    Route::post('/warehouse/pick-waves/{id}/cancel', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'cancelPickWave'])->middleware('abilities:warehouse:write');
     Route::get('/warehouse/report', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'report'])->middleware('abilities:warehouse:read');
     Route::get('/warehouse/location-utilization', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'locationUtilization'])->middleware('abilities:warehouse:read');
     Route::post('/warehouse/putaway/tasks', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'createPutawayTask'])->middleware('ability:inventory:write,integration:write');

@@ -3,13 +3,17 @@
 namespace Tests\Feature;
 
 use App\Models\Category;
+use App\Models\Branch;
 use App\Models\Company;
+use App\Models\InventoryLocation;
 use App\Models\Product;
+use App\Models\ProductBarcode;
 use App\Models\PurchaseInvoice;
 use App\Models\PurchaseOrder;
 use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\User;
+use App\Models\Warehouse;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -58,6 +62,40 @@ class ProcurementDocumentIdempotencyTest extends TestCase
         ]]]);
         $replayed->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $created->json('data.id'));
         $this->assertSame(1, \App\Models\GoodsReceipt::where('company_id', $company->id)->count());
+    }
+
+    public function test_goods_receipt_scanner_validation_rejects_mismatch_and_accepts_product_code(): void
+    {
+        [$company, $user, $supplier, $product, $order] = $this->purchaseFixture('RECEIVING-SCAN');
+        $product->update(['sku' => 'RECEIVE-SCAN-1']);
+        ProductBarcode::create(['product_id' => $product->id, 'code' => 'QR-RECEIVE-1', 'type' => 'qrcode']);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Receiving Scan Branch', 'code' => 'RECEIVE-SCAN-BRANCH']);
+        $warehouse = Warehouse::create(['branch_id' => $branch->id, 'name' => 'Receiving Scan Warehouse', 'code' => 'RECEIVE-SCAN-WH']);
+        $location = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Receiving Scan Bin', 'code' => 'RECEIVE-SCAN-BIN', 'type' => 'bin', 'is_active' => true]);
+        $orderLine = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 3, 'received_qty' => 0, 'unit_price' => 7]);
+        Sanctum::actingAs($user, ['purchasing:write', 'integration:write']);
+        $this->postJson('/api/integration/organization/locations/'.$location->id.'/barcodes', [
+            'code' => 'QR-RECEIVE-BIN-1', 'type' => 'qrcode', 'is_primary' => true,
+        ])->assertCreated()->assertJsonPath('data.code', 'QR-RECEIVE-BIN-1');
+        $payload = [
+            'external_reference' => 'GRN-SCAN-1', 'purchase_order_id' => $order->id, 'date' => '2026-09-20',
+            'location_scan_code' => 'QR-RECEIVE-BIN-1',
+            'lines' => [[
+                'purchase_order_line_id' => $orderLine->id, 'quantity' => 2, 'unit_cost' => 7,
+                'product_scan_code' => 'WRONG-RECEIVE-SCAN',
+            ]],
+        ];
+
+        $this->postJson('/api/integration/goods-receipts', $payload)
+            ->assertStatus(422)
+            ->assertJsonPath('message', 'The scanned product does not match '.$product->name.'.');
+        $this->assertSame(0, \App\Models\GoodsReceipt::where('company_id', $company->id)->count());
+
+        $payload['external_reference'] = 'GRN-SCAN-2';
+        $payload['lines'][0]['product_scan_code'] = 'QR-RECEIVE-1';
+        $created = $this->postJson('/api/integration/goods-receipts', $payload);
+        $created->assertCreated()->assertJsonPath('status', 'pending_approval');
+        $this->assertDatabaseHas('audit_logs', ['action' => 'goods_receipt.created', 'auditable_id' => $created->json('data.id')]);
     }
 
     /** @return array{0: Company, 1: User, 2: Supplier, 3: Product, 4: PurchaseOrder} */

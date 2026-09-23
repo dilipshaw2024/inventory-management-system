@@ -25,12 +25,12 @@ class StockCountIntegrationTest extends TestCase
         $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Count Supplier', 'is_active' => true]);
         $unit = Unit::create(['company_id' => $company->id, 'name' => 'Each', 'code' => 'EA-COUNT', 'dimension' => 'unit', 'status' => 1]);
         $category = Category::create(['company_id' => $company->id, 'name' => 'Count Category', 'status' => 1]);
-        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Count item', 'quantity' => 10, 'purchase_price' => 4, 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Count item', 'sku' => 'COUNT-SCAN-1', 'quantity' => 10, 'purchase_price' => 4, 'status' => 1]);
 
         Sanctum::actingAs($creator, ['inventory:write', 'inventory:read']);
         $created = $this->postJson('/api/inventory/counts', [
             'count_no' => 'CNT-API-1', 'external_reference' => 'wms-count-1001', 'count_date' => '2026-09-17', 'description' => 'Cycle count',
-            'lines' => [['product_id' => $product->id, 'counted_quantity' => 7]],
+            'lines' => [['product_id' => $product->id, 'product_scan_code' => 'COUNT-SCAN-1', 'counted_quantity' => 7]],
         ]);
         $created->assertCreated()->assertJsonPath('status', 'pending_approval')->assertJsonPath('data.lines.0.system_quantity', '10.000000');
         $countId = $created->json('data.id');

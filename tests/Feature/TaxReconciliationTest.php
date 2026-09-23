@@ -15,6 +15,7 @@ use App\Models\Category;
 use App\Models\User;
 use Laravel\Sanctum\Sanctum;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
 class TaxReconciliationTest extends TestCase
@@ -57,6 +58,34 @@ class TaxReconciliationTest extends TestCase
         $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $journalId, 'account_id' => $taxAccount->id, 'debit' => 10]);
         $this->postJson('/api/accounting/tax-settlements', ['from' => '2026-09-01', 'to' => '2026-09-30', 'paid_at' => '2026-10-01', 'payment_reference' => 'REPLAY'])
             ->assertOk()->assertJsonPath('data.journal_entry_id', $journalId)->assertJsonPath('data.payment_reference', 'TAX-BANK-1');
+        $reversed = $this->postJson('/api/accounting/tax-settlements/'.$settled->json('data.id').'/reverse', ['reason' => 'Corrected remittance period'])
+            ->assertOk()->assertJsonPath('status', 'reversed')->assertJsonPath('data.status', 'reversed');
+        $reversalJournalId = $reversed->json('data.reversal_journal_entry_id');
+        $this->assertNotNull($reversalJournalId);
+        $this->assertDatabaseHas('journal_entries', ['id' => $journalId, 'status' => 'reversed']);
+        $this->assertDatabaseHas('journal_entries', ['id' => $reversalJournalId, 'reversal_of_id' => $journalId, 'status' => 'posted']);
+        $this->postJson('/api/accounting/tax-settlements/'.$settled->json('data.id').'/reverse', ['reason' => 'Duplicate reversal'])
+            ->assertStatus(422);
+        $this->postJson('/api/accounting/tax-settlements', [
+            'from' => '2026-09-01', 'to' => '2026-09-30', 'paid_at' => '2026-10-02',
+            'payment_reference' => 'TAX-BANK-CORRECTION', 'external_reference' => 'TAX-CORRECTION-1',
+        ])->assertCreated()->assertJsonPath('status', 'posted')->assertJsonPath('data.settlement_no', 'TAX-SET-2026-09-01-2026-09-30-R2');
+        $this->postJson('/api/accounting/tax-settlements', [
+            'from' => '2026-09-01', 'to' => '2026-09-30', 'paid_at' => '2026-10-03',
+            'payment_reference' => 'REPLAY-CORRECTION', 'external_reference' => 'TAX-CORRECTION-1',
+        ])->assertOk()->assertJsonPath('data.payment_reference', 'TAX-BANK-CORRECTION');
+        $this->postJson('/api/accounting/tax-settlements', [
+            'from' => '2026-09-01', 'to' => '2026-09-30', 'paid_at' => '2026-10-04',
+        ])->assertStatus(422);
+        $this->getJson('/api/accounting/tax-settlements?status=reversed&cursor_mode=1&per_page=1')
+            ->assertOk()->assertJsonPath('meta.feed', 'accounting.tax-settlements')->assertJsonPath('data.0.id', $settled->json('data.id'))
+            ->assertJsonPath('data.0.reversal_journal_entry_id', $reversalJournalId);
+        $this->getJson('/api/accounting/tax-settlements?status=posted&jurisdiction=IN')
+            ->assertOk()->assertJsonPath('data', []);
+        $this->getJson('/api/accounting/journals?include_reversed=1&cursor_mode=1')
+            ->assertOk()->assertJsonPath('meta.feed', 'accounting.journals')
+            ->assertJsonFragment(['id' => $journalId, 'status' => 'reversed'])
+            ->assertJsonFragment(['id' => $reversalJournalId, 'status' => 'posted']);
 
         $filing = $this->postJson('/api/accounting/tax-filings', ['from' => '2026-09-01', 'to' => '2026-09-30', 'jurisdiction' => 'IN', 'external_reference' => 'GST-SEP-2026'])
             ->assertCreated()->assertJsonPath('status', 'draft')->assertJsonPath('data.net_tax', '10.000000')->assertJsonPath('data.return_type', 'indirect_tax');
@@ -72,5 +101,42 @@ class TaxReconciliationTest extends TestCase
             ->assertOk()->assertJsonPath('data.status', 'accepted');
         $this->postJson('/api/accounting/tax-filings', ['from' => '2026-09-01', 'to' => '2026-09-30', 'jurisdiction' => 'IN', 'external_reference' => 'GST-SEP-2026'])
             ->assertOk()->assertJsonPath('status', 'existing')->assertJsonPath('data.id', $filingId);
+    }
+
+    public function test_tax_filing_provider_settings_are_encrypted_and_gateway_submission_is_idempotency_bound(): void
+    {
+        $company = Company::create(['name' => 'Tax Gateway Co', 'code' => 'TAX-GATEWAY']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['accounting:read', 'accounting:write', 'integration:write']);
+        $configured = $this->postJson('/api/accounting/tax-filing-providers', ['provider' => 'HTTP', 'connection_config' => ['endpoint' => 'https://filing-gateway.example.test/submit', 'token' => 'filing-secret']])
+            ->assertCreated()->assertJsonPath('data.provider', 'http');
+        $this->assertArrayNotHasKey('connection_config', $configured->json('data'));
+        $settingId = $configured->json('data.id');
+        $this->assertNotSame('filing-secret', (string) $this->app['db']->table('tax_filing_provider_settings')->where('id', $settingId)->value('connection_config'));
+        $filing = $this->postJson('/api/accounting/tax-filings', ['from' => '2026-09-01', 'to' => '2026-09-30', 'jurisdiction' => 'IN', 'external_reference' => 'TAX-GATEWAY-SEP'])->assertCreated();
+        Http::fake(['https://filing-gateway.example.test/*' => Http::sequence()
+            ->push(['status' => 'accepted', 'reference' => 'GATEWAY-FILING-1'], 200)
+            ->push(['message' => 'gateway unavailable'], 503)
+            ->push(['message' => 'gateway unavailable'], 503)
+            ->push(['message' => 'gateway unavailable'], 503)
+            ->push(['status' => 'accepted', 'reference' => 'GATEWAY-FILING-RETRY'], 200)]);
+        $this->postJson('/api/accounting/tax-filings/'.$filing->json('data.id').'/submit', ['provider' => 'http'])
+            ->assertOk()->assertJsonPath('status', 'accepted')->assertJsonPath('data.status', 'accepted')->assertJsonPath('data.filing_reference', 'GATEWAY-FILING-1')->assertJsonPath('data.submission_provider', 'http');
+        $this->postJson('/api/accounting/tax-filings/'.$filing->json('data.id').'/submit', ['provider' => 'http'])->assertStatus(422);
+        Http::assertSentCount(1);
+        Http::assertSent(fn ($request): bool => $request->hasHeader('Authorization', 'Bearer filing-secret') && $request->hasHeader('Idempotency-Key', 'ERP-TAX-FILING-'.$filing->json('data.id')));
+        $this->getJson('/api/accounting/tax-filing-providers')->assertOk()->assertJsonPath('data.0.id', $settingId);
+        $this->postJson('/api/accounting/tax-filing-providers/'.$settingId.'/deactivate')->assertOk()->assertJsonPath('data.is_active', false);
+
+        $this->postJson('/api/accounting/tax-filing-providers', ['provider' => 'http', 'connection_config' => ['endpoint' => 'https://filing-gateway.example.test/submit', 'token' => 'filing-secret']])->assertCreated();
+        $retryableFiling = $this->postJson('/api/accounting/tax-filings', ['from' => '2026-10-01', 'to' => '2026-10-31', 'jurisdiction' => 'IN', 'external_reference' => 'TAX-GATEWAY-OCT'])->assertCreated();
+        $this->postJson('/api/accounting/tax-filings/'.$retryableFiling->json('data.id').'/submit', ['provider' => 'http'])->assertStatus(422);
+        $this->assertStringContainsString('503', (string) $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('provider_error'));
+        $this->assertSame('draft', $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('status'));
+        $this->getJson('/api/accounting/tax-filings?status=draft&submission_provider=http&has_provider_error=1')->assertOk()->assertJsonFragment(['id' => $retryableFiling->json('data.id')]);
+        $this->artisan('erp:accounting:retry-tax-filings', ['--company' => $company->id])->assertExitCode(0);
+        $this->assertSame('accepted', $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('status'));
+        $this->assertSame('GATEWAY-FILING-RETRY', $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('filing_reference'));
+        $this->getJson('/api/accounting/tax-filings?status=draft&has_provider_error=1')->assertOk()->assertJsonPath('data', []);
     }
 }

@@ -39,6 +39,7 @@ class TransferReplenishmentTest extends TestCase
             'unit_id' => $unit->id,
             'category_id' => $category->id,
             'name' => 'Transfer item',
+            'sku' => 'TRANSFER-ITEM-1',
             'status' => 1,
             'is_stock_item' => true,
         ]);
@@ -71,7 +72,7 @@ class TransferReplenishmentTest extends TestCase
             'posted_at' => now(),
         ]);
 
-        Sanctum::actingAs($user, ['inventory:read', 'inventory:write']);
+        Sanctum::actingAs($user, ['inventory:read', 'inventory:write', 'warehouse:read']);
         $response = $this->getJson('/api/inventory/replenishment/transfer-suggestions?product_id='.$product->id);
 
         $response->assertOk()
@@ -141,14 +142,29 @@ class TransferReplenishmentTest extends TestCase
         ]);
         $warehouseTransferReplay->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $warehouseTransfer->json('data.id'));
 
+        $this->postJson('/api/integration/warehouse/putaway/tasks', [
+            'external_reference' => 'PUTAWAY-SCAN-MISMATCH',
+            'product_id' => $product->id,
+            'source_location_id' => $source->id,
+            'destination_location_id' => $destination->id,
+            'product_scan_code' => 'WRONG-SCAN',
+            'quantity' => 1,
+        ])->assertStatus(422);
         $putaway = $this->postJson('/api/integration/warehouse/putaway/tasks', [
             'external_reference' => 'PUTAWAY-1',
             'product_id' => $product->id,
             'source_location_id' => $source->id,
             'destination_location_id' => $destination->id,
+            'product_scan_code' => 'TRANSFER-ITEM-1',
+            'source_location_code' => 'SOURCE-BIN',
+            'destination_location_code' => 'DESTINATION-BIN',
             'quantity' => 1,
         ]);
         $putaway->assertCreated()->assertJsonPath('status', 'pending_approval');
+        $this->getJson('/api/integration/warehouse/putaway/tasks?status=pending&warehouse_id='.$warehouse->id)
+            ->assertOk()->assertJsonPath('meta.total', 1)
+            ->assertJsonPath('data.0.id', $putaway->json('data.id'))
+            ->assertJsonPath('data.0.operation_type', 'putaway');
         $putawayReplay = $this->postJson('/api/integration/warehouse/putaway/tasks', [
             'external_reference' => 'PUTAWAY-1',
             'product_id' => $product->id,

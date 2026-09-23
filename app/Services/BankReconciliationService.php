@@ -36,6 +36,25 @@ class BankReconciliationService
         return $rows->sortBy(fn (array $row): array => [abs(Carbon::parse($row['date'])->diffInDays($line->transaction_date)), $row['target_id']])->take(20)->values()->all();
     }
 
+    /**
+     * Automatically match only a single exact-amount candidate on the same
+     * or an adjacent business date. Ambiguous or distant candidates remain
+     * available for human review.
+     */
+    public function autoMatch(BankStatementLine $line): ?array
+    {
+        if ($line->status !== 'unmatched') return null;
+
+        $candidates = collect($this->suggestions($line))->filter(function (array $candidate) use ($line): bool {
+            return abs(Carbon::parse($candidate['date'])->diffInDays(Carbon::parse($line->transaction_date), false)) <= 1;
+        })->values();
+        if ($candidates->count() !== 1) return null;
+
+        $candidate = $candidates->first();
+        $target = $this->match($line, (string) $candidate['target_type'], (int) $candidate['target_id']);
+        return ['candidate' => $candidate, 'target' => $target, 'line' => $line->fresh()];
+    }
+
     public function match(BankStatementLine $line, string $type, int $id): Model
     {
         return DB::transaction(function () use ($line, $type, $id): Model {

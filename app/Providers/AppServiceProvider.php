@@ -7,6 +7,7 @@ use App\Services\Integrations\BankStatementAdapterRegistry;
 use App\Services\Integrations\EInvoiceProviderRegistry;
 use App\Services\Integrations\HttpCarrierTrackingAdapter;
 use App\Services\Integrations\HttpBankStatementAdapter;
+use App\Services\Integrations\HttpEInvoiceProvider;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -36,6 +37,7 @@ class AppServiceProvider extends ServiceProvider
         });
         $this->app->singleton(EInvoiceProviderRegistry::class, function ($app): EInvoiceProviderRegistry {
             $registry = new EInvoiceProviderRegistry();
+            $registry->register($app->make(HttpEInvoiceProvider::class));
             foreach ((array) config('integrations.e_invoice_adapters', []) as $providerClass) {
                 $registry->register($app->make($providerClass));
             }

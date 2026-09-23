@@ -4,6 +4,9 @@ namespace Tests\Feature;
 
 use App\Models\Category;
 use App\Models\Company;
+use App\Models\CostCenter;
+use App\Models\Department;
+use App\Models\InventoryMovement;
 use App\Models\InventoryCostLayer;
 use App\Models\Product;
 use App\Models\Supplier;
@@ -75,5 +78,27 @@ class InventoryRevaluationPreviewTest extends TestCase
         $this->postJson('/api/inventory/valuation/revaluations/'.$runId.'/reverse', ['reversal_reason' => 'Correction required'])->assertOk()->assertJsonPath('status', 'reversed');
         $this->assertDatabaseHas('inventory_cost_revaluation_runs', ['id' => $runId, 'status' => 'reversed', 'reversal_reason' => 'Correction required']);
         $this->assertDatabaseHas('inventory_cost_layers', ['id' => $layer->id, 'unit_cost' => 7]);
+    }
+
+    public function test_valuation_can_filter_layers_by_tenant_financial_dimensions(): void
+    {
+        $company = Company::create(['name' => 'Valuation Dimensions Co', 'code' => 'VAL-DIM-TEST']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Valuation Dimensions Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Valuation Dimensions Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Valuation Dimensions Category', 'status' => 1]);
+        $department = Department::create(['company_id' => $company->id, 'code' => 'DEPT-VAL-DIM', 'name' => 'Operations']);
+        $costCenter = CostCenter::create(['company_id' => $company->id, 'code' => 'CC-VAL-DIM', 'name' => 'Valuation Operations', 'is_active' => true]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Dimension item', 'sku' => 'VAL-DIM-ITEM', 'status' => 1]);
+        $movement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 4, 'unit_cost' => 12, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'posted_at' => now()->subDay()]);
+        $layer = InventoryCostLayer::create(['product_id' => $product->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'original_quantity' => 4, 'remaining_quantity' => 4, 'unit_cost' => 12, 'received_at' => now()->subDay(), 'source_type' => $movement->getMorphClass(), 'source_id' => $movement->id]);
+
+        Sanctum::actingAs($user, ['inventory:read']);
+        $response = $this->getJson('/api/inventory/valuation?department_id='.$department->id.'&cost_center_id='.$costCenter->id);
+        $response->assertOk()->assertJsonPath('data.0.id', $product->id);
+        $this->assertSame(48.0, (float) $response->json('data.0.ledger_value'));
+        $this->assertSame(4.0, (float) $response->json('data.0.valuation_quantity'));
+        $this->getJson('/api/inventory/valuation?department_id=999999')->assertStatus(422);
+        $this->assertDatabaseHas('inventory_cost_layers', ['id' => $layer->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id]);
     }
 }

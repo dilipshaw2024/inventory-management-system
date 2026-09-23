@@ -30,6 +30,62 @@ class BankReconciliationController extends Controller
         return response()->json($lines);
     }
 
+    public function bankAccounts(Request $request): JsonResponse
+    {
+        $accounts = $this->companyScope(BankAccount::with('glAccount'), $request->user()?->company_id)
+            ->when($request->filled('provider'), fn ($query) => $query->where('provider', strtolower(trim((string) $request->input('provider')))))
+            ->when($request->has('is_active'), fn ($query) => $query->where('is_active', $request->boolean('is_active')))
+            ->orderBy('name')->orderBy('id')->paginate(min(100, max(1, (int) $request->input('per_page', 50))));
+        return response()->json($accounts);
+    }
+
+    public function storeBankAccount(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:150'], 'account_no' => ['nullable', 'string', 'max:80'],
+            'currency_code' => ['required', 'string', 'size:3'], 'gl_account_id' => ['nullable', 'integer', Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'provider' => ['nullable', 'string', 'max:50'], 'connection_config' => ['nullable', 'array'],
+        ]);
+        $provider = strtolower(trim($data['provider'] ?? 'generic'));
+        if (!in_array($provider, ['generic', 'http'], true)) abort(422, 'Unsupported bank statement provider.');
+        $data['provider'] = $provider;
+        $data['currency_code'] = strtoupper($data['currency_code']);
+        $account = BankAccount::create($data + ['company_id' => $companyId, 'is_active' => true]);
+        app(AuditService::class)->record('bank_account.created', $account, null, $account->toArray());
+        return response()->json(['data' => $account->load('glAccount'), 'status' => 'created'], 201);
+    }
+
+    public function updateBankAccount(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $account = BankAccount::where('company_id', $companyId)->findOrFail($id);
+        $data = $request->validate([
+            'name' => ['sometimes', 'required', 'string', 'max:150'], 'account_no' => ['nullable', 'string', 'max:80'],
+            'currency_code' => ['sometimes', 'required', 'string', 'size:3'], 'gl_account_id' => ['nullable', 'integer', Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'provider' => ['sometimes', 'required', 'string', 'max:50'], 'connection_config' => ['sometimes', 'nullable', 'array'], 'is_active' => ['sometimes', 'boolean'],
+        ]);
+        if (array_key_exists('provider', $data)) {
+            $data['provider'] = strtolower(trim($data['provider']));
+            if (!in_array($data['provider'], ['generic', 'http'], true)) abort(422, 'Unsupported bank statement provider.');
+        }
+        if (array_key_exists('currency_code', $data)) $data['currency_code'] = strtoupper($data['currency_code']);
+        $before = $account->only(array_keys($data));
+        $account->update($data);
+        app(AuditService::class)->record('bank_account.updated', $account, $before, $account->fresh()->only(array_keys($data)));
+        return response()->json(['data' => $account->fresh('glAccount'), 'status' => 'updated']);
+    }
+
+    public function deactivateBankAccount(Request $request, int $id): JsonResponse
+    {
+        $account = BankAccount::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        if ($account->is_active) {
+            $account->update(['is_active' => false]);
+            app(AuditService::class)->record('bank_account.deactivated', $account, ['is_active' => true], ['is_active' => false]);
+        }
+        return response()->json(['data' => $account->fresh(), 'status' => 'deactivated']);
+    }
+
     public function reconciliations(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -166,11 +222,15 @@ class BankReconciliationController extends Controller
             'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'],
         ]);
         try {
+            $account = $this->companyScope(BankAccount::query(), $companyId)->findOrFail($data['bank_account_id']);
+            if (!$account->is_active) throw new \RuntimeException('The bank account is inactive.');
             $adapter = $this->bankAdapters->resolve($data['provider']);
             if (!$adapter instanceof BankStatementPoller) throw new \RuntimeException('The selected bank provider does not support polling.');
-            $lines = $adapter->fetch((int) $data['bank_account_id'], array_filter(['from' => $data['from'] ?? null, 'to' => $data['to'] ?? null]));
+            $lines = $adapter->fetch((int) $data['bank_account_id'], array_filter(['from' => $data['from'] ?? null, 'to' => $data['to'] ?? null, 'connection_config' => $account->connection_config]));
             $import = app(BankStatementImportService::class)->import($companyId, $data['provider'], $lines, $request->user()?->id);
+            $account->update(['last_synced_at' => now(), 'last_sync_status' => 'success', 'last_sync_error' => null]);
         } catch (\InvalidArgumentException|\RuntimeException $exception) {
+            if (isset($account)) $account->update(['last_synced_at' => now(), 'last_sync_status' => 'failed', 'last_sync_error' => $exception->getMessage()]);
             return response()->json(['message' => $exception->getMessage()], 422);
         }
         return response()->json(['batch_id' => $import['batch']->id, 'created' => collect($import['results'])->where('idempotent', false)->count(), 'duplicates' => collect($import['results'])->where('idempotent', true)->count(), 'data' => collect($import['results'])->map(fn (array $result) => $result['data'])->values()], 201);

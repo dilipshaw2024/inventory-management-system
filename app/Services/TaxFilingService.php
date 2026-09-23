@@ -47,12 +47,36 @@ class TaxFilingService
         return $value;
     }
 
-    public function submit(TaxFiling $filing, string $reference): TaxFiling
+    public function submit(TaxFiling $filing, ?string $reference = null, ?string $provider = null): TaxFiling
     {
-        return DB::transaction(function () use ($filing, $reference): TaxFiling {
+        if ($provider !== null) {
+            if ($provider !== 'http') throw new RuntimeException('Unsupported tax filing provider.');
+            try {
+                return DB::transaction(function () use ($filing, $provider): TaxFiling {
+                    $filing = TaxFiling::lockForUpdate()->findOrFail($filing->id);
+                    if ($filing->status !== 'draft') throw new RuntimeException('Only draft tax filings can be submitted.');
+                    if (!$this->verifySnapshot($filing)) throw new RuntimeException('Tax filing snapshot integrity verification failed.');
+                    $providerResult = app(\App\Services\Integrations\HttpTaxFilingProvider::class)->submit($filing);
+                    $reference = $providerResult['filing_reference'] ?? null;
+                    if (!$reference) throw new RuntimeException('The tax filing provider did not return a filing reference.');
+                    $filing->update(['status' => $providerResult['status'] ?? 'submitted', 'filing_reference' => $reference, 'submission_provider' => $provider, 'provider_response' => $providerResult['response'] ?? null, 'provider_error' => null, 'submitted_by' => auth()->id(), 'submitted_at' => now()]);
+                    return $filing->fresh();
+                });
+            } catch (RuntimeException $exception) {
+                DB::transaction(function () use ($filing, $provider, $exception): void {
+                    $current = TaxFiling::lockForUpdate()->find($filing->id);
+                    if ($current?->status === 'draft') {
+                        $current->update(['submission_provider' => $provider, 'provider_error' => mb_substr($exception->getMessage(), 0, 65000)]);
+                    }
+                });
+                throw $exception;
+            }
+        }
+        if (!$reference) throw new RuntimeException('A filing reference or provider is required.');
+        return DB::transaction(function () use ($filing, $reference, $provider): TaxFiling {
             $filing = TaxFiling::lockForUpdate()->findOrFail($filing->id);
             if ($filing->status !== 'draft') throw new RuntimeException('Only draft tax filings can be submitted.');
-            $filing->update(['status' => 'submitted', 'filing_reference' => $reference, 'submitted_by' => auth()->id(), 'submitted_at' => now()]);
+            $filing->update(['status' => 'submitted', 'filing_reference' => $reference, 'submission_provider' => $provider, 'provider_response' => null, 'provider_error' => null, 'submitted_by' => auth()->id(), 'submitted_at' => now()]);
             return $filing->fresh();
         });
     }

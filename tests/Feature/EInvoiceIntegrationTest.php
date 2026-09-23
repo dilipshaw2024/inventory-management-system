@@ -6,12 +6,14 @@ use App\Models\Category;
 use App\Models\Company;
 use App\Models\Customer;
 use App\Models\EInvoiceSubmission;
+use App\Models\EInvoiceProviderSetting;
 use App\Models\Invoice;
 use App\Models\Product;
 use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
 class EInvoiceIntegrationTest extends TestCase
@@ -57,5 +59,37 @@ class EInvoiceIntegrationTest extends TestCase
         $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'INV-PENDING', 'status' => 0, 'total_amount' => 10]);
         $token = $user->createToken('einvoice-pending-test', ['accounting:write'])->plainTextToken;
         $this->withToken($token)->postJson('/api/accounting/invoices/'.$invoice->id.'/e-invoice')->assertStatus(422)->assertJsonPath('message', 'Only approved sales invoices can be prepared for e-invoicing.');
+    }
+
+    public function test_http_provider_settings_are_company_scoped_encrypted_and_used_for_submission(): void
+    {
+        $company = Company::create(['name' => 'Configured E-Invoice Co', 'code' => 'EINV-CONFIG']);
+        $otherCompany = Company::create(['name' => 'Other E-Invoice Co', 'code' => 'EINV-OTHER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $otherUser = User::factory()->create(['company_id' => $otherCompany->id]);
+        $token = $user->createToken('einvoice-settings', ['accounting:read', 'accounting:write', 'integration:read', 'integration:write'])->plainTextToken;
+
+        $created = $this->withToken($token)->postJson('/api/accounting/e-invoice-providers', [
+            'provider' => 'HTTP',
+            'connection_config' => ['endpoint' => 'https://tenant-gateway.example.test/e-invoices', 'token' => 'tenant-secret', 'timeout' => 11],
+        ])->assertCreated()->assertJsonPath('data.provider', 'http');
+        $this->assertArrayNotHasKey('connection_config', $created->json('data'));
+        $settingId = $created->json('data.id');
+        $this->assertNotSame('tenant-secret', (string) $this->app['db']->table('e_invoice_provider_settings')->where('id', $settingId)->value('connection_config'));
+        $this->assertSame(0, EInvoiceProviderSetting::where('company_id', $otherCompany->id)->count());
+        $this->withToken($token)->getJson('/api/accounting/e-invoice-providers')->assertOk()->assertJsonPath('data.0.id', $settingId);
+        $this->withToken($token)->getJson('/api/integration/providers')->assertOk()->assertJsonPath('data.e_invoice.providers.1.ready', true);
+
+        $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'INV-TENANT', 'status' => 1, 'total_amount' => 10]);
+        $submission = EInvoiceSubmission::create([
+            'company_id' => $company->id, 'invoice_id' => $invoice->id, 'provider' => 'http', 'payload_hash' => str_repeat('c', 64),
+            'payload' => ['invoice_number' => 'INV-TENANT'], 'status' => 'prepared',
+        ]);
+        Http::fake(['https://tenant-gateway.example.test/*' => Http::response(['status' => 'accepted', 'reference' => 'TENANT-1'], 200)]);
+        $result = (new \App\Services\Integrations\HttpEInvoiceProvider())->submit($submission);
+        $this->assertSame('TENANT-1', $result['external_reference']);
+        Http::assertSent(fn ($request): bool => $request->url() === 'https://tenant-gateway.example.test/e-invoices' && $request->hasHeader('Authorization', 'Bearer tenant-secret'));
+        $this->withToken($token)->postJson('/api/accounting/e-invoice-providers/'.$settingId.'/deactivate')->assertOk()->assertJsonPath('data.is_active', false);
+        $this->assertFalse(EInvoiceProviderSetting::findOrFail($settingId)->is_active);
     }
 }

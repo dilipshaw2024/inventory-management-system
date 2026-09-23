@@ -7,7 +7,10 @@ use App\Models\BankAccount;
 use App\Models\BankReconciliation;
 use App\Models\BankStatementLine;
 use App\Models\FiscalYear;
+use App\Models\FiscalPeriod;
 use App\Models\InventoryCostRevaluationRun;
+use App\Models\AccountMapping;
+use App\Models\ChartOfAccount;
 use App\Models\User;
 use App\Services\FiscalPeriodService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -108,5 +111,35 @@ class FiscalPeriodTest extends TestCase
             ->assertOk()->assertJsonPath('status', 'blocked')->assertJsonPath('data.ready_to_close', false)
             ->assertJsonPath('data.checks.0.key', 'bank_statement_lines')->assertJsonPath('data.checks.0.count', 1);
         $this->assertDatabaseHas('fiscal_periods', ['id' => $period->id, 'status' => 'open']);
+    }
+
+    public function test_period_close_settles_profit_to_retained_earnings_and_reverses_on_reopen(): void
+    {
+        $company = Company::create(['name' => 'Settlement Co', 'code' => 'PERIOD-SETTLE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY 2026', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
+        $period = FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => '2026-01', 'starts_on' => '2026-01-01', 'ends_on' => '2026-01-31', 'status' => 'open']);
+        $revenue = ChartOfAccount::create(['company_id' => $company->id, 'code' => '4100', 'name' => 'Revenue', 'account_type' => 'income', 'is_active' => true]);
+        $expense = ChartOfAccount::create(['company_id' => $company->id, 'code' => '5100', 'name' => 'Expense', 'account_type' => 'expense', 'is_active' => true]);
+        $receivable = ChartOfAccount::create(['company_id' => $company->id, 'code' => '1200', 'name' => 'Receivable', 'account_type' => 'asset', 'is_active' => true]);
+        $equity = ChartOfAccount::create(['company_id' => $company->id, 'code' => '3200', 'name' => 'Retained earnings', 'account_type' => 'equity', 'is_active' => true]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'retained_earnings', 'account_id' => $equity->id]);
+        Sanctum::actingAs($user, ['integration:write', 'accounting:write']);
+        app(\App\Services\AccountingService::class)->post([
+            'company_id' => $company->id, 'entry_no' => 'JE-PERIOD-1', 'date' => '2026-01-15', 'description' => 'January activity',
+        ], [
+            ['account_id' => $expense->id, 'debit' => 40, 'credit' => 0, 'currency_code' => 'USD', 'exchange_rate' => 1],
+            ['account_id' => $receivable->id, 'debit' => 60, 'credit' => 0, 'currency_code' => 'USD', 'exchange_rate' => 1],
+            ['account_id' => $revenue->id, 'debit' => 0, 'credit' => 100, 'currency_code' => 'USD', 'exchange_rate' => 1],
+        ]);
+
+        $closed = $this->postJson('/api/accounting/fiscal-periods/'.$period->id.'/close', ['close_reason' => 'January financial close.']);
+        $closed->assertOk()->assertJsonPath('status', 'closed')->assertJsonPath('data.settlement_status', 'posted');
+        $settlementId = $closed->json('data.settlement_journal_id');
+        $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $settlementId, 'account_id' => $equity->id, 'credit' => 60]);
+
+        $reopened = $this->postJson('/api/accounting/fiscal-periods/'.$period->id.'/reopen', ['reopen_reason' => 'Late January correction.']);
+        $reopened->assertOk()->assertJsonPath('status', 'open')->assertJsonPath('data.settlement_status', 'reversed');
+        $this->assertNotNull($reopened->json('data.settlement_reversal_journal_id'));
     }
 }

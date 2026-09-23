@@ -27,7 +27,8 @@ class HttpEInvoiceProvider implements EInvoiceProvider, EInvoiceSubmitter
 
     public function submit(EInvoiceSubmission $submission): array
     {
-        $endpoint = trim((string) config('integrations.e_invoice_http_endpoint'));
+        $connection = $this->connectionConfig($submission);
+        $endpoint = trim((string) ($connection['endpoint'] ?? config('integrations.e_invoice_http_endpoint')));
         if ($endpoint === '') {
             throw new \RuntimeException('The HTTP e-invoice endpoint is not configured.');
         }
@@ -38,19 +39,19 @@ class HttpEInvoiceProvider implements EInvoiceProvider, EInvoiceSubmitter
             'payload_hash' => $submission->payload_hash,
             'payload' => $submission->payload,
         ];
-        $retryCount = max(0, min(5, (int) config('integrations.e_invoice_http_retries', 2)));
-        $retrySleep = max(0, (int) config('integrations.e_invoice_http_retry_sleep', 0));
+        $retryCount = max(0, min(5, (int) ($connection['retries'] ?? config('integrations.e_invoice_http_retries', 2))));
+        $retrySleep = max(0, (int) ($connection['retry_sleep'] ?? config('integrations.e_invoice_http_retry_sleep', 0)));
         $response = null;
         for ($attempt = 0; $attempt <= $retryCount; $attempt++) {
             try {
-                $request = Http::timeout((int) config('integrations.e_invoice_http_timeout', 30))
+                $request = Http::timeout((int) ($connection['timeout'] ?? config('integrations.e_invoice_http_timeout', 30)))
                     ->acceptJson()
                     ->asJson()
                     ->withHeaders([
                         'Idempotency-Key' => $payload['external_reference'],
                         'X-ERP-Payload-Hash' => (string) $submission->payload_hash,
                     ]);
-                $token = trim((string) config('integrations.e_invoice_http_token'));
+                $token = trim((string) ($connection['token'] ?? config('integrations.e_invoice_http_token')));
                 if ($token !== '') $request = $request->withToken($token);
                 $response = $request->post($endpoint, $payload);
             } catch (ConnectionException $exception) {
@@ -83,5 +84,16 @@ class HttpEInvoiceProvider implements EInvoiceProvider, EInvoiceSubmitter
             'external_reference' => $body['external_reference'] ?? $body['reference'] ?? ('ERP-EINV-'.$submission->id),
             'response' => $body,
         ];
+    }
+
+    private function connectionConfig(EInvoiceSubmission $submission): array
+    {
+        if (!$submission->company_id) return [];
+        $setting = \App\Models\EInvoiceProviderSetting::withoutGlobalScopes()
+            ->where('company_id', $submission->company_id)
+            ->where('provider', 'http')
+            ->where('is_active', true)
+            ->first();
+        return is_array($setting?->connection_config) ? $setting->connection_config : [];
     }
 }

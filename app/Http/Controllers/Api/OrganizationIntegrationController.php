@@ -7,6 +7,7 @@ use App\Models\Branch;
 use App\Models\Company;
 use App\Models\InventoryLocation;
 use App\Models\InventoryLocationRule;
+use App\Models\InventoryLocationBarcode;
 use App\Models\Warehouse;
 use App\Models\Store;
 use App\Models\Department;
@@ -320,12 +321,44 @@ class OrganizationIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         $data = $request->validate(['warehouse_id' => ['nullable', 'integer'], 'type' => ['nullable', 'in:warehouse,zone,rack,shelf,bin'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $locations = $this->organizationScope(new InventoryLocation())->with(['warehouse', 'parent', 'rules.product', 'rules.category'])
+        $locations = $this->organizationScope(new InventoryLocation())->with(['warehouse', 'parent', 'barcodes', 'rules.product', 'rules.category'])
             ->when($data['warehouse_id'] ?? null, fn ($query, $id) => $query->where('warehouse_id', $id))
             ->when($data['type'] ?? null, fn ($query, $type) => $query->where('type', $type))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($locations, $request, 'organization.locations', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function locationBarcodes(Request $request, int $id): JsonResponse
+    {
+        $location = $this->organizationScope(new InventoryLocation())->findOrFail($id);
+        return response()->json(['data' => $location->barcodes()->orderByDesc('is_primary')->orderBy('id')->get(), 'status' => 'ok']);
+    }
+
+    public function storeLocationBarcode(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $location = $this->organizationScope(new InventoryLocation())->findOrFail($id);
+        $data = $request->validate([
+            'code' => ['required', 'string', 'max:120', Rule::unique('inventory_location_barcodes', 'code')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'type' => ['required', 'in:barcode,qrcode'], 'is_primary' => ['nullable', 'boolean'],
+            'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('inventory_location_barcodes', 'external_reference')->where(fn ($query) => $query->where('location_id', $location->id))],
+        ]);
+        $barcode = DB::transaction(function () use ($data, $companyId, $location): InventoryLocationBarcode {
+            if (!empty($data['is_primary'])) $location->barcodes()->update(['is_primary' => false]);
+            $barcode = $location->barcodes()->create($data + ['company_id' => $companyId, 'is_primary' => (bool) ($data['is_primary'] ?? false)]);
+            app(AuditService::class)->record('organization.location_barcode.created', $barcode, null, $barcode->toArray());
+            return $barcode;
+        });
+        return response()->json(['data' => $barcode->load('location'), 'status' => 'created'], 201);
+    }
+
+    public function deactivateLocationBarcode(Request $request, int $id): JsonResponse
+    {
+        $barcode = InventoryLocationBarcode::whereHas('location.warehouse.branch', fn ($query) => $query->where('company_id', $request->user()?->company_id))->findOrFail($id);
+        $barcode->delete();
+        app(AuditService::class)->record('organization.location_barcode.deactivated', $barcode, ['active' => true], ['active' => false]);
+        return response()->json(['data' => $barcode, 'status' => 'deactivated']);
     }
 
     public function storeLocationRule(Request $request): JsonResponse

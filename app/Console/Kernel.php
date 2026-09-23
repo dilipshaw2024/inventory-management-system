@@ -37,6 +37,9 @@ class Kernel extends ConsoleKernel
         $schedule->command('erp:planning:generate-transfer-orders')->dailyAt('02:30');
         $schedule->command('erp:integration:deliver-webhooks')->everyFiveMinutes();
         $schedule->command('erp:accounting:generate-recurring-journals')->dailyAt('00:30');
+        $schedule->command('erp:accounting:sync-bank-statements')->dailyAt('01:00');
+        $schedule->command('erp:accounting:auto-match-bank-statements')->dailyAt('01:05');
+        $schedule->command('erp:accounting:retry-tax-filings')->dailyAt('01:20');
         $schedule->command('erp:approvals:escalate')->hourly();
         $schedule->command('erp:accounting:budget-alerts')->dailyAt('07:00');
         $schedule->command('erp:procurement:corrective-action-alerts')->dailyAt('07:05');

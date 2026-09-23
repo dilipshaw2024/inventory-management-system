@@ -39,4 +39,9 @@ return [
     'e_invoice_http_retries' => (int) env('ERP_E_INVOICE_HTTP_RETRIES', 2),
     'e_invoice_http_retry_sleep' => (int) env('ERP_E_INVOICE_HTTP_RETRY_SLEEP', 0),
     'e_invoice_callback_secret' => env('ERP_E_INVOICE_CALLBACK_SECRET'),
+    'tax_filing_http_endpoint' => env('ERP_TAX_FILING_HTTP_ENDPOINT'),
+    'tax_filing_http_token' => env('ERP_TAX_FILING_HTTP_TOKEN'),
+    'tax_filing_http_timeout' => (int) env('ERP_TAX_FILING_HTTP_TIMEOUT', 30),
+    'tax_filing_http_retries' => (int) env('ERP_TAX_FILING_HTTP_RETRIES', 2),
+    'tax_filing_http_retry_sleep' => (int) env('ERP_TAX_FILING_HTTP_RETRY_SLEEP', 0),
 ];

@@ -35,6 +35,8 @@ class ProductRequest extends FormRequest
             'tracking_type' => ['required', 'in:none,batch,serial'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'],
             'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
+            'costing_method' => ['nullable', 'in:fifo,weighted_average,moving_average,standard'],
+            'standard_cost' => ['nullable', 'numeric', 'min:0'],
             'can_purchase' => ['nullable', 'boolean'],
             'can_sell' => ['nullable', 'boolean'],
             'is_stock_item' => ['nullable', 'boolean'],

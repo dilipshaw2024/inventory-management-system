@@ -4,8 +4,9 @@ namespace App\Http\Controllers\Pos;
 
 use App\Http\Controllers\Controller;
 use App\Models\Product;
-use App\Models\ProductCostHistory;
 use App\Services\AuditService;
+use App\Services\ProductCostingPolicyService;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\Request;
 
 class ProductCostingController extends Controller
@@ -23,10 +24,17 @@ class ProductCostingController extends Controller
 
     public function update(Request $request, int $id)
     {
-        $data = $request->validate(['costing_method' => ['required', 'in:fifo,weighted_average,moving_average,standard'], 'standard_cost' => ['nullable', 'numeric', 'min:0']]);
-        $product = Product::where('company_id', $this->companyId())->findOrFail($id); $old = $product->only(['costing_method', 'standard_cost']);
-        $product->update($data);
-        ProductCostHistory::create(['product_id' => $product->id, 'old_costing_method' => $old['costing_method'], 'new_costing_method' => $product->costing_method, 'old_standard_cost' => $old['standard_cost'], 'new_standard_cost' => $product->standard_cost, 'effective_at' => now(), 'changed_by' => auth()->id()]);
+        $data = $request->validate(['costing_method' => ['required', 'in:fifo,weighted_average,moving_average,standard'], 'standard_cost' => ['nullable', 'numeric', 'min:0'], 'effective_at' => ['nullable', 'date', 'after:now']]);
+        $product = Product::where('company_id', $this->companyId())->findOrFail($id);
+        if (($data['costing_method'] ?? null) === 'standard' && (($data['standard_cost'] ?? null) === null)) return back()->withInput()->withErrors(['standard_cost' => 'Standard costing requires a standard cost.']);
+        $old = $product->only(['costing_method', 'standard_cost']);
+        if (!empty($data['effective_at'])) {
+            app(ProductCostingPolicyService::class)->schedule($product, $data['costing_method'], isset($data['standard_cost']) ? (float) $data['standard_cost'] : null, CarbonImmutable::parse($data['effective_at']), auth()->id(), 'Scheduled from costing administration.');
+            app(AuditService::class)->record('product.costing.scheduled', $product, null, ['costing_method' => $data['costing_method'], 'standard_cost' => $data['standard_cost'] ?? null, 'effective_at' => $data['effective_at']]);
+            return back()->with(['message' => 'Product costing policy scheduled.', 'alert-type' => 'success']);
+        }
+        $product->update(['costing_method' => $data['costing_method'], 'standard_cost' => $data['standard_cost'] ?? null]);
+        app(ProductCostingPolicyService::class)->recordCurrent($product, $product->costing_method, $product->standard_cost !== null ? (float) $product->standard_cost : null, auth()->id(), 'Updated from costing administration.');
         app(AuditService::class)->record('product.costing.updated', $product, $old, $product->only(['costing_method', 'standard_cost']));
         return back()->with(['message' => 'Product costing method updated.', 'alert-type' => 'success']);
     }

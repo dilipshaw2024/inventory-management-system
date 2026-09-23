@@ -53,6 +53,7 @@ class Product extends Model
     public function variants(){ return $this->hasMany(self::class, 'parent_product_id'); }
     public function attributeAssignments(){ return $this->hasMany(ProductAttributeAssignment::class); }
     public function costHistories(){ return $this->hasMany(ProductCostHistory::class); }
+    public function costingPolicies(){ return $this->hasMany(ProductCostingPolicy::class); }
     public function replenishmentPolicies(){ return $this->hasMany(InventoryReplenishmentPolicy::class); }
     public function barcodes(){ return $this->hasMany(ProductBarcode::class); }
     public function bundleComponents(){ return $this->hasMany(ProductBundleComponent::class, 'bundle_product_id'); }

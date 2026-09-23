@@ -309,10 +309,11 @@ class ProcurementIntegrationController extends Controller
         $data = $request->validate([
             'external_reference' => ['nullable', 'string', 'max:150'],
             'purchase_order_id' => ['required', 'integer', $owned('purchase_orders')],
-            'location_id' => ['nullable', 'integer', $locationScope], 'date' => ['required', 'date'],
+            'location_id' => ['nullable', 'integer', $locationScope], 'location_scan_code' => ['nullable', 'string', 'max:120'], 'date' => ['required', 'date'],
             'description' => ['nullable', 'string', 'max:2000'], 'inspection_required' => ['nullable', 'boolean'], 'is_final_delivery' => ['nullable', 'boolean'], 'discrepancy_reason' => ['nullable', 'string', 'max:3000', 'required_if:is_final_delivery,1'], 'over_receipt_reason' => ['nullable', 'string', 'max:3000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.purchase_order_line_id' => ['required', 'integer', $orderLineScope],
             'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_cost' => ['required', 'numeric', 'min:0'],
+            'lines.*.product_scan_code' => ['nullable', 'string', 'max:150'],
             'lines.*.uom_id' => ['nullable', 'integer', $owned('units')],
             'lines.*.batch_no' => ['nullable', 'string', 'max:100'], 'lines.*.serial_numbers' => ['nullable', 'array'],
             'lines.*.serial_numbers.*' => ['string', 'max:150'], 'lines.*.manufacturing_date' => ['nullable', 'date'],
@@ -323,7 +324,7 @@ class ProcurementIntegrationController extends Controller
             $existing = GoodsReceipt::where('external_reference', $data['external_reference'])->first();
             if ($existing) return response()->json(['data' => $existing->load('purchaseOrder', 'lines.product'), 'status' => 'duplicate_ignored']);
         }
-        $order = PurchaseOrder::with('lines.product')->findOrFail($data['purchase_order_id']);
+        $order = PurchaseOrder::with('lines.product.barcodes')->findOrFail($data['purchase_order_id']);
         if ($order->receiving_closed) return response()->json(['message' => 'Receiving is closed for this purchase order.'], 422);
         if ($order->receipts()->where('status', 'approved')->where('discrepancy_status', 'open')->exists()) return response()->json(['message' => 'Resolve the existing goods-receipt discrepancy before receiving more against this purchase order.'], 422);
         if (!in_array($order->status, ['approved', 'partially_received'], true)) throw new \RuntimeException('Only approved or partially received purchase orders can receive stock.');
@@ -331,6 +332,15 @@ class ProcurementIntegrationController extends Controller
         if (!$location) {
             $targetLocations = $order->lines->whereIn('id', collect($data['lines'])->pluck('purchase_order_line_id'))->pluck('location_id')->filter()->unique()->values();
             if ($targetLocations->count() === 1) $location = InventoryLocation::findOrFail((int) $targetLocations->first());
+        }
+        if (!empty($data['location_scan_code'])) {
+            $scannedLocation = InventoryLocation::where(fn ($query) => $query->where('code', $data['location_scan_code'])
+                ->orWhereHas('barcodes', fn ($barcodeQuery) => $barcodeQuery->where('code', $data['location_scan_code'])->where('company_id', $companyId)))
+                ->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))
+                ->first();
+            if (!$scannedLocation) abort(422, 'The scanned receiving location is not available in the current company.');
+            if ($location && (int) $location->id !== (int) $scannedLocation->id) abort(422, 'The scanned receiving location does not match the selected location.');
+            $location = $scannedLocation;
         }
         $overReceiptTolerance = (float) app(\App\Services\ErpSettingService::class)->get('purchase_over_receipt_tolerance_percent', 0, $companyId);
         $receipt = DB::transaction(function () use ($data, $companyId, $order, $location, $request, $overReceiptTolerance): GoodsReceipt {
@@ -345,6 +355,11 @@ class ProcurementIntegrationController extends Controller
                 $line = $order->lines->firstWhere('id', $input['purchase_order_line_id']);
                 if (!$line) throw new \RuntimeException('Each receipt line must belong to the purchase order.');
                 $product = $line->product; $enteredQuantity = (float) $input['quantity']; $uomId = $input['uom_id'] ?? null;
+                if (!empty($input['product_scan_code'])) {
+                    $scanCode = (string) $input['product_scan_code'];
+                    $matches = $product->sku === $scanCode || $product->barcode === $scanCode || $product->barcodes->contains('code', $scanCode);
+                    if (!$matches) abort(422, 'The scanned product does not match '.$product->name.'.');
+                }
                 $receivedQuantity = app(UomConversionService::class)->toStock($product, $enteredQuantity, $uomId ? (int) $uomId : null, 'purchase');
                 $remaining = (float) $line->ordered_qty - (float) $line->received_qty;
                 if ($receivedQuantity > $remaining + 0.000001) {
@@ -362,7 +377,12 @@ class ProcurementIntegrationController extends Controller
                     'best_before_date' => $input['best_before_date'] ?? null, 'warranty_until' => $input['warranty_until'] ?? null,
                 ]);
             }
-            app(AuditService::class)->record('goods_receipt.created', $receipt, null, $receipt->toArray());
+            app(AuditService::class)->record('goods_receipt.created', $receipt, null, $receipt->toArray() + [
+                'scanner_validation' => [
+                    'location_scan_code' => $data['location_scan_code'] ?? null,
+                    'product_scan_codes' => collect($data['lines'])->pluck('product_scan_code')->filter()->values()->all(),
+                ],
+            ]);
             return $receipt;
         });
         return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product'), 'status' => 'pending_approval'], 201);

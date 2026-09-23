@@ -16,6 +16,7 @@ use App\Models\JournalLine;
 use App\Models\ChartOfAccount;
 use App\Models\TaxSettlement;
 use App\Models\TaxFiling;
+use App\Models\TaxFilingProviderSetting;
 use App\Models\ProductClassification;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
@@ -152,9 +153,69 @@ class FinanceIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for tax filings.');
-        $data = $request->validate(['status' => ['nullable', 'in:draft,submitted,accepted,rejected'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $filings = TaxFiling::where('company_id', $companyId)->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))->orderBy('updated_at')->orderBy('id');
+        $data = $request->validate(['status' => ['nullable', 'in:draft,submitted,accepted,rejected'], 'submission_provider' => ['nullable', 'in:http'], 'has_provider_error' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $filings = TaxFiling::where('company_id', $companyId)
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['submission_provider'] ?? null, fn ($query, $provider) => $query->where('submission_provider', $provider))
+            ->when(array_key_exists('has_provider_error', $data), fn ($query) => filter_var($data['has_provider_error'], FILTER_VALIDATE_BOOLEAN) ? $query->whereNotNull('provider_error') : $query->whereNull('provider_error'))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($filings, $request, 'accounting.tax-filings', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function taxFilingProviders(Request $request): JsonResponse
+    {
+        return response()->json(TaxFilingProviderSetting::where('company_id', $request->user()?->company_id)->orderBy('provider')->paginate(min(100, max(1, (int) $request->input('per_page', 50)))));
+    }
+
+    public function storeTaxFilingProvider(Request $request): JsonResponse
+    {
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'url', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $data['provider'] = strtolower(trim($data['provider']));
+        if ($data['provider'] !== 'http') abort(422, 'Unsupported tax filing provider setting.');
+        $setting = TaxFilingProviderSetting::updateOrCreate(['company_id' => $request->user()?->company_id, 'provider' => $data['provider']], ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true]);
+        app(AuditService::class)->record('tax_filing_provider.updated', $setting, null, $setting->toArray());
+        return response()->json(['data' => $setting, 'status' => 'configured'], 201);
+    }
+
+    public function updateTaxFilingProvider(Request $request, int $id): JsonResponse
+    {
+        $setting = TaxFilingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'connection_config.endpoint' => ['nullable', 'url', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $setting->update($data);
+        app(AuditService::class)->record('tax_filing_provider.updated', $setting, null, $setting->toArray());
+        return response()->json(['data' => $setting->fresh(), 'status' => 'updated']);
+    }
+
+    public function deactivateTaxFilingProvider(Request $request, int $id): JsonResponse
+    {
+        $setting = TaxFilingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $setting->update(['is_active' => false]);
+        app(AuditService::class)->record('tax_filing_provider.deactivated', $setting, ['is_active' => true], ['is_active' => false]);
+        return response()->json(['data' => $setting->fresh(), 'status' => 'deactivated']);
+    }
+
+    public function taxSettlements(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for tax settlements.');
+        $data = $request->validate([
+            'status' => ['nullable', 'in:posted,reversed'],
+            'jurisdiction' => ['nullable', 'string', 'max:100'],
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'updated_since' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $settlements = TaxSettlement::with(['journalEntry', 'reversalJournalEntry', 'creator', 'reverser'])
+            ->where('company_id', $companyId)
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['jurisdiction'] ?? null, fn ($query, $jurisdiction) => $query->where('jurisdiction', $jurisdiction))
+            ->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('period_from', '>=', $date))
+            ->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('period_to', '<=', $date))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($settlements, $request, 'accounting.tax-settlements', (int) ($data['per_page'] ?? 50));
     }
 
     public function storeTaxFiling(Request $request): JsonResponse
@@ -205,11 +266,13 @@ class FinanceIntegrationController extends Controller
     public function submitTaxFiling(Request $request, int $id): JsonResponse
     {
         $filing = TaxFiling::where('company_id', $request->user()?->company_id)->findOrFail($id);
-        $data = $request->validate(['filing_reference' => ['required', 'string', 'max:180']]);
-        try { $filing = app(\App\Services\TaxFilingService::class)->submit($filing, $data['filing_reference']); }
+        $data = $request->validate(['filing_reference' => ['nullable', 'string', 'max:180'], 'provider' => ['nullable', 'in:http']]);
+        if (empty($data['filing_reference']) && empty($data['provider'])) abort(422, 'A filing reference or provider is required.');
+        $previousStatus = $filing->status;
+        try { $filing = app(\App\Services\TaxFilingService::class)->submit($filing, $data['filing_reference'] ?? null, $data['provider'] ?? null); }
         catch (\RuntimeException $exception) { abort(422, $exception->getMessage()); }
-        app(AuditService::class)->record('tax_filing.submitted', $filing, ['status' => 'draft'], $filing->toArray());
-        return response()->json(['data' => $filing, 'status' => 'submitted']);
+        app(AuditService::class)->record('tax_filing.submitted', $filing, ['status' => $previousStatus], $filing->toArray());
+        return response()->json(['data' => $filing, 'status' => $filing->status]);
     }
 
     public function decideTaxFiling(Request $request, int $id): JsonResponse
@@ -226,18 +289,31 @@ class FinanceIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for tax settlement.');
-        $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'paid_at' => ['required', 'date'], 'payment_reference' => ['nullable', 'string', 'max:150']]);
-        $externalReference = 'tax-settlement:'.$companyId.':'.$data['from'].':'.$data['to'].':'.($data['jurisdiction'] ?? 'all');
+        $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'paid_at' => ['required', 'date'], 'payment_reference' => ['nullable', 'string', 'max:150'], 'external_reference' => ['nullable', 'string', 'max:180']]);
+        $externalReference = trim((string) ($data['external_reference'] ?? ('tax-settlement:'.$companyId.':'.$data['from'].':'.$data['to'].':'.($data['jurisdiction'] ?? 'all'))));
         $alreadySettled = TaxSettlement::where('company_id', $companyId)->where('external_reference', $externalReference)->exists();
         $report = json_decode($this->taxReport($request)->getContent(), true, 512, JSON_THROW_ON_ERROR);
         $netTax = (float) ($report['summary']['net_tax'] ?? 0);
         try {
-            $settlement = app(\App\Services\TaxSettlementService::class)->settle((int) $companyId, $data['from'], $data['to'], $data['jurisdiction'] ?? null, $netTax, $data['paid_at'], $data['payment_reference'] ?? null);
+            $settlement = app(\App\Services\TaxSettlementService::class)->settle((int) $companyId, $data['from'], $data['to'], $data['jurisdiction'] ?? null, $netTax, $data['paid_at'], $data['payment_reference'] ?? null, $data['external_reference'] ?? null);
         } catch (\RuntimeException $exception) {
             abort(422, $exception->getMessage());
         }
         app(AuditService::class)->record('tax_settlement.posted', $settlement, null, $settlement->toArray());
         return response()->json(['data' => $settlement, 'status' => 'posted', 'tax_report' => $report['summary']], $alreadySettled ? 200 : 201);
+    }
+
+    public function reverseTaxSettlement(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        $settlement = TaxSettlement::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        try {
+            $reversed = app(\App\Services\TaxSettlementService::class)->reverse($settlement, $data['reason']);
+        } catch (\RuntimeException $exception) {
+            abort(422, $exception->getMessage());
+        }
+        app(AuditService::class)->record('tax_settlement.reversed', $reversed, ['status' => 'posted'], $reversed->toArray());
+        return response()->json(['data' => $reversed, 'status' => 'reversed', 'reversal_journal_entry_id' => $reversed->reversal_journal_entry_id]);
     }
 
     public function fiscalYears(Request $request): JsonResponse
@@ -381,6 +457,7 @@ class FinanceIntegrationController extends Controller
                 if (!$year || $year->status !== 'open') throw new \RuntimeException('The parent fiscal year must be open.');
                 app(\App\Services\FiscalPeriodService::class)->assertBankReconciliationsClosed((int) $period->company_id, $period->ends_on->toDateString());
                 app(\App\Services\FiscalPeriodService::class)->assertCostRevaluationsClosed((int) $period->company_id, $period->ends_on->toDateString());
+                app(\App\Services\FiscalPeriodSettlementService::class)->settle($period, $request->user()?->id);
                 $snapshot = app(\App\Services\InventorySnapshotService::class)->capture((int) $period->company_id, $period->ends_on, $request->user()?->id);
                 if ($snapshot->status === 'variance') throw new \RuntimeException('The fiscal-period close failed because the inventory snapshot contains negative-balance variances.');
                 $before = $period->toArray();
@@ -389,7 +466,7 @@ class FinanceIntegrationController extends Controller
                 return $period->fresh();
             });
         } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
-        return response()->json(['data' => $period->load('fiscalYear', 'inventorySnapshot'), 'status' => $period->status]);
+        return response()->json(['data' => $period->load('fiscalYear', 'inventorySnapshot', 'settlementJournal'), 'status' => $period->status]);
     }
 
     public function reopenFiscalPeriod(Request $request, int $id): JsonResponse
@@ -398,6 +475,7 @@ class FinanceIntegrationController extends Controller
         $data = $request->validate(['reopen_reason' => ['required', 'string', 'max:2000']]);
         $period = FiscalPeriod::where('company_id', $request->user()?->company_id)->findOrFail($id);
         if ($period->status !== 'closed') abort(422, 'Only closed fiscal periods can be reopened.');
+        app(\App\Services\FiscalPeriodSettlementService::class)->reverse($period, $data['reopen_reason']);
         $before = $period->toArray();
         $period->update(['status' => 'open', 'closed_at' => null, 'closed_by' => null]);
         app(AuditService::class)->record('fiscal_period.reopened', $period, $before, $period->toArray() + ['reopen_reason' => $data['reopen_reason']]);

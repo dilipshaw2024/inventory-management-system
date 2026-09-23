@@ -176,6 +176,7 @@ class ProductIntegrationController extends Controller
                 'sales_price' => $data['sales_price'] ?? $parent->sales_price, 'tax_rate' => $data['tax_rate'] ?? $parent->tax_rate, 'tracking_type' => $parent->tracking_type,
                 'product_type' => $parent->product_type ?: 'stock', 'lifecycle_status' => $parent->lifecycle_status ?: 'active',
                 'can_purchase' => (bool) ($parent->can_purchase ?? true), 'can_sell' => (bool) ($parent->can_sell ?? true), 'is_stock_item' => (bool) ($parent->is_stock_item ?? true),
+                'costing_method' => $parent->costing_method ?: 'fifo', 'standard_cost' => $parent->standard_cost,
                 'weight_kg' => $parent->weight_kg, 'length_m' => $parent->length_m, 'width_m' => $parent->width_m, 'height_m' => $parent->height_m,
                 'quantity' => 0, 'status' => 1, 'created_by' => auth()->id(),
             ]);
@@ -198,6 +199,7 @@ class ProductIntegrationController extends Controller
             'purchase_price' => ['sometimes', 'nullable', 'numeric', 'min:0'], 'sales_price' => ['sometimes', 'nullable', 'numeric', 'min:0'],
             'tax_rate' => ['sometimes', 'nullable', 'numeric', 'min:0', 'max:100'],
             'status' => ['sometimes', 'boolean'], 'lifecycle_status' => ['sometimes', 'in:draft,active,discontinued,blocked,archived'],
+            'costing_method' => ['sometimes', 'in:fifo,weighted_average,moving_average,standard'], 'standard_cost' => ['sometimes', 'nullable', 'numeric', 'min:0'],
             'can_purchase' => ['sometimes', 'boolean'], 'can_sell' => ['sometimes', 'boolean'],
         ]);
         if (array_key_exists('status', $data) && !$data['status'] && app(ProductLifecycleService::class)->hasStock($product)) abort(422, 'A variant with stock cannot be deactivated.');
@@ -283,7 +285,10 @@ class ProductIntegrationController extends Controller
             if ($existing) return response()->json(['data' => $existing->load('category', 'unit', 'brand', 'supplier', 'taxRate'), 'status' => 'duplicate_ignored']);
         }
         $product = DB::transaction(function () use ($data, $companyId): Product {
-            $product = Product::create($this->productAttributes($data) + ['company_id' => $companyId, 'quantity' => 0, 'created_by' => auth()->id()]);
+            $attributes = $this->productAttributes($data);
+            $attributes['costing_method'] ??= app(\App\Services\ErpSettingService::class)->get('default_inventory_costing_method', 'fifo', $companyId);
+            if (!array_key_exists('standard_cost', $attributes)) $attributes['standard_cost'] = app(\App\Services\ErpSettingService::class)->get('default_standard_cost', null, $companyId);
+            $product = Product::create($attributes + ['company_id' => $companyId, 'quantity' => 0, 'created_by' => auth()->id()]);
             app(AuditService::class)->record('product.created', $product, null, $product->toArray());
             return $product;
         });
@@ -298,12 +303,34 @@ class ProductIntegrationController extends Controller
         $data = $this->validated($request, $companyId, $product->id);
         app(ProductLifecycleService::class)->assertTransitionAllowed($product, $data);
         if ($product->tracking_type !== $data['tracking_type'] && app(\App\Services\ProductLifecycleService::class)->hasStock($product)) abort(422, 'Tracking type cannot change while the product has stock.');
-        $before = $product->only(array_keys($this->productAttributes($data)));
-        DB::transaction(function () use ($product, $data, $before): void {
-            $product->update($this->productAttributes($data) + ['updated_by' => auth()->id()]);
-            app(AuditService::class)->record('product.updated', $product, $before, $product->fresh()->only(array_keys($this->productAttributes($data))));
+        $attributes = $this->productAttributes($data);
+        $effectiveAt = !empty($data['costing_effective_at']) ? \Carbon\CarbonImmutable::parse($data['costing_effective_at']) : null;
+        $scheduleCosting = $effectiveAt !== null;
+        if ($scheduleCosting && !array_key_exists('costing_method', $data)) abort(422, 'A costing method is required when scheduling a costing policy.');
+        if (($data['costing_method'] ?? null) === 'standard' && array_key_exists('standard_cost', $data) && $data['standard_cost'] === null) abort(422, 'Standard costing requires a standard cost.');
+        if ($scheduleCosting) unset($attributes['costing_method'], $attributes['standard_cost']);
+        $before = $product->only(array_keys($attributes));
+        DB::transaction(function () use ($product, $data, $attributes, $before, $effectiveAt, $scheduleCosting): void {
+            if ($attributes) $product->update($attributes + ['updated_by' => auth()->id()]);
+            if ($scheduleCosting) {
+                app(\App\Services\ProductCostingPolicyService::class)->schedule($product, $data['costing_method'], isset($data['standard_cost']) ? (float) $data['standard_cost'] : null, $effectiveAt, auth()->id(), 'Scheduled through inventory integration.');
+                app(AuditService::class)->record('product.costing.scheduled', $product, null, ['costing_method' => $data['costing_method'], 'standard_cost' => $data['standard_cost'] ?? null, 'effective_at' => $effectiveAt->toISOString(), 'api' => true]);
+                return;
+            }
+            if (array_key_exists('costing_method', $attributes) || array_key_exists('standard_cost', $attributes)) app(\App\Services\ProductCostingPolicyService::class)->recordCurrent($product, $product->costing_method, $product->standard_cost !== null ? (float) $product->standard_cost : null, auth()->id(), 'Updated through inventory integration.');
+            app(AuditService::class)->record('product.updated', $product, $before, $product->fresh()->only(array_keys($attributes)));
         });
-        return response()->json(['data' => $product->fresh()->load('category', 'unit', 'brand', 'supplier', 'taxRate'), 'status' => 'updated']);
+        return response()->json(['data' => $product->fresh()->load('category', 'unit', 'brand', 'supplier', 'taxRate'), 'status' => $scheduleCosting ? 'costing_scheduled' : 'updated']);
+    }
+
+    public function costingPolicies(Request $request, int $id): JsonResponse
+    {
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        return response()->json([
+            'data' => $product->costingPolicies()->with('changedBy:id,name')->orderBy('effective_from')->orderBy('id')->get(),
+            'current' => app(\App\Services\ProductCostingPolicyService::class)->resolve($product),
+            'product_id' => $product->id,
+        ]);
     }
 
     public function deactivate(Request $request, int $id): JsonResponse
@@ -339,6 +366,8 @@ class ProductIntegrationController extends Controller
             'status' => ['nullable', 'boolean'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'],
             'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
+            'costing_method' => ['nullable', 'in:fifo,weighted_average,moving_average,standard'], 'standard_cost' => ['nullable', 'numeric', 'min:0'],
+            'costing_effective_at' => ['nullable', 'date', 'after:now'],
             'can_purchase' => ['nullable', 'boolean'], 'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'],
             'weight_kg' => ['nullable', 'numeric', 'min:0'], 'length_m' => ['nullable', 'numeric', 'min:0'], 'width_m' => ['nullable', 'numeric', 'min:0'], 'height_m' => ['nullable', 'numeric', 'min:0'],
         ]);
@@ -346,7 +375,7 @@ class ProductIntegrationController extends Controller
 
     private function productAttributes(array $data): array
     {
-        return collect($data)->only(['external_reference', 'name', 'supplier_id', 'unit_id', 'category_id', 'brand_id', 'sku', 'barcode', 'hsn_sac_code', 'classification_id', 'purchase_price', 'sales_price', 'min_stock', 'max_stock', 'reorder_level', 'tax_rate', 'tax_rate_id', 'tracking_type', 'status', 'product_type', 'lifecycle_status', 'can_purchase', 'can_sell', 'is_stock_item', 'weight_kg', 'length_m', 'width_m', 'height_m'])->all();
+        return collect($data)->only(['external_reference', 'name', 'supplier_id', 'unit_id', 'category_id', 'brand_id', 'sku', 'barcode', 'hsn_sac_code', 'classification_id', 'purchase_price', 'sales_price', 'min_stock', 'max_stock', 'reorder_level', 'tax_rate', 'tax_rate_id', 'tracking_type', 'status', 'product_type', 'lifecycle_status', 'costing_method', 'standard_cost', 'can_purchase', 'can_sell', 'is_stock_item', 'weight_kg', 'length_m', 'width_m', 'height_m'])->all();
     }
 
     private function nextSku(?int $companyId): string

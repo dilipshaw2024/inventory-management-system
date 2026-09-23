@@ -84,4 +84,26 @@ class ReplenishmentPurchaseOrderTest extends TestCase
         $this->assertDatabaseHas('purchase_order_lines', ['purchase_order_id' => $orderId, 'location_id' => $location->id]);
         $this->getJson('/api/integration/purchase-orders')->assertOk()->assertJsonPath('data.0.lines.0.location_id', $location->id);
     }
+
+    public function test_open_purchase_quantity_is_scoped_to_the_target_location(): void
+    {
+        $company = Company::create(['name' => 'Scoped Replenishment Co', 'code' => 'SCOPED-REPLENISH']);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Scoped Branch', 'code' => 'SCOPED-BRANCH']);
+        $warehouse = $branch->warehouses()->create(['name' => 'Scoped Warehouse', 'code' => 'SCOPED-WH']);
+        $target = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Target', 'code' => 'SCOPED-TARGET', 'type' => 'bin', 'is_active' => true]);
+        $other = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Other', 'code' => 'SCOPED-OTHER', 'type' => 'bin', 'is_active' => true]);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Scoped Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Scoped Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Scoped Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Scoped item', 'status' => 1, 'is_stock_item' => true, 'purchase_price' => 5]);
+        InventoryReplenishmentPolicy::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $target->id, 'reorder_point' => 10, 'min_stock' => 10, 'is_active' => true]);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $target->id, 'movement_type' => 'receipt', 'quantity' => 2, 'unit_cost' => 5, 'posted_at' => now()]);
+        $otherOrder = PurchaseOrder::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'po_no' => 'PO-SCOPED-OTHER', 'date' => now()->toDateString(), 'status' => 'approved']);
+        PurchaseOrderLine::create(['purchase_order_id' => $otherOrder->id, 'product_id' => $product->id, 'location_id' => $other->id, 'ordered_qty' => 8, 'received_qty' => 0, 'unit_price' => 5]);
+
+        Sanctum::actingAs($user, ['inventory:write']);
+        $created = $this->postJson('/api/inventory/replenishment/purchase-orders', ['product_id' => $product->id, 'location_id' => $target->id, 'external_reference' => 'SCOPED-REPLENISHMENT-PO'])->assertCreated();
+        $this->assertEqualsWithDelta(8.0, (float) $created->json('data.lines.0.ordered_qty'), 0.000001);
+    }
 }

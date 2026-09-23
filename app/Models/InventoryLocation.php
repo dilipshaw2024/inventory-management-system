@@ -18,4 +18,5 @@ class InventoryLocation extends Model
     public function children() { return $this->hasMany(self::class, 'parent_id'); }
     public function movements() { return $this->hasMany(InventoryMovement::class, 'location_id'); }
     public function rules() { return $this->hasMany(InventoryLocationRule::class, 'location_id'); }
+    public function barcodes() { return $this->hasMany(InventoryLocationBarcode::class, 'location_id'); }
 }

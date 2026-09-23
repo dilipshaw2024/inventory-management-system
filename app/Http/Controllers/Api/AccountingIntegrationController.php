@@ -18,6 +18,7 @@ use App\Models\PurchaseInvoice;
 use App\Models\SupplierPaymentAllocation;
 use App\Models\EInvoiceSubmission;
 use App\Models\Company;
+use App\Models\EInvoiceProviderSetting;
 use App\Services\AccountingService;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
@@ -44,6 +45,61 @@ class AccountingIntegrationController extends Controller
             ->when($request->filled('status'), fn ($query) => $query->where('status', $request->string('status')->toString()))
             ->latest('id')->paginate(min(100, max(1, (int) $request->input('per_page', 50))));
         return response()->json($submissions);
+    }
+
+    public function eInvoiceProviders(Request $request): JsonResponse
+    {
+        $settings = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)
+            ->orderBy('provider')->paginate(min(100, max(1, (int) $request->input('per_page', 50))));
+        return response()->json($settings);
+    }
+
+    public function storeEInvoiceProvider(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'provider' => ['required', 'string', 'max:80'],
+            'connection_config' => ['required', 'array'],
+            'connection_config.endpoint' => ['nullable', 'url', 'max:2000'],
+            'connection_config.token' => ['nullable', 'string', 'max:2000'],
+            'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'],
+            'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'],
+            'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'],
+            'is_active' => ['sometimes', 'boolean'],
+        ]);
+        $data['provider'] = strtolower(trim($data['provider']));
+        if ($data['provider'] !== 'http') abort(422, 'Unsupported e-invoice provider setting.');
+        $setting = EInvoiceProviderSetting::updateOrCreate(
+            ['company_id' => $companyId, 'provider' => $data['provider']],
+            ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true],
+        );
+        app(AuditService::class)->record('e_invoice_provider.updated', $setting, null, $setting->toArray());
+        return response()->json(['data' => $setting, 'status' => 'configured'], 201);
+    }
+
+    public function updateEInvoiceProvider(Request $request, int $id): JsonResponse
+    {
+        $setting = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $data = $request->validate([
+            'connection_config' => ['sometimes', 'required', 'array'],
+            'connection_config.endpoint' => ['nullable', 'url', 'max:2000'],
+            'connection_config.token' => ['nullable', 'string', 'max:2000'],
+            'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'],
+            'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'],
+            'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'],
+            'is_active' => ['sometimes', 'boolean'],
+        ]);
+        $setting->update($data);
+        app(AuditService::class)->record('e_invoice_provider.updated', $setting, null, $setting->toArray());
+        return response()->json(['data' => $setting->fresh(), 'status' => 'updated']);
+    }
+
+    public function deactivateEInvoiceProvider(Request $request, int $id): JsonResponse
+    {
+        $setting = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
+        $setting->update(['is_active' => false]);
+        app(AuditService::class)->record('e_invoice_provider.deactivated', $setting, ['is_active' => true], ['is_active' => false]);
+        return response()->json(['data' => $setting->fresh(), 'status' => 'deactivated']);
     }
 
     public function prepareEInvoice(Request $request, int $id, EInvoiceService $service): JsonResponse
@@ -428,9 +484,10 @@ class AccountingIntegrationController extends Controller
 
     public function journals(Request $request): JsonResponse
     {
-        $data = $request->validate(['company_id' => ['nullable', 'integer', 'exists:companies,id'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'updated_since' => ['nullable', 'date']]);
+        $data = $request->validate(['company_id' => ['nullable', 'integer', 'exists:companies,id'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'updated_since' => ['nullable', 'date'], 'status' => ['nullable', 'in:posted,reversed'], 'include_reversed' => ['nullable', 'boolean']]);
         $companyId = $this->requestedCompanyId($request, $data['company_id'] ?? null);
-        $journals = JournalEntry::with('lines')->where('status', 'posted')->when($companyId, fn ($query, $id) => $query->where('company_id', $id))->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('date', '>=', $date))->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('date', '<=', $date))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))->orderBy('updated_at')->orderBy('id');
+        $statuses = !empty($data['status']) ? [$data['status']] : (!empty($data['include_reversed']) ? ['posted', 'reversed'] : ['posted']);
+        $journals = JournalEntry::with(['lines', 'reversalOf', 'reversal', 'creator', 'reverser'])->whereIn('status', $statuses)->when($companyId, fn ($query, $id) => $query->where('company_id', $id))->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('date', '>=', $date))->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('date', '<=', $date))->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($journals, $request, 'accounting.journals', 100);
     }
 

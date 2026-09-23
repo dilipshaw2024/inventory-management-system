@@ -27,8 +27,9 @@ class EInvoiceProviderRegistryTest extends TestCase
 
         $registry = app(EInvoiceProviderRegistry::class);
 
-        $this->assertSame(['generic', 'test-provider'], $registry->keys());
+        $this->assertSame(['generic', 'http', 'test-provider'], $registry->keys());
         $this->assertFalse($registry->supportsSubmission('generic'));
+        $this->assertTrue($registry->supportsSubmission('http'));
         $this->assertFalse($registry->supportsSubmission('test-provider'));
     }
 }
