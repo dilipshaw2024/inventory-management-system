@@ -177,7 +177,7 @@ class AccountingReconciliationService
             - (float) Payment::where($scope)->where('approval_status', 'approved')->where('is_reversed', false)->where(fn ($query) => $query->whereDate('payment_date', '<=', $to)->orWhere(fn ($legacy) => $legacy->whereNull('payment_date')->whereDate('created_at', '<=', $to)))->sum('paid_amount');
         $snapshot = InventoryReconciliationSnapshot::where('company_id', $companyId)->whereDate('as_of_date', $to)->first();
         $inventory = $snapshot
-            ? (float) collect($snapshot->rows ?? [])->sum(fn (array $row): float => (float) ($row['balance_value'] ?? 0))
+            ? (float) collect($snapshot->rows ?? [])->sum(fn (array $row): float => (float) ($row['valuation_value'] ?? $row['balance_value'] ?? 0))
             : (float) InventoryMovement::where('company_id', $companyId)->whereDate('posted_at', '<=', $to)->get()->sum(function (InventoryMovement $movement): float {
                 $inbound = ['opening', 'receipt', 'transfer_in', 'adjustment_in', 'return_in', 'quarantine_out', 'release'];
                 $outbound = ['issue', 'transfer_out', 'adjustment_out', 'return_out', 'scrap', 'quarantine_in'];

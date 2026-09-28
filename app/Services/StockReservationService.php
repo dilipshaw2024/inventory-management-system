@@ -213,6 +213,21 @@ class StockReservationService
         }
     }
 
+    public function restoreForSourceRequirements(ProductionOrder $order, array $requirements): void
+    {
+        foreach ($requirements as $productId => $quantity) {
+            $quantity = (float) $quantity;
+            if ($quantity <= 0.000001) continue;
+            $product = Product::where(function ($query) use ($order): void {
+                $query->where('company_id', $order->company_id)->orWhereNull('company_id');
+            })->lockForUpdate()->findOrFail($productId);
+            if (app(InventoryAvailabilityService::class)->available($product, true, $order->location_id, $order->company_id) < $quantity - 0.000001) {
+                throw new \RuntimeException('Insufficient available stock to restore the production reservation for '.$product->name.'.');
+            }
+            $this->createBatchReservations($product, $quantity, $order->location_id, ['source_type' => $order->getMorphClass(), 'source_id' => $order->id]);
+        }
+    }
+
     public function reassign(StockReservation $reservation, ?int $locationId): StockReservation
     {
         return DB::transaction(function () use ($reservation, $locationId): StockReservation {

@@ -12,6 +12,7 @@ class InventoryMovement extends Model
     use BelongsToCompany;
 
     protected $guarded = [];
+    protected $appends = ['source_context'];
 
     protected static function booted(): void
     {
@@ -38,6 +39,11 @@ class InventoryMovement extends Model
     public function serial() { return $this->belongsTo(InventorySerial::class, 'serial_id'); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }
     public function allocations() { return $this->hasMany(InventoryMovementAllocation::class, 'movement_id'); }
+    public function reference() { return $this->morphTo(); }
+    public function getSourceContextAttribute(): ?array
+    {
+        return $this->relationLoaded('reference') ? app(\App\Services\InventoryMovementSourceContextService::class)->resolve($this->reference) : null;
+    }
 
     public function finalizeUnitCost(float $unitCost): void
     {

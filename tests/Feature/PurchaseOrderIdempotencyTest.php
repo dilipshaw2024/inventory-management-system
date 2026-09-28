@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Models\Category;
 use App\Models\Company;
+use App\Models\DocumentRevision;
 use App\Models\Product;
 use App\Models\Supplier;
 use App\Models\Unit;
@@ -37,6 +38,9 @@ class PurchaseOrderIdempotencyTest extends TestCase
 
         $created = $this->postJson('/api/integration/purchase-orders', $payload);
         $created->assertCreated()->assertJsonPath('status', 'pending_approval')->assertJsonPath('data.status', 'submitted');
+        $revision = DocumentRevision::where('document_type', PurchaseOrder::class)->where('document_id', $created->json('data.id'))->latest('version')->firstOrFail();
+        $this->assertSame($product->id, (int) data_get($revision->new_values, 'lines.0.product_id'));
+        $this->assertSame('3.000000', (string) data_get($revision->new_values, 'lines.0.ordered_qty'));
         $replayed = $this->postJson('/api/integration/purchase-orders', $payload + ['lines' => [['product_id' => $product->id, 'quantity' => 99, 'unit_price' => 99]]]);
         $replayed->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $created->json('data.id'));
         $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());

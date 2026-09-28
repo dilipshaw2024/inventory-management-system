@@ -12,6 +12,8 @@ class InventoryStatusTransfer extends Model
     protected $guarded = [];
     protected $casts = ['quantity' => 'decimal:6', 'recovery_quantity' => 'decimal:6', 'recovery_unit_cost' => 'decimal:6', 'inspection_required' => 'boolean', 'approved_at' => 'datetime', 'rejected_at' => 'datetime', 'inspected_at' => 'datetime'];
     public function product() { return $this->belongsTo(Product::class); }
+    public function batch() { return $this->belongsTo(InventoryBatch::class); }
+    public function serial() { return $this->belongsTo(InventorySerial::class); }
     public function recoveryProduct() { return $this->belongsTo(Product::class, 'recovery_product_id'); }
     public function location() { return $this->belongsTo(InventoryLocation::class); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }

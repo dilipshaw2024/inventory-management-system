@@ -14,6 +14,7 @@ use App\Models\Invoice;
 use App\Models\Customer;
 use App\Models\CustomerPaymentAllocation;
 use App\Models\CustomerCreditNote;
+use App\Models\SupplierCreditNote;
 use App\Models\PurchaseInvoice;
 use App\Models\SupplierPaymentAllocation;
 use App\Models\EInvoiceSubmission;
@@ -367,7 +368,15 @@ class AccountingIntegrationController extends Controller
         Payment::where($scope)->where('customer_id', $customer->id)->where('approval_status', 'approved')->where(function ($query): void { $query->where('is_reversed', false)->orWhereNull('is_reversed'); })->where(fn ($query) => $query->whereDate('payment_date', '<=', $to->toDateString())->orWhere(fn ($legacy) => $legacy->whereNull('payment_date')->whereDate('created_at', '<=', $to->toDateString())))->with(['allocations' => fn ($query) => $query->whereDate('allocated_at', '<=', $to->toDateString())])->get()->each(function (Payment $payment) use ($entries): void {
             $entries->push(['occurred_at' => ($payment->payment_date ?: $payment->created_at)->toDateString(), 'type' => 'payment', 'reference' => $payment->reference ?: 'PAY-'.$payment->id, 'source_id' => $payment->id, 'debit' => 0.0, 'credit' => (float) $payment->paid_amount, 'currency_code' => $payment->currency_code, 'allocated_amount' => (float) $payment->allocations->sum('amount'), 'allocated_invoice_amount' => (float) $payment->allocations->sum('amount'), 'allocated_payment_amount' => (float) $payment->allocations->sum(fn ($allocation): float => (float) ($allocation->payment_amount ?? $allocation->amount)), 'allocation_count' => $payment->allocations->count()]);
         });
-        $entries = $entries->sortBy(fn (array $entry): string => $entry['occurred_at'].':'.str_pad((string) $entry['source_id'], 12, '0', STR_PAD_LEFT))->values();
+        $entries = $entries->sortBy(function (array $entry): string {
+            $priority = match ($entry['type']) {
+                'invoice' => 10,
+                'customer_credit_note' => 20,
+                'payment' => 30,
+                default => 99,
+            };
+            return $entry['occurred_at'].':'.str_pad((string) $priority, 2, '0', STR_PAD_LEFT).':'.str_pad((string) $entry['source_id'], 12, '0', STR_PAD_LEFT);
+        })->values();
         $opening = (float) $entries->filter(fn (array $entry): bool => $entry['occurred_at'] < $from->toDateString())->sum(fn (array $entry): float => $entry['debit'] - $entry['credit']);
         $running = $opening;
         $rows = $entries->filter(fn (array $entry): bool => $entry['occurred_at'] >= $from->toDateString() && $entry['occurred_at'] <= $to->toDateString())->map(function (array $entry) use (&$running): array {
@@ -400,7 +409,16 @@ class AccountingIntegrationController extends Controller
         \App\Models\SupplierCreditNote::where($scope)->where('supplier_id', $supplier->id)->whereNull('supplier_claim_id')->where('status', 'approved')->where('total_amount', '>', 0)->whereDate('approved_at', '<=', $to->toDateString())->get()->each(function (\App\Models\SupplierCreditNote $note) use ($entries): void {
             $entries->push(['occurred_at' => optional($note->approved_at)->toDateString() ?: $note->credit_date->toDateString(), 'type' => 'supplier_credit_note', 'reference' => $note->credit_no, 'source_id' => $note->id, 'purchase_invoice_id' => $note->purchase_invoice_id, 'debit' => (float) $note->total_amount, 'credit' => 0.0, 'currency_code' => null]);
         });
-        $entries = $entries->sortBy(fn (array $entry): string => $entry['occurred_at'].':'.str_pad((string) $entry['source_id'], 12, '0', STR_PAD_LEFT))->values();
+        $entries = $entries->sortBy(function (array $entry): string {
+            $priority = match ($entry['type']) {
+                'purchase_invoice' => 10,
+                'supplier_credit_note' => 20,
+                'supplier_claim_settlement' => 25,
+                'supplier_payment' => 30,
+                default => 99,
+            };
+            return $entry['occurred_at'].':'.str_pad((string) $priority, 2, '0', STR_PAD_LEFT).':'.str_pad((string) $entry['source_id'], 12, '0', STR_PAD_LEFT);
+        })->values();
         $opening = (float) $entries->filter(fn (array $entry): bool => $entry['occurred_at'] < $from->toDateString())->sum(fn (array $entry): float => $entry['credit'] - $entry['debit']);
         $running = $opening;
         $rows = $entries->filter(fn (array $entry): bool => $entry['occurred_at'] >= $from->toDateString() && $entry['occurred_at'] <= $to->toDateString())->map(function (array $entry) use (&$running): array {
@@ -528,6 +546,54 @@ class AccountingIntegrationController extends Controller
         abort_unless($companyId, 403, 'A company is required for sales reconciliation.');
         $from = $data['from'] ?? now()->startOfMonth()->toDateString(); $to = $data['to'] ?? now()->toDateString();
         return response()->json($reconciliation->sales($companyId, $from, $to, $data['product_id'] ?? null, $data['customer_id'] ?? null, (float) ($data['tolerance'] ?? 0.01)));
+    }
+
+    public function supplierCreditReconciliation(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'supplier_id' => ['nullable', 'integer'], 'tolerance' => ['nullable', 'numeric', 'min:0'],
+        ]);
+        $companyId = $this->requestedCompanyId($request);
+        abort_unless($companyId, 403, 'A company is required for supplier-credit reconciliation.');
+        $from = $data['from'] ?? now()->startOfMonth()->toDateString();
+        $to = $data['to'] ?? now()->toDateString();
+        $tolerance = (float) ($data['tolerance'] ?? 0.01);
+        $notes = SupplierCreditNote::with(['supplier:id,name', 'journalEntry.lines'])
+            ->where('company_id', $companyId)->where('status', 'approved')
+            ->whereBetween('credit_date', [$from, $to])
+            ->when($data['supplier_id'] ?? null, fn ($query, $supplierId) => $query->where('supplier_id', $supplierId))
+            ->orderBy('credit_date')->orderBy('id')->get();
+        $rows = $notes->map(function (SupplierCreditNote $note) use ($tolerance): array {
+            $expected = (float) $note->total_amount;
+            $journal = $note->journalEntry;
+            $posted = $journal && $journal->status === 'posted'
+                ? (float) $journal->lines->sum(fn ($line): float => (float) $line->debit)
+                : 0.0;
+            $variance = round($expected - $posted, 6);
+            $status = !$journal ? 'missing_journal' : ($journal->status === 'reversed' ? 'reversed' : (abs($variance) > $tolerance ? 'variance' : 'reconciled'));
+            return [
+                'supplier_credit_note_id' => $note->id, 'credit_no' => $note->credit_no,
+                'credit_date' => $note->credit_date?->toDateString(), 'supplier_id' => $note->supplier_id,
+                'supplier_name' => $note->supplier?->name, 'supplier_claim_id' => $note->supplier_claim_id,
+                'purchase_invoice_id' => $note->purchase_invoice_id, 'expected_amount' => round($expected, 6),
+                'posted_amount' => round($posted, 6), 'variance' => $variance,
+                'journal_entry_id' => $journal?->id, 'journal_status' => $journal?->status,
+                'reconciliation_status' => $status, 'tolerance' => $tolerance,
+            ];
+        })->values();
+        return response()->json([
+            'data' => $rows,
+            'summary' => [
+                'credit_note_count' => $rows->count(), 'expected_amount' => round((float) $rows->sum('expected_amount'), 6),
+                'posted_amount' => round((float) $rows->sum('posted_amount'), 6), 'variance' => round((float) $rows->sum('variance'), 6),
+                'reconciled_count' => $rows->where('reconciliation_status', 'reconciled')->count(),
+                'variance_count' => $rows->where('reconciliation_status', 'variance')->count(),
+                'missing_journal_count' => $rows->where('reconciliation_status', 'missing_journal')->count(),
+                'reversed_count' => $rows->where('reconciliation_status', 'reversed')->count(),
+            ],
+            'meta' => ['from' => $from, 'to' => $to, 'tolerance' => $tolerance],
+        ]);
     }
 
     public function costCenterBudgets(Request $request): JsonResponse

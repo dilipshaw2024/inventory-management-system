@@ -84,7 +84,8 @@ class SalesFulfillmentController extends Controller
             $promotionResult = app(PromotionService::class)->applyToLines($promotionCode, $lineRows, (int) $order->customer_id, $order->date->toDateString());
             if ($promotionResult['promotion']) $order->update(['promotion_id' => $promotionResult['promotion']->id]);
             foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line['product_id'], 'batch_id' => $line['batch_id'] ?? null, 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
-            app(AuditService::class)->record('sales_order.created', $order, null, $order->toArray());
+            $lineSnapshots = $order->fresh('lines')->lines->map(fn (SalesOrderLine $line): array => $line->only(['product_id', 'batch_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price', 'discount_amount']))->values()->all();
+            app(AuditService::class)->record('sales_order.created', $order, null, $order->toArray() + ['lines' => $lineSnapshots]);
         });
         return redirect()->route('fulfillment.orders')->with(['message' => 'Sales order submitted.', 'alert-type' => 'success']);
     }

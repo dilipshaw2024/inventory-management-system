@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Models\Category;
 use App\Models\Company;
+use App\Models\DocumentRevision;
 use App\Models\Product;
 use App\Models\PurchaseRequisition;
 use App\Models\PurchaseRequisitionLine;
@@ -56,6 +57,15 @@ class PurchaseRfqIntegrationTest extends TestCase
             'rfq_supplier_id' => $supplierResponseId, 'lines' => [['purchase_rfq_line_id' => $lineId, 'unit_price' => 12.5, 'lead_days' => 3]],
         ]);
         $quoted->assertOk()->assertJsonPath('status', 'quoted')->assertJsonPath('data.status', 'quoted');
+        $quoteRevision = DocumentRevision::where('document_type', PurchaseRfq::class)->where('document_id', $rfqId)->latest('version')->firstOrFail();
+        $this->assertSame($lineId, (int) data_get($quoteRevision->new_values, 'lines.0.purchase_rfq_line_id'));
+        $this->assertSame('12.500000', (string) data_get($quoteRevision->new_values, 'lines.0.unit_price'));
+
+        $comparison = $this->getJson('/api/integration/rfqs/'.$rfqId.'/comparison');
+        $comparison->assertOk()
+            ->assertJsonPath('data.suppliers.0.complete', true)
+            ->assertJsonPath('data.suppliers.0.total_amount', 50)
+            ->assertJsonPath('data.suppliers.0.rank', 1);
 
         $feed = $this->getJson('/api/integration/rfqs?status=submitted');
         $feed->assertOk()->assertJsonPath('data.0.id', $rfqId)->assertJsonPath('data.0.suppliers.0.quotations.0.unit_price', '12.500000');

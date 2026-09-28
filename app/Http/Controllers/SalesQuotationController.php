@@ -58,7 +58,8 @@ class SalesQuotationController extends Controller
         foreach ($data['product_id'] as $index => $productId) {
             SalesQuotationLine::create(['sales_quotation_id' => $quotation->id, 'product_id' => $productId, 'quantity' => $data['quantity'][$index], 'unit_price' => $data['unit_price'][$index], 'discount_amount' => $data['discount_amount'][$index]]);
         }
-        app(AuditService::class)->record('sales_quotation.created', $quotation, null, $quotation->toArray());
+        $lineSnapshots = $quotation->fresh('lines')->lines->map(fn (SalesQuotationLine $line): array => $line->only(['product_id', 'quantity', 'unit_price', 'discount_amount']))->values()->all();
+        app(AuditService::class)->record('sales_quotation.created', $quotation, null, $quotation->toArray() + ['lines' => $lineSnapshots]);
         return redirect()->route('sales.quotations.index')->with(['message' => 'Sales quotation submitted.', 'alert-type' => 'success']);
     }
 

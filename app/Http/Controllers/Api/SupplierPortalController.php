@@ -62,6 +62,8 @@ class SupplierPortalController extends Controller
                 $rfq = $response->rfq()->with('lines')->lockForUpdate()->firstOrFail();
                 $lineIds = collect($data['lines'])->pluck('purchase_rfq_line_id');
                 if ($lineIds->duplicates()->isNotEmpty()) throw new \RuntimeException('A quotation line may appear only once.');
+                $beforeStatus = (string) $response->status;
+                $beforeLines = $response->quotations()->get()->map(fn ($quote): array => $quote->only(['purchase_rfq_line_id', 'unit_price', 'lead_days', 'valid_until', 'supplier_reference', 'notes']))->values()->all();
                 foreach ($data['lines'] as $lineData) {
                     $line = $rfq->lines->firstWhere('id', (int) $lineData['purchase_rfq_line_id']);
                     if (!$line) throw new \RuntimeException('A quotation line does not belong to this RFQ.');
@@ -71,7 +73,8 @@ class SupplierPortalController extends Controller
                     );
                 }
                 $response->update(['status' => 'quoted', 'quoted_at' => now(), 'portal_last_accessed_at' => now()]);
-                app(AuditService::class)->record('purchase_rfq.supplier_portal_quoted', $rfq, null, ['rfq_supplier_id' => $response->id, 'supplier_id' => $response->supplier_id, 'api' => true]);
+                $afterLines = $response->fresh('quotations')->quotations->map(fn ($quote): array => $quote->only(['purchase_rfq_line_id', 'unit_price', 'lead_days', 'valid_until', 'supplier_reference', 'notes']))->values()->all();
+                app(AuditService::class)->record('purchase_rfq.supplier_portal_quoted', $rfq, ['status' => $beforeStatus, 'lines' => $beforeLines], ['rfq_supplier_id' => $response->id, 'supplier_id' => $response->supplier_id, 'status' => 'quoted', 'lines' => $afterLines, 'api' => true]);
                 return $response->fresh('quotations');
             });
         } catch (\RuntimeException $exception) {

@@ -56,5 +56,14 @@ class ProductIdempotencyTest extends TestCase
         $response->assertCreated()->assertJsonPath('data.costing_method', 'standard');
         $this->assertEquals(23.75, (float) $response->json('data.standard_cost'));
         $this->assertDatabaseHas('products', ['id' => $response->json('data.id'), 'costing_method' => 'standard', 'standard_cost' => 23.75]);
+
+        $category->update(['default_costing_method' => 'moving_average', 'default_standard_cost' => null]);
+        $categoryProduct = $this->postJson('/api/inventory/products', [
+            'external_reference' => 'PRODUCT-COSTING-CATEGORY-DEFAULT-1', 'name' => 'Category Default Cost Product',
+            'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id,
+            'tracking_type' => 'none', 'product_type' => 'stock', 'status' => true,
+        ]);
+        $categoryProduct->assertCreated()->assertJsonPath('data.costing_method', 'moving_average');
+        $this->assertNull($categoryProduct->json('data.standard_cost'));
     }
 }

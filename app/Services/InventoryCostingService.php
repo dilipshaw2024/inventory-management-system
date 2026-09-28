@@ -6,6 +6,7 @@ use App\Models\InventoryCostConsumption;
 use App\Models\InventoryCostLayer;
 use App\Models\InventoryMovement;
 use App\Models\InventoryMovementAllocation;
+use App\Models\InventoryExpiryOverrideRequest;
 use App\Models\Product;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Collection;
@@ -50,7 +51,7 @@ class InventoryCostingService
                 $quantity = $cutoff
                     ? max(0, (float) $layer->original_quantity - $consumed)
                     : (float) $layer->remaining_quantity;
-                return ['layer_id' => (int) $layer->id, 'location_id' => $layer->location_id, 'location_code' => $layer->location?->code, 'quantity' => $quantity, 'current_unit_cost' => (float) $layer->unit_cost];
+                return ['layer_id' => (int) $layer->id, 'location_id' => $layer->location_id, 'location_code' => $layer->location?->code, 'department_id' => $layer->department_id, 'cost_center_id' => $layer->cost_center_id, 'quantity' => $quantity, 'current_unit_cost' => (float) $layer->unit_cost];
             })->filter(fn (array $row): bool => $row['quantity'] > 0.000001)->values();
             if ($rows->isEmpty()) return null;
 
@@ -137,8 +138,10 @@ class InventoryCostingService
             $layers = $layers->sortBy(fn ($layer) => ($layer->batch?->expiry_date ?? $layer->batch?->best_before_date)?->timestamp ?? PHP_INT_MAX)->values();
             $hasBatchDate = $layers->contains(fn ($layer) => $layer->batch?->expiry_date !== null || $layer->batch?->best_before_date !== null);
             if ($hasBatchDate) {
-                $allowExpired = app(ErpSettingService::class)->get('allow_expired_batch_issue', false);
-                $allowPastBestBefore = app(ErpSettingService::class)->get('allow_past_best_before_issue', false);
+                $allowExpired = app(ErpSettingService::class)->get('allow_expired_batch_issue', false)
+                    || $this->hasExpiryOverride($movement, 'expired');
+                $allowPastBestBefore = app(ErpSettingService::class)->get('allow_past_best_before_issue', false)
+                    || $this->hasExpiryOverride($movement, 'best_before');
                 $layers = $layers->filter(fn ($layer): bool => ($allowExpired || !$layer->batch?->expiry_date || !$layer->batch->expiry_date->lt(\Carbon\Carbon::today())) && ($allowPastBestBefore || !$layer->batch?->best_before_date || !$layer->batch->best_before_date->lt(\Carbon\Carbon::today())))->values();
             }
         }
@@ -181,5 +184,13 @@ class InventoryCostingService
             $totalCost += $remaining * $cost;
         }
         return $totalCost;
+    }
+
+    private function hasExpiryOverride(?InventoryMovement $movement, string $scope): bool
+    {
+        if (!$movement || $movement->reference_type !== (new \App\Models\InventoryDocument())->getMorphClass()) return false;
+        return InventoryExpiryOverrideRequest::withoutGlobalScopes()
+            ->where('company_id', $movement->company_id)->where('inventory_document_id', $movement->reference_id)
+            ->where('status', 'approved')->whereNull('consumed_at')->whereIn('scope', [$scope, 'both'])->exists();
     }
 }

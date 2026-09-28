@@ -74,5 +74,10 @@ class SupplierClaimTest extends TestCase
         $this->assertDatabaseHas('supplier_credit_notes', ['external_reference' => 'CN-EXT-1', 'status' => 'approved']);
         $assessment = app(SupplierPayablesService::class)->assess($supplier, now()->toDateString());
         $this->assertSame(175.0, $assessment['outstanding']);
+        Sanctum::actingAs($checker, ['accounting:read']);
+        $this->getJson('/api/accounting/supplier-credit-reconciliation?from='.now()->toDateString().'&to='.now()->toDateString())
+            ->assertOk()->assertJsonPath('data.0.expected_amount', 25)
+            ->assertJsonPath('data.0.reconciliation_status', 'missing_journal')
+            ->assertJsonPath('summary.missing_journal_count', 1);
     }
 }

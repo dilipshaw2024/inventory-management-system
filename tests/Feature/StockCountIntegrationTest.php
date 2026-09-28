@@ -37,11 +37,14 @@ class StockCountIntegrationTest extends TestCase
         $this->getJson('/api/inventory/counts/'.$countId.'/reconciliation')->assertOk()
             ->assertJsonPath('summary.line_count', 1)->assertJsonPath('summary.stale_line_count', 0)
             ->assertJsonPath('data.0.current_system_quantity', 10)->assertJsonPath('data.0.current_variance_quantity', -3)
+            ->assertJsonPath('data.0.current_variance_value', -12)->assertJsonPath('summary.current_variance_value', -12)
             ->assertJsonPath('read_only', true);
         $this->getJson('/api/inventory/counts/reconciliation?status=submitted')
             ->assertOk()->assertJsonPath('summary.count_count', 1)
             ->assertJsonPath('summary.variance_line_count', 1)
             ->assertJsonPath('summary.signed_variance_quantity', -3)
+            ->assertJsonPath('summary.signed_variance_value', -12)
+            ->assertJsonPath('summary.absolute_variance_value', 12)
             ->assertJsonPath('data.0.absolute_variance_quantity', 3)
             ->assertJsonPath('meta.read_only', true);
         $this->postJson('/api/inventory/counts', [

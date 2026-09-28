@@ -44,5 +44,6 @@ class DashboardMetricsTest extends TestCase
         $response = $this->getJson('/api/inventory/dashboard?months=3');
 
         $response->assertOk()->assertJsonPath('meta.visibility.finance', false)->assertJsonPath('meta.visibility.service', false)->assertJsonPath('data.month_sales', null)->assertJsonPath('data.receivables', null)->assertJsonPath('data.sales_trend', [])->assertJsonPath('data.open_service_requests', null);
+        $response->assertJsonPath('meta.visibility.inventory', false)->assertJsonPath('data.total_products', null)->assertJsonPath('data.low_stock', null)->assertJsonPath('data.exception_drilldowns.low_stock', [])->assertJsonPath('data.pending_approvals', null);
     }
 }

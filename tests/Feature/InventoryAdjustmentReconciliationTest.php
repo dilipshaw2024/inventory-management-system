@@ -3,7 +3,10 @@
 namespace Tests\Feature;
 
 use App\Models\ChartOfAccount;
+use App\Models\AccountMapping;
 use App\Models\Company;
+use App\Models\CostCenter;
+use App\Models\Department;
 use App\Models\InventoryAdjustment;
 use App\Models\InventoryMovement;
 use App\Models\JournalEntry;
@@ -44,5 +47,41 @@ class InventoryAdjustmentReconciliationTest extends TestCase
             ->assertJsonPath('summary.posted_value', 10)->assertJsonPath('summary.variance', 7)
             ->assertJsonPath('summary.missing_journal_count', 1)->assertJsonPath('data.0.reconciliation_status', 'reconciled')
             ->assertJsonPath('data.1.reconciliation_status', 'missing_journal');
+    }
+
+    public function test_approved_adjustment_carries_dimensions_to_movement_and_journal(): void
+    {
+        $company = Company::create(['name' => 'Adjustment Dimensions Co', 'code' => 'ADJ-DIM']);
+        $requester = User::factory()->create(['company_id' => $company->id]);
+        $checker = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Dimension supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Dimension each', 'status' => 1]);
+        $category = Category::create(['name' => 'Dimension category', 'status' => 1]);
+        $department = Department::create(['company_id' => $company->id, 'code' => 'DEPT-ADJ-DIM', 'name' => 'Adjustment Operations']);
+        $costCenter = CostCenter::create(['company_id' => $company->id, 'code' => 'CC-ADJ-DIM', 'name' => 'Adjustment Cost Center', 'is_active' => true]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Dimension adjusted item', 'sku' => 'ADJ-DIM-ITEM', 'quantity' => 0, 'status' => 1]);
+        $inventory = ChartOfAccount::create(['company_id' => $company->id, 'code' => 'ADJ-DIM-1300', 'name' => 'Inventory', 'account_type' => 'asset', 'is_active' => true]);
+        $grni = ChartOfAccount::create(['company_id' => $company->id, 'code' => 'ADJ-DIM-2100', 'name' => 'GRNI', 'account_type' => 'liability', 'is_active' => true]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'inventory', 'account_id' => $inventory->id]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'grni', 'account_id' => $grni->id]);
+
+        Sanctum::actingAs($requester, ['inventory:write']);
+        $adjustment = $this->postJson('/api/inventory/adjustments', [
+            'external_reference' => 'ADJ-DIM-1', 'date' => now()->toDateString(), 'reason_code' => 'opening_stock',
+            'lines' => [['product_id' => $product->id, 'direction' => 'in', 'quantity' => 2, 'unit_cost' => 11, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id]],
+        ])->assertCreated();
+        $adjustmentId = $adjustment->json('data.id');
+        Sanctum::actingAs($checker, ['inventory:write']);
+        $this->postJson('/api/inventory/adjustments/'.$adjustmentId.'/approve')->assertOk()->assertJsonPath('data.status', 'approved');
+
+        $this->assertDatabaseHas('inventory_movements', ['reference_id' => $adjustmentId, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id]);
+        $journalId = \App\Models\JournalEntry::where('source_id', $adjustmentId)->where('status', 'posted')->value('id');
+        $this->assertNotNull($journalId);
+        $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $journalId, 'account_id' => $inventory->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'debit' => 22]);
+        $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $journalId, 'account_id' => $grni->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'credit' => 22]);
+        Sanctum::actingAs($checker, ['inventory:read']);
+        $this->getJson('/api/inventory/adjustment-reconciliation?from='.now()->toDateString().'&to='.now()->toDateString().'&department_id='.$department->id.'&cost_center_id='.$costCenter->id)
+            ->assertOk()->assertJsonPath('meta.department_id', $department->id)->assertJsonPath('meta.cost_center_id', $costCenter->id)
+            ->assertJsonPath('summary.expected_value', 22)->assertJsonPath('summary.posted_value', 22)->assertJsonPath('data.0.valuation_source', 'movement_cost_layer_allocations')->assertJsonPath('data.0.reconciliation_status', 'reconciled');
     }
 }

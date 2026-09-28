@@ -14,8 +14,10 @@ use App\Models\ApprovalEscalation;
 use App\Models\RoleConflict;
 use App\Models\DataRetentionPolicy;
 use App\Models\DataRetentionPurgeRequest;
+use App\Models\DocumentRevision;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
+use App\Services\RevisionRestoreService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -35,6 +37,53 @@ class SecurityIntegrationController extends Controller
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($logs, $request, 'security.audit-logs', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function revisions(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'document_type' => ['nullable', 'string', 'max:150'],
+            'document_id' => ['nullable', 'integer', 'min:1'],
+            'changed_since' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for revision synchronization.');
+        $revisions = DocumentRevision::with('user:id,name,email')
+            ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+            ->when($data['document_type'] ?? null, fn ($query, $type) => $query->where('document_type', $type))
+            ->when($data['document_id'] ?? null, fn ($query, $id) => $query->where('document_id', $id))
+            ->when($data['changed_since'] ?? null, fn ($query, $date) => $query->where('changed_at', '>=', $date))
+            ->orderBy('changed_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($revisions, $request, 'security.revisions', (int) ($data['per_page'] ?? 50), 'changed_at');
+    }
+
+    public function revisionDiff(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for revision synchronization.');
+        $revision = DocumentRevision::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($id);
+        $old = is_array($revision->old_values) ? $revision->old_values : [];
+        $new = is_array($revision->new_values) ? $revision->new_values : [];
+        $changes = collect(array_unique(array_merge(array_keys($old), array_keys($new))))
+            ->sort()->mapWithKeys(fn (string $key): array => ($old[$key] ?? null) === ($new[$key] ?? null) ? [] : [$key => ['from' => $old[$key] ?? null, 'to' => $new[$key] ?? null]])
+            ->all();
+        return response()->json(['data' => [
+            'revision_id' => $revision->id, 'document_type' => $revision->document_type,
+            'document_id' => $revision->document_id, 'version' => $revision->version,
+            'changed_at' => $revision->changed_at?->toISOString(), 'changed_by' => $revision->changed_by,
+            'changes' => $changes,
+        ]]);
+    }
+
+    public function restoreRevision(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:500']]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for revision restoration.');
+        $revision = DocumentRevision::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($id);
+        $record = app(RevisionRestoreService::class)->restore($revision, $data['reason'], $companyId);
+        return response()->json(['data' => $record, 'status' => 'restored', 'revision_id' => $revision->id]);
     }
 
     public function users(Request $request): JsonResponse

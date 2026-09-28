@@ -15,6 +15,7 @@ use App\Models\Product;
 use App\Models\Supplier;
 use App\Models\Branch;
 use App\Models\InventoryBatch;
+use App\Models\InventoryStatusTransfer;
 use App\Services\AuditService;
 use App\Services\AutomaticAccountingService;
 use App\Services\InventoryAvailabilityService;
@@ -40,7 +41,7 @@ class ReturnIntegrationController extends Controller
             'source_invoice_id' => ['nullable', 'integer', Rule::exists('invoices', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'source_goods_receipt_id' => ['nullable', 'integer', Rule::exists('goods_receipts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'source_delivery_id' => ['nullable', 'integer', Rule::exists('deliveries', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
-            'date' => ['required', 'date'], 'reason_code' => ['required', 'string', 'max:100'], 'inspection_required' => ['nullable', 'boolean'], 'description' => ['nullable', 'string', 'max:2000'],
+            'date' => ['required', 'date'], 'reason_code' => ['required', 'string', 'max:100'], 'inspection_required' => ['nullable', 'boolean'], 'disposition_status' => ['nullable', 'in:available,quarantine,damaged'], 'description' => ['nullable', 'string', 'max:2000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_cost' => ['nullable', 'numeric', 'min:0'],
             'lines.*.batch_id' => ['nullable', 'integer'],
@@ -67,7 +68,7 @@ class ReturnIntegrationController extends Controller
                 'return_no' => app(NumberingSequenceService::class)->nextOrFallback('inventory_return', 'RET-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
                 'return_type' => $data['return_type'], 'customer_id' => $data['customer_id'] ?? null, 'supplier_id' => $data['supplier_id'] ?? null,
                 'source_invoice_id' => $data['source_invoice_id'] ?? null, 'source_goods_receipt_id' => $data['source_goods_receipt_id'] ?? null, 'source_delivery_id' => $data['source_delivery_id'] ?? null, 'location_id' => $data['location_id'] ?? null,
-                'date' => $data['date'], 'reason_code' => $data['reason_code'], 'inspection_required' => (bool) ($data['inspection_required'] ?? false), 'inspection_status' => !empty($data['inspection_required']) ? 'pending' : 'not_required', 'description' => $data['description'] ?? null,
+                'date' => $data['date'], 'reason_code' => $data['reason_code'], 'inspection_required' => (bool) ($data['inspection_required'] ?? false), 'inspection_status' => !empty($data['inspection_required']) ? 'pending' : 'not_required', 'disposition_status' => $data['disposition_status'] ?? 'available', 'description' => $data['description'] ?? null,
                 'tax_exempt' => (bool) $party?->tax_exempt, 'tax_exemption_number' => $party?->tax_exemption_number, 'tax_jurisdiction' => $party?->tax_jurisdiction, 'created_by' => $request->user()?->id,
             ]);
             foreach ($data['lines'] as $line) {
@@ -139,6 +140,23 @@ class ReturnIntegrationController extends Controller
                 $movementType = $salesReturn ? 'return_in' : 'return_out';
                 if ($changedSerials->isNotEmpty()) foreach ($changedSerials as $serial) app(InventoryLedgerService::class)->post($product->id, $movementType, 1, (float) $line->unit_cost, $return->location_id, $return, $return->reason_code, null, $batch?->id ?: $serial->batch_id, $serial->id);
                 else app(InventoryLedgerService::class)->post($product->id, $movementType, (float) $line->quantity, (float) $line->unit_cost, $return->location_id, $return, $return->reason_code, null, $batch?->id);
+
+                if ($salesReturn && $return->disposition_status !== 'available') {
+                    $dispositionSerials = $changedSerials->isNotEmpty() ? $changedSerials : collect([null]);
+                    foreach ($dispositionSerials as $dispositionSerial) {
+                        $transfer = new InventoryStatusTransfer([
+                            'company_id' => $return->company_id, 'transfer_no' => 'RET-DISP-'.$return->id.'-'.$line->id.'-'.($dispositionSerial?->id ?: 'batch'),
+                            'product_id' => $product->id, 'batch_id' => $batch?->id, 'serial_id' => $dispositionSerial?->id, 'location_id' => $return->location_id, 'from_status' => 'available',
+                            'to_status' => $return->disposition_status, 'quantity' => $dispositionSerial ? 1 : $line->quantity,
+                            'reason' => 'Return disposition for '.$return->return_no, 'status' => 'approved',
+                            'inspection_required' => false, 'inspection_status' => 'not_required',
+                            'created_by' => $request->user()?->id, 'approved_by' => $request->user()?->id, 'approved_at' => now(),
+                        ]);
+                        $transfer->save();
+                        app(\App\Services\InventoryStatusService::class)->apply($transfer);
+                        app(AuditService::class)->record('inventory_return.disposition_applied', $transfer, null, ['return_id' => $return->id, 'disposition_status' => $return->disposition_status, 'quantity' => $transfer->quantity, 'batch_id' => $transfer->batch_id, 'serial_id' => $transfer->serial_id]);
+                    }
+                }
             }
             $return->update(['status' => 'approved', 'approved_by' => $request->user()?->id, 'approved_at' => now()]);
             app(AutomaticAccountingService::class)->postSalesReturn($return->load('lines.product'));

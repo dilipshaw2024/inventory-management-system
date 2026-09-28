@@ -30,7 +30,7 @@ class BatchIntegrationController extends Controller
         $inbound = ['opening', 'receipt', 'transfer_in', 'adjustment_in', 'return_in', 'quarantine_out', 'release'];
         $outbound = ['issue', 'transfer_out', 'adjustment_out', 'return_out', 'scrap', 'quarantine_in'];
         $movements = InventoryMovement::with([
-            'product:id,name,sku,company_id', 'location:id,code,name', 'creator:id,name,email',
+            'product:id,name,sku,company_id', 'location:id,code,name', 'creator:id,name,email', 'reference',
             'batch:id,product_id,batch_no,lot_no,manufacturing_date,expiry_date,best_before_date,warranty_until',
             'serial:id,product_id,batch_id,serial_no,status,warranty_until',
             'allocations.batch:id,product_id,batch_no,lot_no,manufacturing_date,expiry_date,best_before_date,warranty_until',

@@ -15,4 +15,5 @@ class InventorySerial extends Model
     public function location() { return $this->belongsTo(InventoryLocation::class); }
     public function batch() { return $this->belongsTo(InventoryBatch::class, 'batch_id'); }
     public function movements() { return $this->hasMany(InventoryMovement::class, 'serial_id'); }
+    public function serviceHandoffs() { return $this->hasMany(ServiceAssetSerialHandoff::class, 'inventory_serial_id'); }
 }

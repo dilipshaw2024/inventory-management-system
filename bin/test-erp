@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ! -f .env.testing ]]; then
+    echo "Missing .env.testing. Copy .env.testing.example and configure a disposable MySQL database." >&2
+    exit 2
+fi
+
+read_env_value() {
+    local file="$1"
+    local key="$2"
+    sed -n "s/^${key}=//p" "$file" | tail -n 1 | tr -d '\"' | tr -d "'"
+}
+
+application_database="$(read_env_value .env DB_DATABASE)"
+test_database="$(read_env_value .env.testing DB_DATABASE)"
+if [[ -z "$test_database" || "$test_database" == "$application_database" ]]; then
+    echo "Refusing to run: .env.testing must use a database different from .env (application: ${application_database:-unknown})." >&2
+    exit 3
+fi
+
+APP_ENV=testing php artisan config:clear >/dev/null
+php artisan test --env=testing "$@"

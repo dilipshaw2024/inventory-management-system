@@ -102,10 +102,10 @@ class InventoryAdjustmentApprovalService
                     : ($line->direction === 'in' ? 'adjustment_in' : 'adjustment_out');
                 if ($serials) {
                     foreach ($serials as $serial) {
-                        app(InventoryLedgerService::class)->post($product->id, $movementType, 1, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id, $serial->id);
+                        app(InventoryLedgerService::class)->post($product->id, $movementType, 1, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id, $serial->id, $line->department_id, $line->cost_center_id);
                     }
                 } else {
-                    app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id);
+                    app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id, null, $line->department_id, $line->cost_center_id);
                 }
             }
 

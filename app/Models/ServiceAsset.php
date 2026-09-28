@@ -25,4 +25,5 @@ class ServiceAsset extends Model
     public function depreciationEntries() { return $this->hasMany(AssetDepreciationEntry::class, 'asset_id'); }
     public function meterReadings() { return $this->hasMany(ServiceAssetMeterReading::class, 'asset_id')->orderByDesc('occurred_at')->orderByDesc('id'); }
     public function ownershipTransfers() { return $this->hasMany(AssetOwnershipTransfer::class, 'asset_id')->orderByDesc('effective_date')->orderByDesc('id'); }
+    public function serialHandoffs() { return $this->hasMany(ServiceAssetSerialHandoff::class, 'service_asset_id')->orderByDesc('effective_at')->orderByDesc('id'); }
 }

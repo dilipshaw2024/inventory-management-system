@@ -17,6 +17,7 @@ class InventoryAdjustmentRequest extends FormRequest
         $company = auth()->user()?->company_id;
         $productScope = Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $company)->orWhereNull('company_id'));
         $locationScope = \App\Services\InventoryLocationRuleService::existsForCompany($company);
+        $dimensionScope = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $company)->orWhereNull('company_id'));
         return [
             'adjustment_no' => ['nullable', 'string', 'max:100', Rule::unique('inventory_adjustments', 'adjustment_no')->where(fn ($query) => $query->where('company_id', $company)->orWhereNull('company_id'))],
             'date' => ['required', 'date'],
@@ -44,6 +45,10 @@ class InventoryAdjustmentRequest extends FormRequest
             'warranty_until.*' => ['nullable', 'date'],
             'location_id' => ['nullable', 'array'],
             'location_id.*' => ['nullable', 'integer', $locationScope],
+            'department_id' => ['nullable', 'array'],
+            'department_id.*' => ['nullable', 'integer', $dimensionScope('departments')],
+            'cost_center_id' => ['nullable', 'array'],
+            'cost_center_id.*' => ['nullable', 'integer', $dimensionScope('cost_centers')],
         ];
     }
 

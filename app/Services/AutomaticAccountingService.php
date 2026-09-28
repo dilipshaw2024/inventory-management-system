@@ -33,9 +33,22 @@ class AutomaticAccountingService
         $variance = $this->account($varianceKey, $companyId);
         if (!$inventory || !$variance) return null;
         $currency = $this->currency($companyId);
-        $lines = (float) $run->total_variance >= 0
-            ? [['account_id' => $inventory, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1], ['account_id' => $variance, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1]]
-            : [['account_id' => $variance, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1], ['account_id' => $inventory, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1]];
+        $run->loadMissing('lines');
+        $groups = $run->lines->groupBy(fn ($line): string => ($line->department_id ?? 'null').'|'.($line->cost_center_id ?? 'null'));
+        $lines = [];
+        foreach ($groups as $group) {
+            $groupAmount = abs((float) $group->sum('variance_amount'));
+            if ($groupAmount <= 0.000001) continue;
+            $dimensions = ['department_id' => $group->first()->department_id, 'cost_center_id' => $group->first()->cost_center_id];
+            if ((float) $run->total_variance >= 0) {
+                $lines[] = ['account_id' => $inventory, 'debit' => $groupAmount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions;
+                $lines[] = ['account_id' => $variance, 'debit' => 0, 'credit' => $groupAmount, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions;
+            } else {
+                $lines[] = ['account_id' => $variance, 'debit' => $groupAmount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions;
+                $lines[] = ['account_id' => $inventory, 'debit' => 0, 'credit' => $groupAmount, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions;
+            }
+        }
+        if (!$lines) return null;
         return app(AccountingService::class)->post([
             'company_id' => $companyId, 'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
             'date' => $run->as_of_date->toDateString(), 'description' => 'Inventory cost revaluation '.$run->id,
@@ -70,14 +83,15 @@ class AutomaticAccountingService
         $debit = $this->account($operation['debit'], $companyId);
         $credit = $this->account($operation['credit'], $companyId);
         if (!$debit || !$credit) return;
+        $dimensions = ['department_id' => $movement->department_id, 'cost_center_id' => $movement->cost_center_id];
         app(AccountingService::class)->post([
             'company_id' => $companyId,
             'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
             'date' => optional($movement->posted_at)->toDateString() ?? now()->toDateString(),
             'description' => 'Automatic inventory '.$movement->movement_type,
         ], [
-            ['account_id' => $debit, 'debit' => $totalCost, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1],
-            ['account_id' => $credit, 'debit' => 0, 'credit' => $totalCost, 'currency_code' => $currency, 'exchange_rate' => 1],
+            ['account_id' => $debit, 'debit' => $totalCost, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions,
+            ['account_id' => $credit, 'debit' => 0, 'credit' => $totalCost, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions,
         ], $source ?? $movement);
     }
 

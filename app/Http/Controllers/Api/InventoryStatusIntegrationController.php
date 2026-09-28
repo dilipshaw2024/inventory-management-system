@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\InventoryLocation;
 use App\Models\InventoryStatusBalance;
 use App\Models\InventoryStatusTransfer;
+use App\Models\InventoryBatch;
+use App\Models\InventorySerial;
 use App\Models\Product;
 use App\Models\Branch;
 use App\Services\AuditService;
@@ -27,6 +29,9 @@ class InventoryStatusIntegrationController extends Controller
             'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'],
             'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
+        if (!empty($data['batch_id']) && !InventoryBatch::whereKey($data['batch_id'])->where('product_id', $data['product_id'])->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->exists()) abort(422, 'The selected batch does not belong to the selected company product.');
+        if (!empty($data['serial_id']) && !InventorySerial::whereKey($data['serial_id'])->where('product_id', $data['product_id'])->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->exists()) abort(422, 'The selected serial does not belong to the selected company product.');
+        if (!empty($data['batch_id']) && !empty($data['serial_id']) && !InventorySerial::whereKey($data['serial_id'])->where('batch_id', $data['batch_id'])->exists()) abort(422, 'The selected serial does not belong to the selected batch.');
         $query = $this->companyScope(InventoryStatusBalance::with(['product', 'location']), $companyId)
             ->where('quantity', '>', 0)
             ->when($data['status'] ?? null, fn ($q, $status) => $q->where('status', $status))
@@ -84,7 +89,7 @@ class InventoryStatusIntegrationController extends Controller
             'to_status' => ['nullable', 'in:available,blocked,quarantine,damaged,scrap'],
             'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
-        $query = $this->companyScope(InventoryStatusTransfer::with(['product', 'recoveryProduct', 'location', 'creator', 'approver', 'inspector']), $companyId)
+        $query = $this->companyScope(InventoryStatusTransfer::with(['product', 'batch', 'serial', 'recoveryProduct', 'location', 'creator', 'approver', 'inspector']), $companyId)
             ->when($data['status'] ?? null, fn ($q, $status) => $q->where('status', $status))
             ->when($data['from_status'] ?? null, fn ($q, $status) => $q->where('from_status', $status))
             ->when($data['to_status'] ?? null, fn ($q, $status) => $q->where('to_status', $status))
@@ -99,6 +104,8 @@ class InventoryStatusIntegrationController extends Controller
         $data = $request->validate([
             'external_reference' => ['nullable', 'string', 'max:150'],
             'product_id' => ['required', 'integer', Rule::exists('products', 'id')->where(fn ($q) => $q->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'batch_id' => ['nullable', 'integer', Rule::exists('inventory_batches', 'id')],
+            'serial_id' => ['nullable', 'integer', Rule::exists('inventory_serials', 'id')],
             'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
             'from_status' => ['required', 'in:available,blocked,quarantine,damaged'],
             'to_status' => ['required', 'in:available,blocked,quarantine,damaged,scrap', 'different:from_status'],
@@ -115,7 +122,7 @@ class InventoryStatusIntegrationController extends Controller
             $transfer = InventoryStatusTransfer::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
                 'transfer_no' => app(NumberingSequenceService::class)->nextOrFallback('inventory_status_transfer', 'ST-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
-                'product_id' => $data['product_id'], 'location_id' => $data['location_id'] ?? null,
+                'product_id' => $data['product_id'], 'batch_id' => $data['batch_id'] ?? null, 'serial_id' => $data['serial_id'] ?? null, 'location_id' => $data['location_id'] ?? null,
                 'from_status' => $data['from_status'], 'to_status' => $data['to_status'], 'quantity' => $data['quantity'],
                 'reason' => $data['reason'], 'recovery_product_id' => $data['recovery_product_id'] ?? null, 'recovery_quantity' => $data['recovery_quantity'] ?? null, 'recovery_unit_cost' => $data['recovery_unit_cost'] ?? null, 'inspection_required' => (bool) ($data['inspection_required'] ?? false), 'inspection_status' => !empty($data['inspection_required']) ? 'pending' : 'not_required', 'status' => 'pending', 'created_by' => $request->user()?->id,
             ]);

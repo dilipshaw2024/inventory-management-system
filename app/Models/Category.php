@@ -11,7 +11,7 @@ class Category extends Model
 {
     use HasFactory, SoftDeletes, BelongsToCompany;
     protected $guarded = [];
-    protected $casts = ['tax_rate' => 'decimal:4', 'is_active' => 'boolean', 'required_attribute_ids' => 'array'];
+    protected $casts = ['tax_rate' => 'decimal:4', 'is_active' => 'boolean', 'required_attribute_ids' => 'array', 'default_standard_cost' => 'decimal:6'];
 
     public function products(){
         return $this->hasMany(Product::class, 'category_id');

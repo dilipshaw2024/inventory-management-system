@@ -17,4 +17,5 @@ class ProductionOrder extends Model
     public function pausedBy() { return $this->belongsTo(User::class, 'paused_by'); }
     public function closedBy() { return $this->belongsTo(User::class, 'closed_by'); }
     public function operations() { return $this->hasMany(ProductionOperation::class, 'production_order_id')->orderBy('sequence'); }
+    public function materialIssueDocuments() { return $this->hasMany(InventoryDocument::class, 'production_order_id')->where('document_type', 'issue'); }
 }

@@ -10,6 +10,8 @@ use App\Models\ProductionOrder;
 use App\Models\ProductionOperation;
 use App\Models\ProductionScrapRecord;
 use App\Models\InventoryMovement;
+use App\Models\InventoryDocumentLine;
+use App\Models\StockReservation;
 use App\Models\InventoryCostConsumption;
 use App\Models\Branch;
 use App\Models\Product;
@@ -258,6 +260,45 @@ class ManufacturingIntegrationController extends Controller
         $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'status' => ['nullable', 'in:draft,released,in_progress,paused,completed,closed,cancelled'], 'product_id' => ['nullable', 'integer'], 'order_id' => ['nullable', 'integer']]);
         $rows = app(ProductionVarianceService::class)->report((int) $request->user()?->company_id, $data['from'] ?? null, $data['to'] ?? null, $data['status'] ?? null, $data['product_id'] ?? null, $data['order_id'] ?? null);
         return response()->json(['data' => $rows, 'totals' => ['order_count' => $rows->count(), 'planned_quantity' => (float) $rows->sum('planned_quantity'), 'completed_quantity' => (float) $rows->sum('completed_quantity'), 'yield_variance' => (float) $rows->sum('yield_variance'), 'planned_material_cost' => (float) $rows->sum('planned_material_cost'), 'expected_material_cost_to_date' => (float) $rows->sum('expected_material_cost_to_date'), 'actual_material_cost' => (float) $rows->sum('actual_material_cost'), 'material_cost_variance' => (float) $rows->sum('material_cost_variance'), 'planned_operation_cost' => (float) $rows->sum('planned_operation_cost'), 'expected_operation_cost_to_date' => (float) $rows->sum('expected_operation_cost_to_date'), 'actual_operation_cost' => (float) $rows->sum('actual_operation_cost'), 'operation_cost_variance' => (float) $rows->sum('operation_cost_variance'), 'total_cost_variance' => (float) $rows->sum('total_cost_variance')]]);
+    }
+
+    public function materialIssueVariance(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for material issue variance.');
+        $data = $request->validate([
+            'production_order_id' => ['nullable', 'integer', Rule::exists('production_orders', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'status' => ['nullable', 'in:draft,released,in_progress,paused,completed,closed,cancelled'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $orders = ProductionOrder::with('bom')->where('company_id', $companyId)
+            ->when($data['production_order_id'] ?? null, fn ($query, $id) => $query->whereKey($id))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->orderBy('id')->limit((int) ($data['per_page'] ?? 100))->get();
+
+        $rows = $orders->map(function (ProductionOrder $order) use ($companyId): array {
+            $requirements = [];
+            if ($order->bom_snapshot) {
+                $requirements = app(\App\Services\BomExplosionService::class)->leafRequirementsFromSnapshot($order->bom_snapshot, (float) $order->planned_quantity);
+            } elseif ($order->bom) {
+                $requirements = app(\App\Services\BomExplosionService::class)->leafRequirements($order->bom, (float) $order->planned_quantity, $companyId, $order->planned_date?->toDateString());
+            }
+            $issued = InventoryDocumentLine::whereHas('document', fn ($query) => $query->where('company_id', $companyId)->where('production_order_id', $order->id)->where('document_type', 'issue')->where('status', 'approved'))
+                ->selectRaw('product_id, SUM(quantity) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
+            $consumed = InventoryMovement::where('company_id', $companyId)->where('reference_type', $order->getMorphClass())->where('reference_id', $order->id)->where('movement_type', 'issue')
+                ->selectRaw('product_id, SUM(quantity) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
+            $reserved = StockReservation::where('company_id', $companyId)->where('source_type', $order->getMorphClass())->where('source_id', $order->id)->where('status', 'active')
+                ->selectRaw('product_id, SUM(quantity - released_quantity) AS quantity')->groupBy('product_id')->pluck('quantity', 'product_id');
+            $components = collect(array_keys($requirements))->map(function (int $productId) use ($requirements, $issued, $consumed, $reserved, $companyId): array {
+                $product = Product::where(function ($query) use ($companyId): void { $query->where('company_id', $companyId)->orWhereNull('company_id'); })->find($productId);
+                $planned = (float) ($requirements[$productId] ?? 0);
+                $issueQuantity = (float) ($issued[$productId] ?? 0);
+                $consumedQuantity = (float) ($consumed[$productId] ?? 0);
+                return ['product_id' => $productId, 'product' => $product, 'planned_quantity' => $planned, 'material_issue_quantity' => $issueQuantity, 'production_consumed_quantity' => $consumedQuantity, 'open_reserved_quantity' => (float) ($reserved[$productId] ?? 0), 'total_issued_quantity' => $issueQuantity + $consumedQuantity, 'quantity_variance' => $issueQuantity + $consumedQuantity - $planned];
+            })->values();
+            return ['production_order_id' => $order->id, 'order_no' => $order->order_no, 'status' => $order->status, 'components' => $components, 'planned_quantity' => (float) $components->sum('planned_quantity'), 'material_issue_quantity' => (float) $components->sum('material_issue_quantity'), 'production_consumed_quantity' => (float) $components->sum('production_consumed_quantity'), 'open_reserved_quantity' => (float) $components->sum('open_reserved_quantity'), 'quantity_variance' => (float) $components->sum('quantity_variance')];
+        })->values();
+        return response()->json(['data' => $rows, 'totals' => ['production_order_count' => $rows->count(), 'planned_quantity' => (float) $rows->sum('planned_quantity'), 'material_issue_quantity' => (float) $rows->sum('material_issue_quantity'), 'production_consumed_quantity' => (float) $rows->sum('production_consumed_quantity'), 'open_reserved_quantity' => (float) $rows->sum('open_reserved_quantity'), 'quantity_variance' => (float) $rows->sum('quantity_variance')]]);
     }
 
     public function workCenterUtilization(Request $request): JsonResponse

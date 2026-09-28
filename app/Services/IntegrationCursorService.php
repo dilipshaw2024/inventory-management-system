@@ -10,16 +10,16 @@ use Illuminate\Support\Facades\DB;
 
 class IntegrationCursorService
 {
-    public function paginate(Builder $query, Request $request, string $feed, int $perPage = 50): JsonResponse
+    public function paginate(Builder $query, Request $request, string $feed, int $perPage = 50, string $timestampColumn = 'updated_at'): JsonResponse
     {
         $perPage = min(100, max(1, $perPage));
         $state = $this->stateFromRequest($request, $feed);
         if ($state === null && !$request->boolean('cursor_mode')) return response()->json($query->paginate($perPage)->withQueryString());
 
         if ($state) {
-            $query->where(function (Builder $scope) use ($state): void {
-                $scope->where('updated_at', '>', $state['updated_at'])
-                    ->orWhere(fn (Builder $sameTime) => $sameTime->where('updated_at', $state['updated_at'])->where('id', '>', $state['id']));
+            $query->where(function (Builder $scope) use ($state, $timestampColumn): void {
+                $scope->where($timestampColumn, '>', $state['updated_at'])
+                    ->orWhere(fn (Builder $sameTime) => $sameTime->where($timestampColumn, $state['updated_at'])->where('id', '>', $state['id']));
             });
         }
         $rows = $query->limit($perPage + 1)->get();
@@ -27,7 +27,7 @@ class IntegrationCursorService
         $rows = $rows->take($perPage)->values();
         $companyId = $request->user()?->company_id;
         $principal = $this->principalKey($request);
-        $next = $rows->isEmpty() ? null : $this->encode($feed, $rows->last()->updated_at, (int) $rows->last()->id, (int) $companyId, $principal);
+        $next = $rows->isEmpty() ? null : $this->encode($feed, $rows->last()->{$timestampColumn}, (int) $rows->last()->id, (int) $companyId, $principal);
         return response()->json(['data' => $rows, 'meta' => ['feed' => $feed, 'has_more' => $hasMore, 'next_cursor' => $hasMore ? $next : null, 'acknowledged_cursor' => $state ? $this->encode($feed, $state['updated_at'], $state['id'], (int) $companyId, $principal) : null]]);
     }
 

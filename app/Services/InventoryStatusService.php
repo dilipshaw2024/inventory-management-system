@@ -6,6 +6,7 @@ use App\Models\InventoryMovement;
 use App\Models\InventoryStatusBalance;
 use App\Models\InventoryStatusTransfer;
 use App\Models\Product;
+use App\Models\InventorySerial;
 use Illuminate\Support\Facades\DB;
 
 class InventoryStatusService
@@ -18,6 +19,14 @@ class InventoryStatusService
                 throw new \RuntimeException('This status transfer must pass inspection before approval.');
             }
             $quantity = (float) $transfer->quantity;
+            $batch = $transfer->batch_id ? \App\Models\InventoryBatch::whereKey($transfer->batch_id)->where('product_id', $product->id)->lockForUpdate()->first() : null;
+            if ($transfer->batch_id && !$batch) throw new \RuntimeException('The selected batch does not belong to the disposition product.');
+            $serial = $transfer->serial_id ? InventorySerial::whereKey($transfer->serial_id)->where('product_id', $product->id)->lockForUpdate()->first() : null;
+            if ($transfer->serial_id && !$serial) throw new \RuntimeException('The selected serial does not belong to the disposition product.');
+            if ($serial && $batch && (int) $serial->batch_id !== (int) $batch->id) throw new \RuntimeException('The selected serial does not belong to the selected batch.');
+            if ($serial && abs($quantity - 1) > 0.000001) throw new \RuntimeException('A serialized disposition must contain exactly one unit.');
+            if ($serial && $transfer->from_status === 'available' && !in_array($serial->status, ['available', 'returned'], true)) throw new \RuntimeException('The selected serial is not available for disposition.');
+            if ($serial && $transfer->from_status !== 'available' && $serial->status !== $transfer->from_status) throw new \RuntimeException('The selected serial is not in the requested source disposition.');
             if ($transfer->from_status === 'available') {
                 if (app(InventoryAvailabilityService::class)->available($product, true, $transfer->location_id, $transfer->company_id) < $quantity) throw new \RuntimeException('Insufficient available stock at the selected location for '.$product->name.'.');
             } else {
@@ -25,10 +34,10 @@ class InventoryStatusService
                 if (!$balance || (float) $balance->quantity < $quantity) throw new \RuntimeException('Insufficient '.$transfer->from_status.' stock for '.$product->name.'.');
                 $balance->decrement('quantity', $quantity);
             }
-            if ($transfer->to_status !== 'scrap') {
+            if (!in_array($transfer->to_status, ['scrap', 'available'], true)) {
                 $balance = InventoryStatusBalance::firstOrCreate(['product_id' => $product->id, 'location_id' => $transfer->location_id, 'status' => $transfer->to_status], ['quantity' => 0]);
                 $balance->increment('quantity', $quantity);
-            } else {
+            } elseif ($transfer->to_status === 'scrap') {
                 // Scrapping removes physical stock regardless of its current
                 // quality status, so keep the legacy physical quantity in sync.
                 $product->quantity = (float) $product->quantity - $quantity;
@@ -41,8 +50,9 @@ class InventoryStatusService
                 $movementType = $transfer->to_status === 'scrap'
                     ? 'scrap'
                     : ($transfer->from_status === 'available' ? 'quarantine_in' : 'quarantine_out');
-                app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, (float) ($product->purchase_price ?? 0), $transfer->location_id, $transfer, $transfer->reason);
+                app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, (float) ($product->purchase_price ?? 0), $transfer->location_id, $transfer, $transfer->reason, null, $batch?->id, $serial?->id);
             }
+            if ($serial) $serial->update(['status' => $transfer->to_status === 'scrap' ? 'scrapped' : $transfer->to_status, 'location_id' => $transfer->location_id ?: $serial->location_id]);
             $recoveryQuantity = (float) ($transfer->recovery_quantity ?? 0);
             if ($transfer->recovery_product_id && (int) $transfer->recovery_product_id === (int) $transfer->product_id) throw new \RuntimeException('Recovery product must differ from the disposition product.');
             if ($transfer->to_status !== 'scrap' && ($transfer->recovery_product_id || $recoveryQuantity > 0.000001 || $transfer->recovery_unit_cost !== null)) throw new \RuntimeException('Recovery material is only valid for scrap disposition.');

@@ -8,6 +8,7 @@ use App\Models\StockCount;
 use App\Models\InventoryBatch;
 use App\Models\InventorySerial;
 use App\Models\InventoryLocation;
+use App\Models\InventoryExpiryOverrideRequest;
 use App\Models\Department;
 use App\Models\CostCenter;
 use App\Models\Store;
@@ -96,10 +97,10 @@ class InventoryLedgerService
             $batch = $batchRecord
                 ? $batchRecord
                 : ($serialId ? InventorySerial::where('product_id', $productId)->with('batch')->findOrFail($serialId)->batch : null);
-            if ($batch && $batch->expiry_date && $batch->expiry_date->lt(Carbon::today()) && !app(ErpSettingService::class)->get('allow_expired_batch_issue', false, $companyId)) {
+            if ($batch && $batch->expiry_date && $batch->expiry_date->lt(Carbon::today()) && !app(ErpSettingService::class)->get('allow_expired_batch_issue', false, $companyId) && !$this->hasExpiryOverride($reference, 'expired')) {
                 throw new \RuntimeException('Expired batch '.$batch->batch_no.' cannot be issued without the company expiry-policy override.');
             }
-            if ($batch && $batch->best_before_date && $batch->best_before_date->lt(Carbon::today()) && !app(ErpSettingService::class)->get('allow_past_best_before_issue', false, $companyId)) {
+            if ($batch && $batch->best_before_date && $batch->best_before_date->lt(Carbon::today()) && !app(ErpSettingService::class)->get('allow_past_best_before_issue', false, $companyId) && !$this->hasExpiryOverride($reference, 'best_before')) {
                 throw new \RuntimeException('Batch '.$batch->batch_no.' is past its best-before date and cannot be issued without the company best-before override.');
             }
         }
@@ -159,5 +160,15 @@ class InventoryLedgerService
             ->where('allow_negative_stock', true)
             ->whereHas('branch', fn ($query) => $query->where('company_id', $companyId))
             ->value('allow_negative_stock');
+    }
+
+    private function hasExpiryOverride(?Model $reference, string $scope): bool
+    {
+        if (!$reference || $reference->getMorphClass() !== (new \App\Models\InventoryDocument())->getMorphClass()) return false;
+        return InventoryExpiryOverrideRequest::withoutGlobalScopes()
+            ->where('company_id', $reference->getAttribute('company_id'))
+            ->where('inventory_document_id', $reference->getKey())
+            ->where('status', 'approved')->whereNull('consumed_at')
+            ->whereIn('scope', [$scope, 'both'])->exists();
     }
 }

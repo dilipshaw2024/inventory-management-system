@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\Category;
 use App\Models\Branch;
 use App\Models\Company;
+use App\Models\DocumentRevision;
 use App\Models\InventoryLocation;
 use App\Models\Product;
 use App\Models\ProductBarcode;
@@ -36,6 +37,9 @@ class ProcurementDocumentIdempotencyTest extends TestCase
 
         $created = $this->postJson('/api/integration/purchase-invoices', $payload);
         $created->assertCreated()->assertJsonPath('status', 'pending_approval');
+        $revision = DocumentRevision::where('document_type', PurchaseInvoice::class)->where('document_id', $created->json('data.id'))->latest('version')->firstOrFail();
+        $this->assertSame(2.0, (float) data_get($revision->new_values, 'lines.0.quantity'));
+        $this->assertSame(7.0, (float) data_get($revision->new_values, 'lines.0.unit_price'));
         $replayed = $this->postJson('/api/integration/purchase-invoices', $payload + ['lines' => [[
             'purchase_order_line_id' => $orderLine->id, 'quantity' => 99, 'unit_price' => 99,
         ]]]);

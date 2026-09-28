@@ -31,7 +31,7 @@ class ProductCostingPolicyTest extends TestCase
         ]);
         $future = CarbonImmutable::now()->addDay();
 
-        app(ProductCostingPolicyService::class)->schedule($product, 'standard', 31.5, $future, $user->id, 'Quarterly standard-cost refresh.');
+        app(ProductCostingPolicyService::class)->schedule($product, 'standard', 31.5, $future, $user->id, 'Quarterly standard-cost refresh.', 'integration.product.update', $product->id, 'COSTING-POLICY-REF-1');
 
         $service = app(ProductCostingPolicyService::class);
         $this->assertSame('fifo', $service->resolve($product)['costing_method']);
@@ -41,5 +41,7 @@ class ProductCostingPolicyTest extends TestCase
         Sanctum::actingAs($user, ['inventory:read']);
         $this->getJson('/api/inventory/products/'.$product->id.'/costing-policies')
             ->assertOk()->assertJsonPath('product_id', $product->id)->assertJsonPath('data.0.costing_method', 'standard');
+        $this->getJson('/api/inventory/products/'.$product->id.'/cost-history')
+            ->assertOk()->assertJsonPath('product_id', $product->id)->assertJsonPath('data.0.source_type', 'integration.product.update')->assertJsonPath('data.0.source_reference', 'COSTING-POLICY-REF-1');
     }
 }

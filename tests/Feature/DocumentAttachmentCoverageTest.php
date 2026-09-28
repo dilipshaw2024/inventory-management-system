@@ -48,22 +48,25 @@ class DocumentAttachmentCoverageTest extends TestCase
         $this->assertSame($company->id, $attachment->company_id);
         Storage::disk('local')->assertExists($attachment->stored_path);
 
-        Sanctum::actingAs($user, ['inventory:read']);
+        Sanctum::actingAs($user, ['sales:read']);
         $this->getJson('/api/inventory/attachments?attachable_type=sales_order&attachable_id='.$order->id)
             ->assertOk()
             ->assertJsonPath('data.0.attachable_id', $order->id)
             ->assertJsonPath('data.0.attachment_type', 'document');
 
-        Sanctum::actingAs($user, ['inventory:write']);
+        Sanctum::actingAs($user, ['sales:write']);
         $apiPayload = ['attachable_type' => 'sales_order', 'attachable_id' => $order->id, 'external_reference' => 'ERP-DOC-1', 'attachment_type' => 'document', 'file' => UploadedFile::fake()->create('api-order.pdf', 10, 'application/pdf')];
         $created = $this->post('/api/inventory/attachments', $apiPayload);
         $created->assertCreated()->assertJsonPath('data.external_reference', 'ERP-DOC-1');
         $duplicate = $this->post('/api/inventory/attachments', $apiPayload);
         $duplicate->assertOk()->assertJsonPath('idempotent', true)->assertJsonPath('status', 'duplicate_ignored');
+        Sanctum::actingAs($user, ['inventory:read']);
+        $this->getJson('/api/inventory/attachments?attachable_type=sales_order&attachable_id='.$order->id)->assertForbidden();
+        Sanctum::actingAs($user, ['inventory:write']);
         $brandUpload = $this->post('/api/inventory/attachments', ['attachable_type' => 'brand', 'attachable_id' => $brand->id, 'external_reference' => 'BRAND-LOGO-1', 'attachment_type' => 'image', 'is_primary' => true, 'file' => UploadedFile::fake()->image('brand-logo.png')]);
         $brandUpload->assertCreated()->assertJsonPath('data.attachable_id', $brand->id);
         $this->assertSame(1, (int) $brandUpload->json('data.is_primary'));
-        Sanctum::actingAs($user, ['inventory:read']);
+        Sanctum::actingAs($user, ['sales:read']);
         $this->get('/api/inventory/attachments/'.$attachment->id.'/download')->assertOk()->assertHeader('Content-Type', 'application/pdf');
     }
 }

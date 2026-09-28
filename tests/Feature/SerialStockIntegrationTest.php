@@ -4,11 +4,14 @@ namespace Tests\Feature;
 
 use App\Models\Company;
 use App\Models\Category;
+use App\Models\Customer;
 use App\Models\InventoryBatch;
 use App\Models\InventoryMovement;
 use App\Models\InventorySerial;
 use App\Models\Product;
 use App\Models\Supplier;
+use App\Models\ServiceAsset;
+use App\Models\ServiceAssetSerialHandoff;
 use App\Models\Unit;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -67,13 +70,15 @@ class SerialStockIntegrationTest extends TestCase
         $category = Category::create(['name' => 'Trace Goods', 'status' => 1]);
         $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Traceable goods', 'sku' => 'TRACE-001', 'tracking_type' => 'batch', 'quantity' => 2, 'status' => 1]);
         $batch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'TRACE-LOT-001']);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Trace Customer', 'status' => 1]);
+        $return = \App\Models\InventoryReturn::create(['company_id' => $company->id, 'return_no' => 'RET-BATCH-TRACE-001', 'return_type' => 'sales', 'customer_id' => $customer->id, 'date' => '2026-09-25', 'reason_code' => 'traceability', 'status' => 'approved']);
         InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 5, 'unit_cost' => 3, 'batch_id' => $batch->id, 'reason' => 'Trace receipt']);
-        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 2, 'unit_cost' => 3, 'batch_id' => $batch->id, 'reason' => 'Trace issue']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 2, 'unit_cost' => 3, 'batch_id' => $batch->id, 'reference_type' => $return->getMorphClass(), 'reference_id' => $return->id, 'reason' => 'Trace issue']);
         $token = $user->createToken('trace-read-test', ['inventory:read'])->plainTextToken;
 
         $response = $this->withToken($token)->getJson('/api/inventory/batches/'.$batch->id.'/traceability?direction=outbound');
 
-        $response->assertOk()->assertJsonPath('data.0.batch_id', $batch->id)->assertJsonPath('data.0.movement_type', 'issue');
+        $response->assertOk()->assertJsonPath('data.0.batch_id', $batch->id)->assertJsonPath('data.0.movement_type', 'issue')->assertJsonPath('data.0.source_context.party_type', 'customer')->assertJsonPath('data.0.source_context.party_name', 'Trace Customer');
         $this->assertSame(1, $response->json('total'));
     }
 
@@ -87,13 +92,23 @@ class SerialStockIntegrationTest extends TestCase
         $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Serial traceable item', 'sku' => 'SERIAL-TRACE-001', 'tracking_type' => 'serial', 'quantity' => 1, 'status' => 1]);
         $batch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'SERIAL-TRACE-LOT']);
         $serial = InventorySerial::create(['product_id' => $product->id, 'batch_id' => $batch->id, 'serial_no' => 'SN-TRACE-001', 'status' => 'issued']);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Serial Trace Customer', 'status' => 1]);
+        $return = \App\Models\InventoryReturn::create(['company_id' => $company->id, 'return_no' => 'RET-SERIAL-TRACE-001', 'return_type' => 'sales', 'customer_id' => $customer->id, 'date' => '2026-09-25', 'reason_code' => 'traceability', 'status' => 'approved']);
         InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 1, 'unit_cost' => 9, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'reason' => 'Serial trace receipt']);
-        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 1, 'unit_cost' => 9, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'reason' => 'Serial trace issue']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 1, 'unit_cost' => 9, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'reference_type' => $return->getMorphClass(), 'reference_id' => $return->id, 'reason' => 'Serial trace issue']);
         $token = $user->createToken('serial-trace-read-test', ['inventory:read'])->plainTextToken;
 
         $response = $this->withToken($token)->getJson('/api/inventory/serials/'.$serial->id.'/traceability?direction=outbound');
 
         $response->assertOk()->assertJsonPath('data.0.serial_id', $serial->id)->assertJsonPath('data.0.movement_type', 'issue');
         $this->assertSame(1, $response->json('total'));
+
+        $asset = ServiceAsset::create(['company_id' => $company->id, 'asset_no' => 'ASSET-TRACE-001', 'name' => 'Installed trace device', 'product_id' => $product->id, 'customer_id' => null, 'inventory_serial_id' => $serial->id, 'serial_no' => $serial->serial_no, 'status' => 'active']);
+        // Keep the handoff after the issue movement regardless of suite wall-clock time.
+        ServiceAssetSerialHandoff::create(['company_id' => $company->id, 'service_asset_id' => $asset->id, 'inventory_serial_id' => $serial->id, 'action' => 'installed', 'effective_at' => now()->addMinute(), 'location' => 'Customer site']);
+
+        $custody = $this->withToken($token)->getJson('/api/inventory/serials/'.$serial->id.'/chain-of-custody?direction=outbound');
+        $custody->assertOk()->assertJsonPath('data.0.event_type', 'inventory_movement')->assertJsonPath('data.0.source_context.party_type', 'customer')->assertJsonPath('data.0.source_context.party_name', 'Serial Trace Customer')->assertJsonPath('data.1.event_type', 'service_handoff')->assertJsonPath('data.1.action', 'installed');
+        $this->assertSame(2, $custody->json('meta.total'));
     }
 }

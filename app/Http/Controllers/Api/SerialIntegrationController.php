@@ -4,7 +4,9 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\InventoryLocation;
+use App\Models\InventoryMovement;
 use App\Models\InventorySerial;
+use App\Models\ServiceAssetSerialHandoff;
 use App\Services\IntegrationCursorService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -48,10 +50,80 @@ class SerialIntegrationController extends Controller
         return app(IntegrationCursorService::class)->paginate($movements, $request, 'inventory.serial.traceability.'.$id, (int) ($data['per_page'] ?? 50));
     }
 
+    public function chainOfCustody(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate([
+            'direction' => ['nullable', 'in:all,inbound,outbound'],
+            'occurred_from' => ['nullable', 'date'],
+            'occurred_to' => ['nullable', 'date', 'after_or_equal:occurred_from'],
+            'page' => ['nullable', 'integer', 'min:1'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for serial chain of custody.');
+        $serial = InventorySerial::whereKey($id)
+            ->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+            ->firstOrFail();
+
+        $inbound = ['opening', 'receipt', 'transfer_in', 'adjustment_in', 'return_in', 'quarantine_out', 'release'];
+        $outbound = ['issue', 'transfer_out', 'adjustment_out', 'return_out', 'scrap', 'quarantine_in'];
+        $events = collect();
+
+        InventoryMovement::with(['product:id,name,sku', 'location:id,code,name', 'creator:id,name,email', 'batch:id,batch_no,lot_no,expiry_date,best_before_date', 'reference'])
+            ->where('product_id', $serial->product_id)
+            ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+            ->where(fn ($query) => $query->where('serial_id', $serial->id)->orWhereHas('allocations', fn ($allocation) => $allocation->where('serial_id', $serial->id)))
+            ->when($data['occurred_from'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '>=', $date))
+            ->when($data['occurred_to'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '<=', $date))
+            ->get()
+            ->each(function ($movement) use (&$events, $inbound, $outbound, $data): void {
+                $direction = in_array($movement->movement_type, $inbound, true) ? 'inbound' : (in_array($movement->movement_type, $outbound, true) ? 'outbound' : 'other');
+                if (($data['direction'] ?? 'all') !== 'all' && ($data['direction'] ?? 'all') !== $direction) return;
+                $events->push([
+                    'event_type' => 'inventory_movement', 'event_id' => (int) $movement->id,
+                    'occurred_at' => ($movement->posted_at ?: $movement->created_at)?->toISOString(),
+                    'direction' => $direction, 'movement_type' => $movement->movement_type,
+                    'quantity' => (float) $movement->quantity, 'unit_cost' => (float) $movement->unit_cost,
+                    'location' => $movement->location, 'batch' => $movement->batch,
+                    'source_type' => $movement->reference_type, 'source_id' => $movement->reference_id,
+                    'source_context' => app(\App\Services\InventoryMovementSourceContextService::class)->resolve($movement->reference),
+                    'reason' => $movement->reason, 'creator' => $movement->creator,
+                ]);
+            });
+
+        ServiceAssetSerialHandoff::with(['asset.customer:id,name', 'creator:id,name,email'])
+            ->where('company_id', $companyId)->where('inventory_serial_id', $serial->id)
+            ->when($data['occurred_from'] ?? null, fn ($query, $date) => $query->whereDate('effective_at', '>=', $date))
+            ->when($data['occurred_to'] ?? null, fn ($query, $date) => $query->whereDate('effective_at', '<=', $date))
+            ->get()
+            ->each(function (ServiceAssetSerialHandoff $handoff) use (&$events, $data): void {
+                $direction = $handoff->action === 'installed' ? 'outbound' : 'inbound';
+                if (($data['direction'] ?? 'all') !== 'all' && ($data['direction'] ?? 'all') !== $direction) return;
+                $events->push([
+                    'event_type' => 'service_handoff', 'event_id' => (int) $handoff->id,
+                    'occurred_at' => $handoff->effective_at?->toISOString(), 'direction' => $direction,
+                    'action' => $handoff->action, 'location' => $handoff->location,
+                    'notes' => $handoff->notes, 'asset' => $handoff->asset,
+                    'customer' => $handoff->asset?->customer, 'creator' => $handoff->creator,
+                ]);
+            });
+
+        $events = $events->sortBy(fn (array $event): array => [$event['occurred_at'] ?? '', $event['event_type'], $event['event_id']])->values();
+        $perPage = (int) ($data['per_page'] ?? 50);
+        $page = (int) ($data['page'] ?? 1);
+        $total = $events->count();
+        $rows = $events->forPage($page, $perPage)->values();
+        return response()->json(['data' => $rows, 'meta' => [
+            'serial_id' => $serial->id, 'direction' => $data['direction'] ?? 'all',
+            'current_page' => $page, 'per_page' => $perPage, 'total' => $total,
+            'last_page' => max(1, (int) ceil($total / $perPage)),
+        ]]);
+    }
+
     public function stock(Request $request): JsonResponse
     {
         $data = $request->validate([
-            'status' => ['nullable', 'in:available,reserved,issued,returned,scrapped,quarantine'],
+            'status' => ['nullable', 'in:available,reserved,issued,returned,scrapped,quarantine,damaged'],
             'product_id' => ['nullable', 'integer'],
             'batch_id' => ['nullable', 'integer'],
             'location_id' => ['nullable', 'integer'],

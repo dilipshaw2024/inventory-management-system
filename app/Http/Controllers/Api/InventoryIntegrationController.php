@@ -24,10 +24,12 @@ use App\Models\InvoiceDetail;
 use App\Models\CustomerContact;
 use App\Models\InventoryDocument;
 use App\Models\InventoryDocumentLine;
+use App\Models\InventoryExpiryOverrideRequest;
 use App\Models\InventoryReturn;
 use App\Models\InventoryLocation;
 use App\Models\Branch;
 use App\Models\InventoryMovement;
+use App\Models\InventoryMovementAllocation;
 use App\Models\InventoryTransfer;
 use App\Models\StockCount;
 use App\Models\StockCountLine;
@@ -36,6 +38,8 @@ use App\Models\InventoryBatch;
 use App\Models\InventoryReconciliationSnapshot;
 use App\Models\InventoryCostLayerAdjustment;
 use App\Models\InventoryCostRevaluationRun;
+use App\Models\ProductionOrder;
+use App\Models\FiscalPeriod;
 use App\Models\JournalEntry;
 use App\Services\AuditService;
 use App\Services\InventoryAvailabilityService;
@@ -57,6 +61,7 @@ use App\Services\CurrencyConversionService;
 use App\Services\AutomaticAccountingService;
 use App\Services\InventoryCostingService;
 use App\Services\InventoryCostRevaluationService;
+use App\Services\InventoryPeriodValuationService;
 use App\Models\Payment;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -211,7 +216,7 @@ class InventoryIntegrationController extends Controller
                 ]);
                 return $operation->fresh();
             });
-        } catch (\RuntimeException $exception) {
+        } catch (\InvalidArgumentException|\RuntimeException $exception) {
             return response()->json(['message' => $exception->getMessage()], 422);
         }
 
@@ -275,7 +280,8 @@ class InventoryIntegrationController extends Controller
             $promotionResult = app(PromotionService::class)->applyCodesToLines($promotionCodes, $lineRows, (int) $order->customer_id, $order->date->toDateString());
             if ($promotionResult['promotion']) $order->update(['promotion_id' => $promotionResult['promotion']->id, 'promotion_ids' => collect($promotionResult['promotions'])->pluck('id')->values()->all()]);
             foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line['product_id'], 'batch_id' => $line['batch_id'] ?? null, 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
-            app(AuditService::class)->record('sales_order.created', $order, null, $order->toArray());
+            $lineSnapshots = $order->fresh('lines')->lines->map(fn (SalesOrderLine $line): array => $line->only(['product_id', 'batch_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price', 'discount_amount']))->values()->all();
+            app(AuditService::class)->record('sales_order.created', $order, null, $order->toArray() + ['lines' => $lineSnapshots]);
             return $order;
         });
         return response()->json(['data' => $order->load('customer', 'priceList', 'lines.product'), 'status' => 'pending_approval'], 201);
@@ -414,12 +420,15 @@ class InventoryIntegrationController extends Controller
             'location_id' => ['nullable', 'integer'], 'batch_id' => ['nullable', 'integer'],
             'department_id' => ['nullable', 'integer', $owned('departments')],
             'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
+            'fiscal_period_id' => ['nullable', 'integer', Rule::exists('fiscal_periods', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'as_of' => ['nullable', 'date'], 'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
 
-        $asOf = $data['as_of'] ?? null;
+        if (!empty($data['fiscal_period_id']) && !empty($data['as_of'])) abort(422, 'Use either fiscal_period_id or as_of, not both.');
+        $period = !empty($data['fiscal_period_id']) ? FiscalPeriod::where('company_id', $companyId)->findOrFail($data['fiscal_period_id']) : null;
+        $asOf = $period?->ends_on?->toDateString() ?? ($data['as_of'] ?? null);
         $valueExpression = $asOf
             ? 'COALESCE(SUM(GREATEST(layers.original_quantity - (SELECT COALESCE(SUM(consumptions.quantity), 0) FROM inventory_cost_consumptions consumptions LEFT JOIN inventory_movements consumption_movements ON consumption_movements.id = consumptions.movement_id WHERE consumptions.cost_layer_id = layers.id AND ((consumptions.movement_id IS NOT NULL AND DATE(consumption_movements.posted_at) <= ?) OR (consumptions.movement_id IS NULL AND DATE(consumptions.created_at) <= ?))), 0) * layers.unit_cost), 0)'
             : 'COALESCE(SUM(layers.remaining_quantity * layers.unit_cost), 0)';
@@ -456,6 +465,24 @@ class InventoryIntegrationController extends Controller
         return app(IntegrationCursorService::class)->paginate($valuation, $request, 'inventory.valuation', (int) ($data['per_page'] ?? 50));
     }
 
+    public function accountingPeriodValuation(Request $request, InventoryPeriodValuationService $valuation): JsonResponse
+    {
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $data = $request->validate([
+            'fiscal_period_id' => ['required', 'integer', Rule::exists('fiscal_periods', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'product_id' => ['nullable', 'integer'], 'category_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'],
+            'batch_id' => ['nullable', 'integer'], 'department_id' => ['nullable', 'integer', $owned('departments')],
+            'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
+        ]);
+        abort_unless($companyId, 403, 'A company is required for accounting-period valuation.');
+        if (!empty($data['product_id']) && !$this->companyScope(Product::query(), $companyId)->whereKey($data['product_id'])->exists()) abort(422, 'Product is not authorized for this company.');
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
+        $period = FiscalPeriod::where('company_id', $companyId)->findOrFail($data['fiscal_period_id']);
+        $result = $valuation->drilldown($period, $data);
+        return response()->json($result + ['period' => ['id' => $period->id, 'name' => $period->name, 'starts_on' => $period->starts_on?->toDateString(), 'ends_on' => $period->ends_on?->toDateString(), 'status' => $period->status]]);
+    }
+
     public function revaluationPreview(Request $request, InventoryCostingService $costing): JsonResponse
     {
         $data = $request->validate(['product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'as_of' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
@@ -477,6 +504,87 @@ class InventoryIntegrationController extends Controller
         return app(IntegrationCursorService::class)->paginate($runs, $request, 'inventory.cost-revaluation-runs', (int) ($data['per_page'] ?? 50));
     }
 
+    public function revaluationReconciliation(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'status' => ['nullable', 'in:pending,approved,rejected,reversed'],
+            'product_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'tolerance' => ['nullable', 'numeric', 'min:0', 'max:1000000000'],
+        ]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for revaluation reconciliation.');
+        if (!empty($data['product_id']) && !$this->companyScope(Product::query(), $companyId)->whereKey($data['product_id'])->exists()) abort(422, 'Product is not authorized for this company.');
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
+
+        $from = $data['from'] ?? now()->startOfMonth()->toDateString();
+        $to = $data['to'] ?? now()->toDateString();
+        $tolerance = (float) ($data['tolerance'] ?? 0.01);
+        $runs = $this->companyScope(InventoryCostRevaluationRun::with('lines'), $companyId)
+            ->whereBetween('as_of_date', [$from, $to])
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->orderBy('as_of_date')->orderBy('id')->get();
+
+        $rows = $runs->map(function (InventoryCostRevaluationRun $run) use ($data, $companyId, $tolerance): array {
+            $lines = $run->lines
+                ->when($data['product_id'] ?? null, fn ($lines, $productId) => $lines->where('product_id', (int) $productId))
+                ->when($data['location_id'] ?? null, fn ($lines, $locationId) => $lines->where('location_id', (int) $locationId));
+            $expected = (float) $lines->sum('variance_amount');
+            $journalIds = collect([$run->journal_entry_id, $run->reversal_journal_entry_id])->filter()->unique()->values();
+            $journals = $journalIds->isEmpty()
+                ? collect()
+                : JournalEntry::with('lines')->where('company_id', $companyId)->whereIn('id', $journalIds)->get();
+            $inventoryAccount = \App\Models\AccountMapping::where('mapping_key', 'inventory')
+                ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+                ->orderByRaw('company_id IS NULL')->value('account_id');
+            $inventoryNet = $inventoryAccount
+                ? (float) $journals->sum(fn (JournalEntry $journal): float => (float) $journal->lines->where('account_id', $inventoryAccount)->sum(fn ($line): float => (float) $line->debit - (float) $line->credit))
+                : 0.0;
+            $posted = abs($inventoryNet);
+            $effectiveExpected = $run->status === 'reversed' ? 0.0 : abs($expected);
+            $variance = round($effectiveExpected - $posted, 6);
+            $status = match (true) {
+                $run->status === 'pending' || $run->status === 'rejected' => 'not_posted',
+                $run->status === 'approved' && $run->accounting_status === 'missing_mapping' => 'missing_mapping',
+                $run->status === 'approved' && $journals->isEmpty() => 'missing_journal',
+                abs($variance) > $tolerance => 'variance',
+                default => 'reconciled',
+            };
+
+            return [
+                'revaluation_id' => $run->id,
+                'as_of_date' => optional($run->as_of_date)->toDateString(),
+                'run_status' => $run->status,
+                'accounting_status' => $run->accounting_status,
+                'line_count' => $lines->count(),
+                'expected_value' => round($effectiveExpected, 6),
+                'posted_value' => round($posted, 6),
+                'posted_inventory_net' => round($inventoryNet, 6),
+                'variance' => $variance,
+                'journal_entry_id' => $run->journal_entry_id,
+                'reversal_journal_entry_id' => $run->reversal_journal_entry_id,
+                'reconciliation_status' => $status,
+            ];
+        })->values();
+
+        return response()->json([
+            'data' => $rows,
+            'summary' => [
+                'revaluations' => $rows->count(),
+                'expected_value' => round((float) $rows->sum('expected_value'), 6),
+                'posted_value' => round((float) $rows->sum('posted_value'), 6),
+                'variance' => round((float) $rows->sum('variance'), 6),
+                'variance_count' => $rows->where('reconciliation_status', 'variance')->count(),
+                'missing_mapping_count' => $rows->where('reconciliation_status', 'missing_mapping')->count(),
+                'missing_journal_count' => $rows->where('reconciliation_status', 'missing_journal')->count(),
+                'not_posted_count' => $rows->where('reconciliation_status', 'not_posted')->count(),
+            ],
+            'meta' => ['from' => $from, 'to' => $to, 'tolerance' => $tolerance, 'read_only' => true],
+        ]);
+    }
+
     public function createRevaluationRun(Request $request, InventoryCostRevaluationService $revaluations): JsonResponse
     {
         $data = $request->validate(['external_reference' => ['nullable', 'string', 'max:150'], 'as_of' => ['nullable', 'date'], 'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer']]);
@@ -489,7 +597,7 @@ class InventoryIntegrationController extends Controller
         }
         try {
             $run = $revaluations->create((int) $companyId, $data['as_of'] ?? now()->toDateString(), $data['external_reference'] ?? null, $data['product_id'] ?? null, $data['location_id'] ?? null, $request->user()?->id);
-        } catch (\RuntimeException $exception) {
+        } catch (\InvalidArgumentException|\RuntimeException $exception) {
             return response()->json(['message' => $exception->getMessage()], 422);
         }
         return response()->json(['data' => $run, 'status' => 'pending'], 201);
@@ -606,7 +714,10 @@ class InventoryIntegrationController extends Controller
                     ? (float) $line->recounted_quantity
                     : (float) $line->counted_quantity;
                 $system = (float) $line->system_quantity;
-                return ['current' => $current, 'counted' => $counted, 'system' => $system, 'variance' => $counted - $current, 'stale' => abs($current - $system) > 0.000001];
+                $unitCost = (float) ($line->unit_cost ?? $line->product?->purchase_price ?? 0);
+                $variance = $counted - $current;
+                $recountDelta = $line->recounted_quantity === null ? 0.0 : (float) $line->recounted_quantity - (float) $line->counted_quantity;
+                return ['current' => $current, 'counted' => $counted, 'system' => $system, 'variance' => $variance, 'unit_cost' => $unitCost, 'variance_value' => $variance * $unitCost, 'recount_delta' => $recountDelta, 'stale' => abs($current - $system) > 0.000001];
             });
             return [
                 'id' => (int) $count->id,
@@ -620,6 +731,9 @@ class InventoryIntegrationController extends Controller
                 'variance_line_count' => $lineRows->filter(fn (array $line): bool => abs($line['variance']) > 0.000001)->count(),
                 'signed_variance_quantity' => round((float) $lineRows->sum('variance'), 6),
                 'absolute_variance_quantity' => round((float) $lineRows->sum(fn (array $line): float => abs($line['variance'])), 6),
+                'signed_variance_value' => round((float) $lineRows->sum('variance_value'), 6),
+                'absolute_variance_value' => round((float) $lineRows->sum(fn (array $line): float => abs($line['variance_value'])), 6),
+                'recount_delta_quantity' => round((float) $lineRows->sum('recount_delta'), 6),
                 'current_quantity' => round((float) $lineRows->sum('current'), 6),
                 'counted_quantity' => round((float) $lineRows->sum('counted'), 6),
             ];
@@ -636,6 +750,9 @@ class InventoryIntegrationController extends Controller
                 'variance_line_count' => (int) $rows->sum('variance_line_count'),
                 'signed_variance_quantity' => round((float) $rows->sum('signed_variance_quantity'), 6),
                 'absolute_variance_quantity' => round((float) $rows->sum('absolute_variance_quantity'), 6),
+                'signed_variance_value' => round((float) $rows->sum('signed_variance_value'), 6),
+                'absolute_variance_value' => round((float) $rows->sum('absolute_variance_value'), 6),
+                'recount_delta_quantity' => round((float) $rows->sum('recount_delta_quantity'), 6),
             ],
             'meta' => [
                 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(),
@@ -656,6 +773,9 @@ class InventoryIntegrationController extends Controller
                 ? (float) $line->recounted_quantity
                 : (float) $line->counted_quantity;
             $system = (float) $line->system_quantity;
+            $unitCost = (float) ($line->unit_cost ?? $line->product?->purchase_price ?? 0);
+            $variance = $counted - $current;
+            $recountDelta = $line->recounted_quantity === null ? 0.0 : (float) $line->recounted_quantity - (float) $line->counted_quantity;
             return [
                 'product_id' => (int) $line->product_id,
                 'product_name' => $line->product?->name,
@@ -664,14 +784,23 @@ class InventoryIntegrationController extends Controller
                 'current_system_quantity' => $current,
                 'counted_quantity' => $counted,
                 'movement_drift' => $current - $system,
-                'current_variance_quantity' => $counted - $current,
+                'current_variance_quantity' => $variance,
+                'unit_cost' => $unitCost,
+                'current_variance_value' => $variance * $unitCost,
+                'recount_delta_quantity' => $recountDelta,
                 'is_stale' => abs($current - $system) > 0.000001,
             ];
         })->values();
         return response()->json([
             'data' => $rows,
             'count' => ['id' => $count->id, 'count_no' => $count->count_no, 'status' => $count->status, 'count_date' => $count->count_date?->toDateString(), 'location' => $count->location],
-            'summary' => ['line_count' => $rows->count(), 'stale_line_count' => $rows->where('is_stale', true)->count(), 'current_variance_quantity' => round((float) $rows->sum('current_variance_quantity'), 6)],
+            'summary' => [
+                'line_count' => $rows->count(),
+                'stale_line_count' => $rows->where('is_stale', true)->count(),
+                'current_variance_quantity' => round((float) $rows->sum('current_variance_quantity'), 6),
+                'current_variance_value' => round((float) $rows->sum('current_variance_value'), 6),
+                'recount_delta_quantity' => round((float) $rows->sum('recount_delta_quantity'), 6),
+            ],
             'read_only' => true,
         ]);
     }
@@ -908,16 +1037,111 @@ class InventoryIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
             'document_type' => ['nullable', 'in:receipt,issue'],
+            'production_order_id' => ['nullable', 'integer', Rule::exists('production_orders', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'reversal_of_id' => ['nullable', 'integer', Rule::exists('inventory_documents', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('document_type', 'issue'))],
             'status' => ['nullable', 'in:pending,approved,rejected'],
             'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
-        $documents = $this->companyScope(InventoryDocument::with(['location', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), $companyId)
+        $documents = $this->companyScope(InventoryDocument::with(['location', 'productionOrder', 'reversedDocument', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), $companyId)
             ->when($data['document_type'] ?? null, fn ($query, $type) => $query->where('document_type', $type))
+            ->when($data['production_order_id'] ?? null, fn ($query, $id) => $query->where('production_order_id', $id))
+            ->when($data['reversal_of_id'] ?? null, fn ($query, $id) => $query->where('reversal_of_id', $id))
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($documents, $request, 'inventory.documents', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function materialIssues(Request $request): JsonResponse
+    {
+        $request->merge(['document_type' => 'issue']);
+        return $this->documents($request);
+    }
+
+    public function materialIssueReversals(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate(['status' => ['nullable', 'in:pending,approved,rejected'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $documents = $this->companyScope(InventoryDocument::with(['reversedDocument.productionOrder', 'location', 'lines.product']), $companyId)
+            ->where('document_type', 'receipt')->whereNotNull('reversal_of_id')
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($documents, $request, 'manufacturing.material-issue-reversals', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function createMaterialIssue(Request $request): JsonResponse
+    {
+        abort_unless($request->filled('production_order_id'), 422, 'A production_order_id is required for a material issue.');
+        $request->merge(['document_type' => 'issue']);
+        return $this->createDocument($request);
+    }
+
+    public function approveMaterialIssue(int $id): JsonResponse
+    {
+        app(ApprovalGuard::class)->assertBeforeTransaction(InventoryDocument::class, $id);
+        $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('document_type', 'issue')->whereNotNull('production_order_id')->findOrFail($id);
+        return response()->json(['data' => app(InventoryDocumentApprovalService::class)->approve($document, auth()->user()), 'status' => 'approved']);
+    }
+
+    public function rejectMaterialIssue(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('document_type', 'issue')->whereNotNull('production_order_id')->findOrFail($id);
+        return response()->json(['data' => app(InventoryDocumentApprovalService::class)->reject($document, $data['reason'], auth()->user()), 'status' => 'rejected']);
+    }
+
+    public function reverseMaterialIssue(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000'], 'external_reference' => ['nullable', 'string', 'max:150']]);
+        $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('document_type', 'issue')->whereNotNull('production_order_id')->findOrFail($id);
+        if (!empty($data['external_reference'])) {
+            $existing = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) {
+                if ((int) $existing->reversal_of_id !== (int) $document->id) return response()->json(['message' => 'The external reference is already used by another inventory document.'], 422);
+                return response()->json(['data' => $existing->load(['location', 'reversedDocument', 'lines.product']), 'status' => 'duplicate_ignored']);
+            }
+        }
+        try {
+            $reversal = app(\App\Services\InventoryDocumentReversalService::class)->createMaterialIssueReversal($document, $data['reason'], auth()->user(), $data['external_reference'] ?? null);
+        } catch (\InvalidArgumentException|\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $reversal, 'status' => 'pending_approval'], 201);
+    }
+
+    public function reverseIssueDocument(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000'], 'external_reference' => ['nullable', 'string', 'max:150']]);
+        $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('document_type', 'issue')->findOrFail($id);
+        if (!empty($data['external_reference'])) {
+            $existing = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) {
+                if ((int) $existing->reversal_of_id !== (int) $document->id) return response()->json(['message' => 'The external reference is already used by another inventory document.'], 422);
+                return response()->json(['data' => $existing->load(['location', 'reversedDocument', 'lines.product']), 'status' => 'duplicate_ignored']);
+            }
+        }
+        try {
+            $reversal = app(\App\Services\InventoryDocumentReversalService::class)->createIssueReversal($document, $data['reason'], auth()->user(), $data['external_reference'] ?? null);
+        } catch (\InvalidArgumentException|\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $reversal, 'status' => 'pending_approval'], 201);
+    }
+
+    public function approveMaterialIssueReversal(int $id): JsonResponse
+    {
+        app(ApprovalGuard::class)->assertBeforeTransaction(InventoryDocument::class, $id);
+        $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('document_type', 'receipt')->whereNotNull('reversal_of_id')->findOrFail($id);
+        return response()->json(['data' => app(InventoryDocumentApprovalService::class)->approve($document, auth()->user()), 'status' => 'approved']);
+    }
+
+    public function rejectMaterialIssueReversal(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->where('document_type', 'receipt')->whereNotNull('reversal_of_id')->findOrFail($id);
+        return response()->json(['data' => app(InventoryDocumentApprovalService::class)->reject($document, $data['reason'], auth()->user()), 'status' => 'rejected']);
     }
 
     public function createDocument(Request $request): JsonResponse
@@ -928,6 +1152,7 @@ class InventoryIntegrationController extends Controller
             'external_reference' => ['nullable', 'string', 'max:150'],
             'document_no' => ['nullable', 'string', 'max:100', Rule::unique('inventory_documents', 'document_no')->where(fn ($query) => $query->where('company_id', $companyId))],
             'document_type' => ['required', 'in:receipt,issue'], 'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
+            'production_order_id' => ['nullable', 'integer', Rule::exists('production_orders', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'department_id' => ['nullable', 'integer', $owned('departments')], 'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
             'date' => ['required', 'date'], 'description' => ['required', 'string', 'max:2000'], 'inspection_required' => ['nullable', 'boolean'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')],
@@ -942,15 +1167,29 @@ class InventoryIntegrationController extends Controller
             if (!empty($line['batch_allocations']) && $data['document_type'] !== 'issue') abort(422, 'Batch allocations are supported for issue documents only.');
             if (!empty($line['batch_allocations']) && !empty($line['batch_no'])) abort(422, 'Use batch_allocations or batch_no, not both, on an issue line.');
         }
+        $productionOrder = null;
+        if (!empty($data['production_order_id'])) {
+            if ($data['document_type'] !== 'issue') abort(422, 'A production-linked inventory document must be an issue.');
+            $productionOrder = ProductionOrder::where('company_id', $companyId)->findOrFail($data['production_order_id']);
+            if (in_array($productionOrder->status, ['cancelled', 'closed', 'completed', 'paused'], true)) abort(422, 'Material issue documents require a released or in-progress production order.');
+            if (!empty($data['location_id']) && $productionOrder->location_id && (int) $data['location_id'] !== (int) $productionOrder->location_id) abort(422, 'The material issue location must match the production order location.');
+            $data['location_id'] = $data['location_id'] ?? $productionOrder->location_id;
+            $requirements = $productionOrder->bom_snapshot
+                ? app(\App\Services\BomExplosionService::class)->leafRequirementsFromSnapshot($productionOrder->bom_snapshot, (float) $productionOrder->planned_quantity)
+                : ($productionOrder->bom ? app(\App\Services\BomExplosionService::class)->leafRequirements($productionOrder->bom, (float) $productionOrder->planned_quantity, $companyId, $productionOrder->planned_date?->toDateString()) : []);
+            foreach ($data['lines'] as $line) {
+                if (!array_key_exists((int) $line['product_id'], $requirements)) abort(422, 'Product '.$line['product_id'].' is not an effective BOM component for this production order.');
+            }
+        }
         if (!empty($data['external_reference'])) {
             $existing = $this->companyScope(InventoryDocument::query(), $companyId)->where('external_reference', $data['external_reference'])->first();
-            if ($existing) return response()->json(['data' => $existing->load(['location', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), 'status' => 'duplicate_ignored']);
+            if ($existing) return response()->json(['data' => $existing->load(['location', 'productionOrder', 'reversedDocument', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), 'status' => 'duplicate_ignored']);
         }
         $document = DB::transaction(function () use ($data, $companyId, $request): InventoryDocument {
             $document = InventoryDocument::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
                 'document_no' => ($data['document_no'] ?? null) ?: strtoupper($data['document_type']).'-'.now()->format('YmdHis').'-'.random_int(100, 999),
-                'document_type' => $data['document_type'], 'location_id' => $data['location_id'] ?? null,
+                'document_type' => $data['document_type'], 'location_id' => $data['location_id'] ?? null, 'production_order_id' => $data['production_order_id'] ?? null,
                 'department_id' => $data['department_id'] ?? null, 'cost_center_id' => $data['cost_center_id'] ?? null,
                 'date' => $data['date'], 'description' => $data['description'], 'inspection_status' => ($data['document_type'] === 'receipt' && !empty($data['inspection_required'])) ? 'pending' : 'not_required',
                 'created_by' => $request->user()?->id, 'status' => 'pending',
@@ -963,10 +1202,10 @@ class InventoryIntegrationController extends Controller
                 'manufacturing_date' => $line['manufacturing_date'] ?? null, 'expiry_date' => $line['expiry_date'] ?? null,
                 'best_before_date' => $line['best_before_date'] ?? null, 'warranty_until' => $line['warranty_until'] ?? null,
             ]);
-            app(AuditService::class)->record('inventory_document.created', $document, null, $document->toArray() + ['api' => true]);
+            app(AuditService::class)->record('inventory_document.created', $document, null, $document->toArray() + ['api' => true, 'workflow' => $document->production_order_id ? 'material_issue' : 'general']);
             return $document;
         });
-        return response()->json(['data' => $document->load(['location', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), 'status' => 'pending_approval'], 201);
+        return response()->json(['data' => $document->load(['location', 'productionOrder', 'reversedDocument', 'department', 'costCenter', 'lines.product', 'lines.department', 'lines.costCenter']), 'status' => 'pending_approval'], 201);
     }
 
     public function approveDocument(int $id): JsonResponse
@@ -981,6 +1220,60 @@ class InventoryIntegrationController extends Controller
         $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
         $document = $this->companyScope(InventoryDocument::query(), auth()->user()?->company_id)->findOrFail($id);
         return response()->json(['data' => app(InventoryDocumentApprovalService::class)->reject($document, $data['reason'], auth()->user()), 'status' => 'rejected']);
+    }
+
+    public function expiryOverrides(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $document = $this->companyScope(InventoryDocument::query(), $companyId)->where('document_type', 'issue')->findOrFail($id);
+        $data = $request->validate(['status' => ['nullable', 'in:pending,approved,rejected'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $overrides = InventoryExpiryOverrideRequest::with(['requester:id,name,email', 'approver:id,name,email', 'consumer:id,name,email'])
+            ->where('company_id', $companyId)->where('inventory_document_id', $document->id)
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($overrides, $request, 'inventory.expiry-overrides.'.$document->id, (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeExpiryOverride(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $document = $this->companyScope(InventoryDocument::query(), $companyId)->where('document_type', 'issue')->findOrFail($id);
+        if ($document->status !== 'pending') abort(422, 'Expiry exceptions must be requested before the issue is approved.');
+        $data = $request->validate(['scope' => ['required', 'in:expired,best_before,both'], 'reason' => ['required', 'string', 'min:5', 'max:2000']]);
+        $existing = InventoryExpiryOverrideRequest::where('company_id', $companyId)->where('inventory_document_id', $document->id)->whereIn('status', ['pending', 'approved'])->whereNull('consumed_at')->first();
+        if ($existing) return response()->json(['data' => $existing->load(['requester:id,name,email', 'approver:id,name,email']), 'status' => 'duplicate_ignored']);
+        $override = InventoryExpiryOverrideRequest::create([
+            'company_id' => $companyId, 'inventory_document_id' => $document->id, 'scope' => $data['scope'],
+            'status' => 'pending', 'reason' => $data['reason'], 'requested_by' => $request->user()->id,
+        ]);
+        app(AuditService::class)->record('inventory_expiry_override.requested', $override, null, $override->toArray() + ['document_id' => $document->id]);
+        return response()->json(['data' => $override->load(['requester:id,name,email', 'document']), 'status' => 'pending'], 201);
+    }
+
+    public function approveExpiryOverride(Request $request, int $id, int $overrideId): JsonResponse
+    {
+        return $this->decideExpiryOverride($request, $id, $overrideId, 'approved');
+    }
+
+    public function rejectExpiryOverride(Request $request, int $id, int $overrideId): JsonResponse
+    {
+        return $this->decideExpiryOverride($request, $id, $overrideId, 'rejected');
+    }
+
+    private function decideExpiryOverride(Request $request, int $id, int $overrideId, string $status): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate(['decision_reason' => ['required', 'string', 'min:5', 'max:2000']]);
+        $document = $this->companyScope(InventoryDocument::query(), $companyId)->where('document_type', 'issue')->findOrFail($id);
+        $override = InventoryExpiryOverrideRequest::where('company_id', $companyId)->where('inventory_document_id', $document->id)->lockForUpdate()->findOrFail($overrideId);
+        if ($override->status !== 'pending') return response()->json(['data' => $override->load(['requester:id,name,email', 'approver:id,name,email']), 'status' => 'already_decided']);
+        if ((int) $override->requested_by === (int) $request->user()->id) abort(422, 'The expiry exception requester cannot decide the same exception.');
+        if ($document->status !== 'pending') abort(422, 'Expiry exceptions can only be decided before the issue is approved.');
+        $before = $override->toArray();
+        $override->update(['status' => $status, 'approved_by' => $request->user()->id, 'approved_at' => now(), 'decision_reason' => $data['decision_reason']]);
+        app(AuditService::class)->record('inventory_expiry_override.'.$status, $override, $before, $override->fresh()->toArray());
+        return response()->json(['data' => $override->fresh()->load(['requester:id,name,email', 'approver:id,name,email']), 'status' => $status]);
     }
 
     public function inspectDocument(Request $request, int $id): JsonResponse
@@ -1027,6 +1320,8 @@ class InventoryIntegrationController extends Controller
             'lines.*.location_id' => ['nullable', 'integer', $locationScope],
             'lines.*.direction' => ['required', 'in:in,out'], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
             'lines.*.unit_cost' => ['nullable', 'numeric', 'min:0'],
+            'lines.*.department_id' => ['nullable', 'integer', $owned('departments')],
+            'lines.*.cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
         ]);
         foreach ($data['lines'] as $line) {
             if (!empty($line['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($line['location_id'])->exists()) abort(422, 'A line location is not authorized for this company.');
@@ -1061,7 +1356,7 @@ class InventoryIntegrationController extends Controller
 
         $adjustments = $this->companyScope(InventoryAdjustment::with([
             'creator:id,name,email', 'approver:id,name,email',
-            'lines.product:id,name,sku', 'lines.location:id,code,name',
+            'lines.product:id,name,sku', 'lines.location:id,code,name', 'lines.department:id,code,name', 'lines.costCenter:id,code,name',
         ]), $request->user()?->company_id)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['reason_code'] ?? null, fn ($query, $reason) => $query->where('reason_code', $reason))
@@ -1079,24 +1374,37 @@ class InventoryIntegrationController extends Controller
     public function adjustmentReconciliation(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
             'from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'],
             'status' => ['nullable', 'in:approved,rejected,pending'], 'tolerance' => ['nullable', 'numeric', 'min:0', 'max:1000000000'],
+            'department_id' => ['nullable', 'integer', $owned('departments')],
+            'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')],
         ]);
         $tolerance = (float) ($data['tolerance'] ?? 0.000001);
         $adjustments = $this->companyScope(InventoryAdjustment::with('lines'), $companyId)
             ->whereBetween('date', [$data['from'], $data['to']])
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->orderBy('date')->orderBy('id')->get();
-        $rows = $adjustments->map(function (InventoryAdjustment $adjustment) use ($tolerance): array {
-            $movements = InventoryMovement::where('company_id', $adjustment->company_id)->where('reference_type', $adjustment->getMorphClass())->where('reference_id', $adjustment->id)->get(['quantity', 'unit_cost', 'movement_type']);
-            $expected = (float) $movements->sum(fn (InventoryMovement $movement): float => (float) $movement->quantity * (float) ($movement->unit_cost ?? 0));
+        $rows = $adjustments->map(function (InventoryAdjustment $adjustment) use ($tolerance, $data): array {
+            $movements = InventoryMovement::where('company_id', $adjustment->company_id)->where('reference_type', $adjustment->getMorphClass())->where('reference_id', $adjustment->id)
+                ->when(array_key_exists('department_id', $data), fn ($query) => $query->where('department_id', $data['department_id']))
+                ->when(array_key_exists('cost_center_id', $data), fn ($query) => $query->where('cost_center_id', $data['cost_center_id']))
+                ->get(['id', 'quantity', 'unit_cost', 'movement_type', 'department_id', 'cost_center_id']);
+            $movementValue = (float) $movements->sum(fn (InventoryMovement $movement): float => (float) $movement->quantity * (float) ($movement->unit_cost ?? 0));
+            $allocations = InventoryMovementAllocation::whereIn('movement_id', $movements->pluck('id'))->get(['quantity', 'unit_cost']);
+            $valuationValue = (float) $allocations->sum(fn (InventoryMovementAllocation $allocation): float => (float) $allocation->quantity * (float) ($allocation->unit_cost ?? 0));
+            $usesCostLayerValuation = $allocations->isNotEmpty();
+            $expected = $usesCostLayerValuation ? $valuationValue : $movementValue;
             $journals = JournalEntry::where('company_id', $adjustment->company_id)->where('source_type', $adjustment->getMorphClass())->where('source_id', $adjustment->id)->where('status', 'posted')->with('lines')->get();
-            $posted = (float) $journals->sum(fn (JournalEntry $journal): float => (float) $journal->lines->sum('debit'));
+            $journalRows = $journals->filter(function (JournalEntry $journal) use ($data): bool {
+                return $journal->lines->contains(fn ($line): bool => (!array_key_exists('department_id', $data) || (int) $line->department_id === (int) $data['department_id']) && (!array_key_exists('cost_center_id', $data) || (int) $line->cost_center_id === (int) $data['cost_center_id']));
+            });
+            $posted = (float) $journalRows->sum(fn (JournalEntry $journal): float => (float) $journal->lines->filter(fn ($line): bool => (!array_key_exists('department_id', $data) || (int) $line->department_id === (int) $data['department_id']) && (!array_key_exists('cost_center_id', $data) || (int) $line->cost_center_id === (int) $data['cost_center_id']))->sum('debit'));
             $variance = round($expected - $posted, 6);
-            return ['adjustment_id' => $adjustment->id, 'adjustment_no' => $adjustment->adjustment_no, 'date' => optional($adjustment->date)->toDateString(), 'status' => $adjustment->status, 'reason_code' => $adjustment->reason_code, 'line_count' => $adjustment->lines->count(), 'movement_count' => $movements->count(), 'expected_value' => round($expected, 6), 'posted_value' => round($posted, 6), 'variance' => $variance, 'journal_count' => $journals->count(), 'reconciliation_status' => $journals->isEmpty() && $expected > $tolerance ? 'missing_journal' : (abs($variance) > $tolerance ? 'variance' : 'reconciled')];
+            return ['adjustment_id' => $adjustment->id, 'adjustment_no' => $adjustment->adjustment_no, 'date' => optional($adjustment->date)->toDateString(), 'status' => $adjustment->status, 'reason_code' => $adjustment->reason_code, 'department_id' => isset($data['department_id']) ? (int) $data['department_id'] : null, 'cost_center_id' => isset($data['cost_center_id']) ? (int) $data['cost_center_id'] : null, 'line_count' => $adjustment->lines->count(), 'movement_count' => $movements->count(), 'allocation_count' => $allocations->count(), 'movement_value' => round($movementValue, 6), 'expected_value' => round($expected, 6), 'valuation_source' => $usesCostLayerValuation ? 'movement_cost_layer_allocations' : 'movement_unit_cost_legacy_fallback', 'posted_value' => round($posted, 6), 'variance' => $variance, 'journal_count' => $journalRows->count(), 'reconciliation_status' => $journalRows->isEmpty() && $expected > $tolerance ? 'missing_journal' : (abs($variance) > $tolerance ? 'variance' : 'reconciled')];
         })->values();
-        return response()->json(['data' => $rows, 'summary' => ['adjustments' => $rows->count(), 'expected_value' => round((float) $rows->sum('expected_value'), 6), 'posted_value' => round((float) $rows->sum('posted_value'), 6), 'variance' => round((float) $rows->sum('variance'), 6), 'variance_count' => $rows->where('reconciliation_status', 'variance')->count(), 'missing_journal_count' => $rows->where('reconciliation_status', 'missing_journal')->count()], 'meta' => ['from' => $data['from'], 'to' => $data['to'], 'tolerance' => $tolerance]]);
+        return response()->json(['data' => $rows, 'summary' => ['adjustments' => $rows->count(), 'expected_value' => round((float) $rows->sum('expected_value'), 6), 'posted_value' => round((float) $rows->sum('posted_value'), 6), 'variance' => round((float) $rows->sum('variance'), 6), 'variance_count' => $rows->where('reconciliation_status', 'variance')->count(), 'missing_journal_count' => $rows->where('reconciliation_status', 'missing_journal')->count()], 'meta' => ['from' => $data['from'], 'to' => $data['to'], 'tolerance' => $tolerance, 'department_id' => isset($data['department_id']) ? (int) $data['department_id'] : null, 'cost_center_id' => isset($data['cost_center_id']) ? (int) $data['cost_center_id'] : null]]);
     }
 
     public function approveAdjustment(int $id): JsonResponse
@@ -1111,7 +1419,7 @@ class InventoryIntegrationController extends Controller
             return response()->json(['message' => $exception->getMessage()], 422);
         }
 
-        return response()->json(['data' => $adjustment->load('lines.product', 'lines.location'), 'status' => $adjustment->status]);
+        return response()->json(['data' => $adjustment->load('lines.product', 'lines.location', 'lines.department', 'lines.costCenter'), 'status' => $adjustment->status]);
     }
 
     public function rejectAdjustment(Request $request, int $id): JsonResponse
@@ -1128,7 +1436,7 @@ class InventoryIntegrationController extends Controller
             return response()->json(['message' => $exception->getMessage()], 422);
         }
 
-        return response()->json(['data' => $adjustment->load('lines.product', 'lines.location'), 'status' => $adjustment->status]);
+        return response()->json(['data' => $adjustment->load('lines.product', 'lines.location', 'lines.department', 'lines.costCenter'), 'status' => $adjustment->status]);
     }
 
     public function salesOrders(Request $request): JsonResponse
@@ -1274,6 +1582,7 @@ class InventoryIntegrationController extends Controller
             $promotionResult = app(PromotionService::class)->applyCodesToLines($promotionCodes, $lineRows, $customer->id, $data['date']);
             $promotionDiscount = (float) collect($promotionResult['lines'])->sum('discount');
             $discount += $promotionDiscount;
+            $auditLines = [];
             foreach ($promotionResult['lines'] as $line) {
                 InvoiceDetail::create([
                     'date' => $data['date'], 'invoice_id' => $invoice->id, 'category_id' => $line['category_id'],
@@ -1281,6 +1590,7 @@ class InventoryIntegrationController extends Controller
                     'selling_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'selling_price' => (float) $line['quantity'] * (float) $line['unit_price'],
                     'tax_rate' => $line['tax_rate'], 'tax_amount' => $line['tax_amount'], 'status' => 0,
                 ]);
+                $auditLines[] = ['product_id' => $line['product_id'], 'quantity' => (float) $line['quantity'], 'unit_price' => (float) $line['unit_price'], 'discount' => (float) ($line['discount'] ?? 0), 'tax_rate' => (float) $line['tax_rate'], 'tax_amount' => (float) $line['tax_amount'], 'batch_no' => $line['batch_no'] ?? null, 'serial_numbers' => $line['serial_numbers'] ?? null];
             }
             if ($discount > $lineTotal + 0.000001) throw new \RuntimeException('Discount cannot exceed the invoice subtotal.');
             $netSubtotal = max(0, $subtotal - $discount);
@@ -1295,7 +1605,7 @@ class InventoryIntegrationController extends Controller
                 'paid_status' => $data['paid_status'], 'discount_amount' => $discount, 'total_amount' => $total,
                 'paid_amount' => $paid, 'due_amount' => $total - $paid, 'base_amount' => $paid * (float) ($exchangeRate ?: 1),
             ]);
-            app(AuditService::class)->record('invoice.created', $invoice, null, $invoice->toArray());
+            app(AuditService::class)->record('invoice.created', $invoice, null, array_merge($invoice->toArray(), ['lines' => $auditLines]));
             return $invoice;
         });
         return response()->json(['data' => $invoice->load('customer', 'store', 'invoice_details.product', 'payment'), 'status' => 'pending_approval'], 201);
@@ -1398,6 +1708,23 @@ class InventoryIntegrationController extends Controller
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($snapshots, $request, 'inventory.reconciliation-snapshots', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function reconciliationSnapshot(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate(['product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer']]);
+        $snapshot = $this->companyScope(InventoryReconciliationSnapshot::query(), $request->user()?->company_id)->findOrFail($id);
+        $rows = collect($snapshot->rows ?? [])
+            ->when($data['product_id'] ?? null, fn ($rows, $productId) => $rows->where('product_id', (int) $productId))
+            ->when(array_key_exists('location_id', $data), fn ($rows) => $rows->where('location_id', $data['location_id'] === null ? null : (int) $data['location_id']))
+            ->values();
+        return response()->json(['data' => $snapshot->toArray() + ['rows' => $rows->all()], 'summary' => [
+            'row_count' => $rows->count(),
+            'quantity' => round((float) $rows->sum('balance_quantity'), 6),
+            'movement_value' => round((float) $rows->sum('balance_value'), 6),
+            'valuation_value' => round((float) $rows->sum(fn (array $row): float => (float) ($row['valuation_value'] ?? $row['balance_value'] ?? 0)), 6),
+            'valuation_source' => $rows->contains(fn (array $row): bool => ($row['valuation_source'] ?? null) === 'cost_layers') ? 'cost_layers' : 'movement_cost',
+        ], 'status' => 'ok']);
     }
 
     public function costLayerAdjustments(Request $request): JsonResponse

@@ -6,6 +6,9 @@ use App\Models\Category;
 use App\Models\Company;
 use App\Models\InventoryStatusBalance;
 use App\Models\InventoryMovement;
+use App\Models\InventoryBatch;
+use App\Models\InventorySerial;
+use App\Models\InventoryStatusTransfer;
 use App\Models\AccountMapping;
 use App\Models\ChartOfAccount;
 use App\Models\FiscalYear;
@@ -41,6 +44,32 @@ class InventoryStatusSummaryTest extends TestCase
             ->assertJsonPath('summary.by_status.damaged.value', 18)
             ->assertJsonPath('summary.by_status.quarantine.quantity', 2)
             ->assertJsonPath('data.0.product_id', $product->id);
+    }
+
+    public function test_batch_and_serial_disposition_keeps_layer_and_serial_context(): void
+    {
+        $company = Company::create(['name' => 'Traceable Disposition Co', 'code' => 'TRACE-DISPOSITION']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Traceable Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Each', 'code' => 'EA-TRACE-DISPOSITION', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Traceable Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Traceable disposition item', 'quantity' => 1, 'purchase_price' => 8, 'tracking_type' => 'serial', 'status' => 1]);
+        $batch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'TRACE-DISP-LOT']);
+        $serial = InventorySerial::create(['product_id' => $product->id, 'batch_id' => $batch->id, 'serial_no' => 'TRACE-DISP-SN', 'status' => 'available']);
+        \App\Models\FiscalYear::create(['company_id' => $company->id, 'name' => 'FY 2026', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
+        Sanctum::actingAs($user, ['inventory:write']);
+        app(\App\Services\InventoryLedgerService::class)->post($product->id, 'receipt', 1, 8, null, null, 'Test receipt', $user->id, $batch->id, $serial->id);
+        $transfer = InventoryStatusTransfer::create(['company_id' => $company->id, 'transfer_no' => 'ST-TRACE-DISP', 'product_id' => $product->id, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'from_status' => 'available', 'to_status' => 'damaged', 'quantity' => 1, 'reason' => 'Serial quality failure', 'status' => 'approved', 'approved_by' => $user->id, 'created_by' => $user->id, 'approved_at' => now(), 'inspection_status' => 'not_required']);
+        app(\App\Services\InventoryStatusService::class)->apply($transfer);
+        $this->assertDatabaseHas('inventory_movements', ['reference_id' => $transfer->id, 'movement_type' => 'quarantine_in', 'batch_id' => $batch->id, 'serial_id' => $serial->id]);
+        $this->assertDatabaseHas('inventory_serials', ['id' => $serial->id, 'status' => 'damaged']);
+        $this->assertDatabaseHas('inventory_status_balances', ['product_id' => $product->id, 'status' => 'damaged', 'quantity' => 1]);
+
+        $release = InventoryStatusTransfer::create(['company_id' => $company->id, 'transfer_no' => 'ST-TRACE-RELEASE', 'product_id' => $product->id, 'batch_id' => $batch->id, 'serial_id' => $serial->id, 'from_status' => 'damaged', 'to_status' => 'available', 'quantity' => 1, 'reason' => 'Quality recheck passed', 'status' => 'approved', 'approved_by' => $user->id, 'created_by' => $user->id, 'approved_at' => now(), 'inspection_status' => 'not_required']);
+        app(\App\Services\InventoryStatusService::class)->apply($release);
+        $this->assertDatabaseHas('inventory_movements', ['reference_id' => $release->id, 'movement_type' => 'quarantine_out', 'batch_id' => $batch->id, 'serial_id' => $serial->id]);
+        $this->assertDatabaseHas('inventory_serials', ['id' => $serial->id, 'status' => 'available']);
+        $this->assertDatabaseHas('inventory_status_balances', ['product_id' => $product->id, 'status' => 'damaged', 'quantity' => 0]);
     }
 
     public function test_scrap_status_transfer_can_receive_recovery_material(): void

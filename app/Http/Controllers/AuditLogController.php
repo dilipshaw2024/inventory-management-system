@@ -7,9 +7,14 @@ use App\Models\User;
 use App\Models\UserActivityLog;
 use App\Models\DocumentStatusHistory;
 use App\Models\DocumentRevision;
+use App\Models\Product;
+use App\Models\Supplier;
+use App\Models\Customer;
+use App\Services\RevisionRestoreService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class AuditLogController extends Controller
 {
@@ -84,5 +89,13 @@ class AuditLogController extends Controller
             'changed_by' => $revision->changed_by,
             'changes' => $changes,
         ]);
+    }
+
+    public function restoreRevision(Request $request, int $id)
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:500']]);
+        $revision = DocumentRevision::query()->findOrFail($id);
+        $record = app(RevisionRestoreService::class)->restore($revision, $data['reason'], auth()->user()?->company_id);
+        return back()->with(['message' => class_basename($record).' revision restored and audited.', 'alert-type' => 'success']);
     }
 }

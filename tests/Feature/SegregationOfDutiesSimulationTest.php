@@ -5,8 +5,14 @@ namespace Tests\Feature;
 use App\Models\ApprovalPolicy;
 use App\Models\ApprovalOverride;
 use App\Models\Company;
+use App\Models\DocumentRevision;
 use App\Models\Permission;
 use App\Models\Role;
+use App\Models\Supplier;
+use App\Models\Unit;
+use App\Models\Brand;
+use App\Models\Category;
+use App\Models\Customer;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Laravel\Sanctum\Sanctum;
@@ -93,4 +99,122 @@ class SegregationOfDutiesSimulationTest extends TestCase
             ->assertJsonPath('summary.active_approved', 0)
             ->assertJsonCount(2, 'data');
     }
+
+    public function test_security_admin_can_restore_supplier_and_customer_revisions_with_audit(): void
+    {
+        $company = Company::create(['name' => 'Restore Masters Co', 'code' => 'RESTORE-MASTERS']);
+        $admin = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['code' => 'users.manage', 'name' => 'Manage users', 'module' => 'security']);
+        $role = Role::create(['code' => 'security-admin', 'name' => 'Security admin', 'is_active' => true]);
+        $role->permissions()->attach($permission->id);
+        $admin->roles()->attach($role->id);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Deleted supplier', 'is_active' => false]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Deleted customer', 'is_active' => false]);
+        $supplier->delete();
+        $customer->delete();
+        $supplierRevision = DocumentRevision::create(['company_id' => $company->id, 'document_type' => (new Supplier)->getMorphClass(), 'document_id' => $supplier->id, 'version' => 1, 'old_values' => ['name' => 'Restored supplier', 'is_active' => true], 'new_values' => ['name' => 'Deleted supplier', 'is_active' => false], 'changed_by' => $admin->id, 'changed_at' => now()]);
+        $customerRevision = DocumentRevision::create(['company_id' => $company->id, 'document_type' => (new Customer)->getMorphClass(), 'document_id' => $customer->id, 'version' => 1, 'old_values' => ['name' => 'Restored customer', 'is_active' => true], 'new_values' => ['name' => 'Deleted customer', 'is_active' => false], 'changed_by' => $admin->id, 'changed_at' => now()]);
+
+        $this->actingAs($admin)->post('/erp/security/audit/revisions/'.$supplierRevision->id.'/restore', ['reason' => 'Restore approved supplier master.'])->assertRedirect();
+        $this->actingAs($admin)->post('/erp/security/audit/revisions/'.$customerRevision->id.'/restore', ['reason' => 'Restore approved customer master.'])->assertRedirect();
+        $this->assertDatabaseHas('suppliers', ['id' => $supplier->id, 'name' => 'Restored supplier', 'is_active' => true, 'deleted_at' => null]);
+        $this->assertDatabaseHas('customers', ['id' => $customer->id, 'name' => 'Restored customer', 'is_active' => true, 'deleted_at' => null]);
+        $this->assertDatabaseHas('audit_logs', ['action' => 'document_revision.restored', 'auditable_type' => (new Supplier)->getMorphClass(), 'auditable_id' => $supplier->id]);
+        $this->assertDatabaseHas('audit_logs', ['action' => 'document_revision.restored', 'auditable_type' => (new Customer)->getMorphClass(), 'auditable_id' => $customer->id]);
+    }
+
+
+    public function test_security_admin_can_restore_catalog_master_revisions(): void
+    {
+        $company = Company::create(['name' => 'Restore Catalog Co', 'code' => 'RESTORE-CATALOG']);
+        $admin = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['code' => 'users.manage', 'name' => 'Manage users', 'module' => 'security']);
+        $role = Role::create(['code' => 'catalog-security-admin', 'name' => 'Catalog security admin', 'is_active' => true]);
+        $role->permissions()->attach($permission->id);
+        $admin->roles()->attach($role->id);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Deleted unit', 'code' => 'DEL-UNIT', 'status' => 0]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Deleted category', 'code' => 'DEL-CAT', 'is_active' => false, 'status' => 0]);
+        $brand = Brand::create(['company_id' => $company->id, 'name' => 'Deleted brand', 'code' => 'DEL-BRAND', 'is_active' => false]);
+        $unit->delete();
+        $category->delete();
+        $brand->delete();
+        $revisions = [
+            [$unit, 'Restored unit', (new Unit)->getMorphClass(), ['name' => 'Restored unit', 'status' => 1]],
+            [$category, 'Restored category', (new Category)->getMorphClass(), ['name' => 'Restored category', 'is_active' => true, 'status' => 1]],
+            [$brand, 'Restored brand', (new Brand)->getMorphClass(), ['name' => 'Restored brand', 'is_active' => true]],
+        ];
+        foreach ($revisions as [$record, $name, $type, $oldValues]) {
+            $revision = DocumentRevision::create([
+                'company_id' => $company->id, 'document_type' => $type, 'document_id' => $record->id,
+                'version' => 1, 'old_values' => $oldValues, 'new_values' => ['name' => $record->name],
+                'changed_by' => $admin->id, 'changed_at' => now(),
+            ]);
+            $this->actingAs($admin)->post('/erp/security/audit/revisions/'.$revision->id.'/restore', ['reason' => 'Restore approved catalog master.'])->assertRedirect();
+            $this->assertDatabaseHas($record->getTable(), ['id' => $record->id, 'name' => $name, 'deleted_at' => null]);
+            $this->assertDatabaseHas('audit_logs', ['action' => 'document_revision.restored', 'auditable_type' => $type, 'auditable_id' => $record->id]);
+        }
+        $this->assertDatabaseHas('units', ['id' => $unit->id, 'status' => 1]);
+        $this->assertDatabaseHas('categories', ['id' => $category->id, 'is_active' => 1]);
+        $this->assertDatabaseHas('brands', ['id' => $brand->id, 'is_active' => 1]);
+    }
+
+    public function test_integration_clients_can_synchronize_tenant_revisions_and_field_diffs(): void
+    {
+        $company = Company::create(['name' => 'Revision Co', 'code' => 'REV-CO']);
+        $otherCompany = Company::create(['name' => 'Other Revision Co', 'code' => 'REV-OTHER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        DocumentRevision::create([
+            'company_id' => $company->id, 'document_type' => 'product', 'document_id' => 44,
+            'version' => 1, 'old_values' => ['name' => 'Old'], 'new_values' => ['name' => 'New'],
+            'changed_by' => $user->id, 'changed_at' => now()->subMinute(),
+        ]);
+        DocumentRevision::create([
+            'company_id' => $otherCompany->id, 'document_type' => 'product', 'document_id' => 45,
+            'version' => 1, 'old_values' => ['name' => 'Private'], 'new_values' => ['name' => 'Secret'],
+            'changed_by' => null, 'changed_at' => now(),
+        ]);
+
+        Sanctum::actingAs($user, ['integration:read']);
+        $response = $this->getJson('/api/integration/security/revisions?cursor_mode=1&per_page=1')
+            ->assertOk()->assertJsonPath('meta.feed', 'security.revisions')
+            ->assertJsonPath('meta.has_more', false)->assertJsonPath('data.0.document_id', 44);
+        $revisionId = $response->json('data.0.id');
+        $this->getJson('/api/integration/security/revisions/'.$revisionId.'/diff')
+            ->assertOk()->assertJsonPath('data.changes.name.from', 'Old')
+            ->assertJsonPath('data.changes.name.to', 'New');
+        $this->getJson('/api/integration/security/revisions/'.DocumentRevision::where('company_id', $otherCompany->id)->value('id').'/diff')
+            ->assertNotFound();
+    }
+
+    public function test_integration_clients_can_restore_a_tenant_master_revision_with_write_scope(): void
+    {
+        $company = Company::create(['name' => 'API Restore Co', 'code' => 'API-RESTORE']);
+        $otherCompany = Company::create(['name' => 'Other API Restore Co', 'code' => 'API-RESTORE-OTHER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Current supplier', 'is_active' => false]);
+        $revision = DocumentRevision::create([
+            'company_id' => $company->id, 'document_type' => (new Supplier)->getMorphClass(), 'document_id' => $supplier->id,
+            'version' => 1, 'old_values' => ['name' => 'Restored supplier', 'is_active' => true],
+            'new_values' => ['name' => 'Current supplier', 'is_active' => false], 'changed_by' => $user->id, 'changed_at' => now(),
+        ]);
+        $otherRevision = DocumentRevision::create([
+            'company_id' => $otherCompany->id, 'document_type' => 'product', 'document_id' => 991,
+            'version' => 1, 'old_values' => ['name' => 'Private'], 'new_values' => ['name' => 'Secret'],
+            'changed_by' => null, 'changed_at' => now(),
+        ]);
+
+        Sanctum::actingAs($user, ['integration:read', 'integration:write']);
+        $this->postJson('/api/integration/security/revisions/'.$revision->id.'/restore', [
+            'reason' => 'Restore approved supplier master through integration.',
+        ])->assertOk()->assertJsonPath('status', 'restored')->assertJsonPath('revision_id', $revision->id);
+
+        $this->assertDatabaseHas('suppliers', ['id' => $supplier->id, 'name' => 'Restored supplier', 'is_active' => true]);
+        $this->assertDatabaseHas('audit_logs', [
+            'action' => 'document_revision.restored', 'auditable_type' => (new Supplier)->getMorphClass(), 'auditable_id' => $supplier->id,
+        ]);
+        $this->postJson('/api/integration/security/revisions/'.$otherRevision->id.'/restore', [
+            'reason' => 'Should remain tenant isolated.',
+        ])->assertNotFound();
+    }
+
 }

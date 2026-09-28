@@ -22,6 +22,7 @@ class DashboardController extends Controller
         ];
         if (!($metrics['visibility']['finance'] ?? true)) $cards = collect($cards)->reject(fn (array $metric): bool => in_array($metric[0], ['Sales this month', 'Receivables'], true))->values()->all();
         if (!($metrics['visibility']['service'] ?? true)) $cards = collect($cards)->reject(fn (array $metric): bool => in_array($metric[0], ['Service requests', 'Maintenance workload'], true))->values()->all();
+        if (!($metrics['visibility']['inventory'] ?? true)) $cards = collect($cards)->reject(fn (array $metric): bool => $metric[0] === 'Inventory health')->values()->all();
         return view('admin.index', [
             'metrics' => $cards,
             'salesTrend' => $metrics['sales_trend'] ?? [],

@@ -121,6 +121,8 @@ class PurchaseRfqController extends Controller
         if ($rfq->status !== 'submitted') return back()->with(['message' => 'Only submitted RFQs can receive quotations.', 'alert-type' => 'error']);
         $rfqSupplier = PurchaseRfqSupplier::where('purchase_rfq_id', $rfq->id)->findOrFail($data['rfq_supplier_id']);
         DB::transaction(function () use ($data, $rfq, $rfqSupplier): void {
+            $beforeStatus = (string) $rfqSupplier->status;
+            $beforeLines = $rfqSupplier->quotations()->get()->map(fn (PurchaseSupplierQuotation $quote): array => $quote->only(['purchase_rfq_line_id', 'unit_price', 'lead_days', 'valid_until', 'supplier_reference', 'notes']))->values()->all();
             foreach ($data['line_id'] as $index => $lineId) {
                 $line = PurchaseRfqLine::where('purchase_rfq_id', $rfq->id)->findOrFail($lineId);
                 PurchaseSupplierQuotation::updateOrCreate(
@@ -129,7 +131,8 @@ class PurchaseRfqController extends Controller
                 );
             }
             $rfqSupplier->update(['status' => 'quoted', 'quoted_at' => now()]);
-            app(AuditService::class)->record('purchase_rfq.quoted', $rfq, null, ['supplier_id' => $rfqSupplier->supplier_id]);
+            $afterLines = $rfqSupplier->fresh('quotations')->quotations->map(fn (PurchaseSupplierQuotation $quote): array => $quote->only(['purchase_rfq_line_id', 'unit_price', 'lead_days', 'valid_until', 'supplier_reference', 'notes']))->values()->all();
+            app(AuditService::class)->record('purchase_rfq.quoted', $rfq, ['status' => $beforeStatus, 'lines' => $beforeLines], ['supplier_id' => $rfqSupplier->supplier_id, 'status' => 'quoted', 'lines' => $afterLines]);
         });
         return back()->with(['message' => 'Supplier quotation recorded.', 'alert-type' => 'success']);
     }

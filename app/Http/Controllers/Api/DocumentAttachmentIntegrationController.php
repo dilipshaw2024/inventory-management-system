@@ -50,8 +50,12 @@ class DocumentAttachmentIntegrationController extends Controller
         ]);
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for attachment synchronization.');
+        $allowedTypes = $this->accessibleTypes($request, false);
+        abort_unless($allowedTypes !== [], 403, 'This token has no attachment read permission.');
+        if (!empty($data['attachable_type'])) abort_unless(in_array($data['attachable_type'], $allowedTypes, true), 403, 'This token cannot read attachments for the selected module.');
         $query = DocumentAttachment::query()
             ->where('company_id', $companyId)
+            ->whereIn('attachable_type', array_map(fn (string $type): string => $this->types[$type], $allowedTypes))
             ->when($data['attachable_type'] ?? null, fn ($query, $type) => $query->where('attachable_type', $this->types[$type]))
             ->when($data['attachable_id'] ?? null, fn ($query, $id) => $query->where('attachable_id', $id))
             ->when($data['attachment_type'] ?? null, fn ($query, $type) => $query->where('attachment_type', $type))
@@ -74,6 +78,7 @@ class DocumentAttachmentIntegrationController extends Controller
         ]);
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for attachment synchronization.');
+        $this->assertTypeAccess($request, $data['attachable_type'], true);
         $record = $this->types[$data['attachable_type']]::withoutGlobalScopes()->whereKey($data['attachable_id'])
             ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->firstOrFail();
         if (!empty($data['external_reference'])) {
@@ -103,7 +108,38 @@ class DocumentAttachmentIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for attachment access.');
         $attachment = DocumentAttachment::where('company_id', $companyId)->findOrFail($id);
+        $type = array_search($attachment->attachable_type, $this->types, true);
+        abort_unless($type !== false, 404);
+        $this->assertTypeAccess($request, $type, false);
         abort_unless(Storage::disk('local')->exists($attachment->stored_path), 404);
         return Storage::disk('local')->download($attachment->stored_path, $attachment->original_name, ['Content-Type' => $attachment->mime_type]);
+    }
+
+    private function accessibleTypes(Request $request, bool $write): array
+    {
+        $ability = fn (string $module): string => $module.':'.($write ? 'write' : 'read');
+        $modules = [];
+        foreach (array_keys($this->types) as $type) {
+            $module = $this->moduleForType($type);
+            if ($request->user()?->tokenCan($ability($module)) || $request->user()?->tokenCan('integration:'.($write ? 'write' : 'read'))) $modules[$module] = true;
+        }
+        return array_values(array_filter(array_keys($this->types), fn (string $type): bool => isset($modules[$this->moduleForType($type)])));
+    }
+
+    private function assertTypeAccess(Request $request, string $type, bool $write): void
+    {
+        abort_unless(in_array($type, $this->accessibleTypes($request, $write), true), 403, 'This token cannot access attachments for the selected module.');
+    }
+
+    private function moduleForType(string $type): string
+    {
+        return match ($type) {
+            'purchase_requisition', 'purchase_rfq', 'purchase_order', 'goods_receipt', 'purchase_invoice' => 'purchasing',
+            'supplier_claim', 'supplier_credit_note', 'landed_cost' => 'accounting',
+            'sales_quotation', 'sales_order', 'delivery', 'invoice' => 'sales',
+            'production_order' => 'manufacturing',
+            'service_asset', 'service_request', 'maintenance_order' => 'service',
+            default => 'inventory',
+        };
     }
 }

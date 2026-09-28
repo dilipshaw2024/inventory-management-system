@@ -24,19 +24,26 @@ class ProductCostingPolicyService
         ];
     }
 
-    public function schedule(Product $product, string $method, ?float $standardCost, \DateTimeInterface $effectiveFrom, ?int $changedBy = null, ?string $reason = null): ProductCostingPolicy
+    public function schedule(Product $product, string $method, ?float $standardCost, \DateTimeInterface $effectiveFrom, ?int $changedBy = null, ?string $reason = null, ?string $sourceType = null, ?int $sourceId = null, ?string $sourceReference = null): ProductCostingPolicy
     {
         $effective = CarbonImmutable::instance($effectiveFrom);
         if ($effective->lte(CarbonImmutable::now())) throw new \InvalidArgumentException('A scheduled costing policy must use a future effective date.');
         if ($method === 'standard' && $standardCost === null) throw new \InvalidArgumentException('Standard costing requires a standard cost.');
 
-        return ProductCostingPolicy::create([
+        $policy = ProductCostingPolicy::create([
             'product_id' => $product->id, 'costing_method' => $method, 'standard_cost' => $standardCost,
             'effective_from' => $effective, 'changed_by' => $changedBy, 'reason' => $reason,
         ]);
+        ProductCostHistory::create([
+            'product_id' => $product->id, 'old_costing_method' => $product->costing_method,
+            'new_costing_method' => $method, 'old_standard_cost' => $product->standard_cost,
+            'new_standard_cost' => $standardCost, 'effective_at' => $effective, 'changed_by' => $changedBy,
+            'reason' => $reason, 'source_type' => $sourceType, 'source_id' => $sourceId, 'source_reference' => $sourceReference,
+        ]);
+        return $policy;
     }
 
-    public function recordCurrent(Product $product, string $method, ?float $standardCost, ?int $changedBy = null, ?string $reason = null): ProductCostingPolicy
+    public function recordCurrent(Product $product, string $method, ?float $standardCost, ?int $changedBy = null, ?string $reason = null, ?string $sourceType = null, ?int $sourceId = null, ?string $sourceReference = null): ProductCostingPolicy
     {
         if ($method === 'standard' && $standardCost === null) throw new \InvalidArgumentException('Standard costing requires a standard cost.');
         $effective = CarbonImmutable::now();
@@ -48,6 +55,7 @@ class ProductCostingPolicyService
             'product_id' => $product->id, 'old_costing_method' => $product->getOriginal('costing_method'),
             'new_costing_method' => $method, 'old_standard_cost' => $product->getOriginal('standard_cost'),
             'new_standard_cost' => $standardCost, 'effective_at' => $effective, 'changed_by' => $changedBy, 'reason' => $reason,
+            'source_type' => $sourceType, 'source_id' => $sourceId, 'source_reference' => $sourceReference,
         ]);
         return $policy;
     }

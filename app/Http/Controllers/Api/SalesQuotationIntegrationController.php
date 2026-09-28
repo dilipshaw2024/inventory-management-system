@@ -62,10 +62,48 @@ class SalesQuotationIntegrationController extends Controller
                 'description' => $data['description'] ?? null, 'created_by' => $request->user()?->id, 'status' => 'submitted',
             ]);
             foreach ($data['lines'] as $line) SalesQuotationLine::create(['sales_quotation_id' => $quotation->id, 'product_id' => $line['product_id'], 'quantity' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount_amount']]);
-            app(AuditService::class)->record('sales_quotation.created', $quotation, null, $quotation->toArray() + ['api' => true]);
+            $lineSnapshots = $quotation->fresh('lines')->lines->map(fn (SalesQuotationLine $line): array => $line->only(['product_id', 'quantity', 'unit_price', 'discount_amount']))->values()->all();
+            app(AuditService::class)->record('sales_quotation.created', $quotation, null, $quotation->toArray() + ['lines' => $lineSnapshots, 'api' => true]);
             return $quotation->fresh(['customer', 'lines.product']);
         });
         return response()->json(['data' => $quotation, 'status' => 'submitted'], 201);
+    }
+
+    public function update(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'customer_id' => ['required', 'integer'], 'quote_date' => ['required', 'date'],
+            'valid_until' => ['nullable', 'date', 'after_or_equal:quote_date'],
+            'description' => ['nullable', 'string', 'max:2000'], 'lines' => ['required', 'array', 'min:1'],
+            'lines.*.product_id' => ['required', 'integer'], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
+            'lines.*.unit_price' => ['required', 'numeric', 'min:0'], 'lines.*.discount_amount' => ['required', 'numeric', 'min:0'],
+        ]);
+        $customer = $this->companyScope(Customer::query(), $companyId)->whereKey($data['customer_id'])->where('is_active', true)->first();
+        if (!$customer) abort(422, 'Customer is not authorized or inactive.');
+        $productIds = collect($data['lines'])->pluck('product_id');
+        if ($this->companyScope(Product::query(), $companyId)->whereIn('id', $productIds)->count() !== $productIds->unique()->count()) abort(422, 'One or more products are not authorized for this company.');
+        $quotation = DB::transaction(function () use ($data, $id, $companyId, $request): SalesQuotation {
+            $quotation = SalesQuotation::with('lines')->where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+            if (!in_array($quotation->status, ['draft', 'rejected'], true)) abort(422, 'Only draft or rejected quotations can be revised.');
+            $before = $quotation->toArray();
+            $before['lines'] = $quotation->lines->map(fn (SalesQuotationLine $line): array => $line->only(['product_id', 'quantity', 'unit_price', 'discount_amount']))->values()->all();
+            $quotation->update([
+                'customer_id' => $data['customer_id'], 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
+                'description' => $data['description'] ?? null, 'status' => 'submitted', 'approved_by' => null, 'approved_at' => null,
+                'rejection_reason' => null, 'rejected_by' => null, 'rejected_at' => null, 'customer_response_status' => 'pending',
+                'customer_responded_at' => null, 'customer_response_notes' => null, 'customer_portal_token_hash' => null,
+                'customer_portal_token_expires_at' => null, 'customer_portal_last_accessed_at' => null,
+            ]);
+            $quotation->lines()->delete();
+            foreach ($data['lines'] as $line) SalesQuotationLine::create(['sales_quotation_id' => $quotation->id, 'product_id' => $line['product_id'], 'quantity' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount_amount']]);
+            $fresh = $quotation->fresh(['customer', 'lines.product']);
+            $after = $fresh->toArray();
+            $after['lines'] = $fresh->lines->map(fn (SalesQuotationLine $line): array => $line->only(['product_id', 'quantity', 'unit_price', 'discount_amount']))->values()->all();
+            app(AuditService::class)->record('sales_quotation.revised', $fresh, $before, $after + ['api' => true, 'actor_id' => $request->user()?->id]);
+            return $fresh;
+        });
+        return response()->json(['data' => $quotation, 'status' => 'submitted']);
     }
 
     public function approve(Request $request, int $id): JsonResponse

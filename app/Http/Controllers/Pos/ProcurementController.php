@@ -76,7 +76,8 @@ class ProcurementController extends Controller
                 if ($priceAgreement && (float) $request->unit_price[$index] <= 0) $unitPrice = (float) $priceAgreement->unit_price;
                 PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $productId, 'location_id' => $request->input('location_id.'.$index), 'uom_id' => $uomId, 'uom_quantity' => $enteredQty, 'ordered_qty' => $stockQty, 'unit_price' => $unitPrice]);
             }
-            app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray());
+            $lineSnapshots = $order->fresh('lines')->lines->map(fn (PurchaseOrderLine $line): array => $line->only(['product_id', 'location_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price']))->values()->all();
+            app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray() + ['lines' => $lineSnapshots]);
             return $order;
         });
         return redirect()->route('procurement.orders')->with(['message' => 'Purchase order submitted.', 'alert-type' => 'success']);

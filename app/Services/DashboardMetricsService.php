@@ -40,7 +40,15 @@ class DashboardMetricsService
         $hasAssignedRoles = $user->roles()->exists();
         $finance = !$hasAssignedRoles || $user->hasPermission('reports.view') || $user->hasPermission('accounting.view');
         $service = !$hasAssignedRoles || $user->hasPermission('reports.view') || $user->hasPermission('service.manage');
-        $metrics['visibility'] = ['finance' => $finance, 'service' => $service, 'inventory' => true];
+        $inventory = !$hasAssignedRoles || $user->hasPermission('reports.view') || $user->hasPermission('inventory.view') || $user->hasPermission('inventory.manage');
+        $purchasing = !$hasAssignedRoles || $user->hasPermission('reports.view') || $user->hasPermission('purchasing.view') || $user->hasPermission('purchasing.manage');
+        $sales = !$hasAssignedRoles || $user->hasPermission('reports.view') || $user->hasPermission('sales.view') || $user->hasPermission('sales.manage');
+        $metrics['visibility'] = ['finance' => $finance, 'service' => $service, 'inventory' => $inventory];
+        $pending = 0;
+        if ($inventory) $pending += (int) ($metrics['pending_approvals_by_module']['inventory'] ?? 0);
+        if ($purchasing) $pending += (int) ($metrics['pending_approvals_by_module']['purchasing'] ?? 0);
+        if ($sales) $pending += (int) ($metrics['pending_approvals_by_module']['sales'] ?? 0);
+        $metrics['pending_approvals'] = ($inventory || $purchasing || $sales) ? $pending : null;
         if (!$finance) {
             $metrics['month_sales'] = null;
             $metrics['receivables'] = null;
@@ -50,6 +58,11 @@ class DashboardMetricsService
             $metrics['open_service_requests'] = null;
             $metrics['breached_service_requests'] = null;
             $metrics['active_maintenance_orders'] = null;
+        }
+        if (!$inventory) {
+            $metrics['total_products'] = null;
+            $metrics['low_stock'] = null;
+            $metrics['exception_drilldowns'] = ['low_stock' => [], 'excess_stock' => []];
         }
         return $metrics;
     }
@@ -62,14 +75,19 @@ class DashboardMetricsService
         $monthSales = (float) Invoice::whereIn('status', [1, 'approved'])->whereDate('date', '>=', $monthStart)->sum('total_amount');
         $products = Product::where('status', 1)->get(); $availability = app(InventoryAvailabilityService::class)->availableMany($products, true, null, auth()->user()?->company_id);
         $totalProducts = max(1, $products->count()); $planning = $this->planningMetrics($products, $companyId, $availability); $lowStock = $planning['low'];
-        $pendingApprovals = Invoice::where('status', 0)->count() + Purchase::where('status', 0)->count() + InventoryAdjustment::where('status', 'pending')->count() + PurchaseOrder::where('status', 'submitted')->count() + GoodsReceipt::where('status', 'pending')->count() + PurchaseInvoice::where('status', 'pending')->count() + SalesOrder::where('status', 'submitted')->count() + Delivery::where('status', 'pending')->count() + InventoryReturn::where('status', 'pending')->count() + InventoryDocument::where('status', 'pending')->count() + StockCount::where('status', 'submitted')->count();
+        $pendingByModule = [
+            'inventory' => InventoryAdjustment::where('status', 'pending')->count() + InventoryDocument::where('status', 'pending')->count() + StockCount::where('status', 'submitted')->count(),
+            'purchasing' => Purchase::where('status', 0)->count() + PurchaseOrder::where('status', 'submitted')->count() + GoodsReceipt::where('status', 'pending')->count() + PurchaseInvoice::where('status', 'pending')->count(),
+            'sales' => Invoice::where('status', 0)->count() + SalesOrder::where('status', 'submitted')->count() + Delivery::where('status', 'pending')->count() + InventoryReturn::where('status', 'pending')->count(),
+        ];
+        $pendingApprovals = array_sum($pendingByModule);
         $receivables = max(0, (float) Payment::where('due_amount', '>', 0)->where('approval_status', 'approved')->where('is_reversed', false)->sum('due_amount') - (float) CustomerPaymentAllocation::whereNull('voided_at')->whereHas('payment', fn ($query) => $query->where('approval_status', 'approved')->where('is_reversed', false))->sum('amount'));
         $openServiceRequests = ServiceRequest::whereIn('status', ['open', 'assigned', 'in_progress'])->count();
         $breachedServiceRequests = ServiceRequest::whereNotNull('response_due_at')->whereNotIn('status', ['resolved', 'cancelled'])->where(function ($query): void { $query->where(function ($nested): void { $nested->whereNull('assigned_at')->where('response_due_at', '<', now()); })->orWhereColumn('assigned_at', '>', 'response_due_at'); })->count();
         $activeMaintenanceOrders = MaintenanceOrder::whereIn('status', ['planned', 'in_progress'])->count();
         return [
             'month_sales' => $monthSales, 'total_products' => $totalProducts, 'low_stock' => $lowStock,
-            'pending_approvals' => $pendingApprovals, 'receivables' => $receivables,
+            'pending_approvals' => $pendingApprovals, 'pending_approvals_by_module' => $pendingByModule, 'receivables' => $receivables,
             'open_service_requests' => $openServiceRequests, 'breached_service_requests' => $breachedServiceRequests,
             'active_maintenance_orders' => $activeMaintenanceOrders,
             'sales_trend' => $this->salesTrend($months),

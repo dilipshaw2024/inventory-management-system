@@ -29,12 +29,12 @@ class ProductCostingController extends Controller
         if (($data['costing_method'] ?? null) === 'standard' && (($data['standard_cost'] ?? null) === null)) return back()->withInput()->withErrors(['standard_cost' => 'Standard costing requires a standard cost.']);
         $old = $product->only(['costing_method', 'standard_cost']);
         if (!empty($data['effective_at'])) {
-            app(ProductCostingPolicyService::class)->schedule($product, $data['costing_method'], isset($data['standard_cost']) ? (float) $data['standard_cost'] : null, CarbonImmutable::parse($data['effective_at']), auth()->id(), 'Scheduled from costing administration.');
+            app(ProductCostingPolicyService::class)->schedule($product, $data['costing_method'], isset($data['standard_cost']) ? (float) $data['standard_cost'] : null, CarbonImmutable::parse($data['effective_at']), auth()->id(), 'Scheduled from costing administration.', 'browser.product_costing', $product->id);
             app(AuditService::class)->record('product.costing.scheduled', $product, null, ['costing_method' => $data['costing_method'], 'standard_cost' => $data['standard_cost'] ?? null, 'effective_at' => $data['effective_at']]);
             return back()->with(['message' => 'Product costing policy scheduled.', 'alert-type' => 'success']);
         }
         $product->update(['costing_method' => $data['costing_method'], 'standard_cost' => $data['standard_cost'] ?? null]);
-        app(ProductCostingPolicyService::class)->recordCurrent($product, $product->costing_method, $product->standard_cost !== null ? (float) $product->standard_cost : null, auth()->id(), 'Updated from costing administration.');
+        app(ProductCostingPolicyService::class)->recordCurrent($product, $product->costing_method, $product->standard_cost !== null ? (float) $product->standard_cost : null, auth()->id(), 'Updated from costing administration.', 'browser.product_costing', $product->id);
         app(AuditService::class)->record('product.costing.updated', $product, $old, $product->only(['costing_method', 'standard_cost']));
         return back()->with(['message' => 'Product costing method updated.', 'alert-type' => 'success']);
     }

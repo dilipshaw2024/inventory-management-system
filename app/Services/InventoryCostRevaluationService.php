@@ -21,7 +21,7 @@ class InventoryCostRevaluationService
             if ($lines->isEmpty()) throw new \RuntimeException('No revaluation variance was found for the selected scope.');
             $run = InventoryCostRevaluationRun::create(['company_id' => $companyId, 'external_reference' => $externalReference, 'as_of_date' => $asOf, 'status' => 'pending', 'total_variance' => (float) $lines->sum('variance_amount'), 'requested_by' => $requestedBy]);
             foreach ($lines as $line) {
-                InventoryCostRevaluationLine::create(['revaluation_run_id' => $run->id, 'product_id' => $line['product_id'], 'cost_layer_id' => $line['layer_id'], 'location_id' => $line['location_id'], 'quantity' => $line['quantity'], 'old_unit_cost' => $line['current_unit_cost'], 'new_unit_cost' => $line['target_unit_cost'], 'variance_amount' => $line['variance_amount']]);
+                InventoryCostRevaluationLine::create(['revaluation_run_id' => $run->id, 'product_id' => $line['product_id'], 'cost_layer_id' => $line['layer_id'], 'location_id' => $line['location_id'], 'department_id' => $line['department_id'] ?? null, 'cost_center_id' => $line['cost_center_id'] ?? null, 'quantity' => $line['quantity'], 'old_unit_cost' => $line['current_unit_cost'], 'new_unit_cost' => $line['target_unit_cost'], 'variance_amount' => $line['variance_amount']]);
             }
             app(AuditService::class)->record('inventory_cost_revaluation.created', $run, null, $run->load('lines')->toArray());
             return $run->load('lines');

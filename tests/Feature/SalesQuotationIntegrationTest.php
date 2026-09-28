@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\Category;
 use App\Models\Company;
 use App\Models\Customer;
+use App\Models\DocumentRevision;
 use App\Models\Product;
 use App\Models\Supplier;
 use App\Models\SalesQuotation;
@@ -36,6 +37,10 @@ class SalesQuotationIntegrationTest extends TestCase
         ]);
         $created->assertCreated()->assertJsonPath('status', 'submitted')->assertJsonPath('data.lines.0.product_id', $product->id);
         $quotationId = $created->json('data.id');
+        $creationRevision = DocumentRevision::where('document_type', SalesQuotation::class)->where('document_id', $quotationId)->latest('version')->firstOrFail();
+        $this->assertSame($product->id, (int) data_get($creationRevision->new_values, 'lines.0.product_id'));
+        $this->assertSame('50.000000', (string) data_get($creationRevision->new_values, 'lines.0.unit_price'));
+        $this->assertSame('5.000000', (string) data_get($creationRevision->new_values, 'lines.0.discount_amount'));
 
         $duplicate = $this->postJson('/api/integration/sales-quotations', [
             'external_reference' => 'SQ-EXT-1', 'customer_id' => $customer->id, 'quote_date' => now()->toDateString(),
@@ -61,6 +66,28 @@ class SalesQuotationIntegrationTest extends TestCase
         Sanctum::actingAs($checker, ['sales:read', 'sales:write']);
         $this->postJson('/api/integration/sales-quotations/'.$quotationId.'/approve')->assertOk()->assertJsonPath('status', 'approved');
         $this->postJson('/api/integration/sales-quotations/'.$declined->json('data.id').'/approve')->assertStatus(422);
+        $this->postJson('/api/integration/sales-quotations/'.$declined->json('data.id').'/reject', ['rejection_reason' => 'Commercial terms require revision.'])->assertOk()->assertJsonPath('status', 'rejected');
+        Sanctum::actingAs($creator, ['sales:read', 'sales:write']);
+        $revised = $this->patchJson('/api/integration/sales-quotations/'.$declined->json('data.id'), [
+            'customer_id' => $customer->id, 'quote_date' => now()->toDateString(), 'valid_until' => now()->addDays(10)->toDateString(),
+            'lines' => [['product_id' => $product->id, 'quantity' => 3, 'unit_price' => 40, 'discount_amount' => 2]],
+        ]);
+        $revised->assertOk()->assertJsonPath('status', 'submitted')->assertJsonPath('data.lines.0.quantity', '3.000000');
+        $revision = DocumentRevision::where('document_type', SalesQuotation::class)->where('document_id', $declined->json('data.id'))->latest('version')->firstOrFail();
+        $this->assertSame('40.000000', (string) data_get($revision->new_values, 'lines.0.unit_price'));
+        $otherCompany = Company::create(['name' => 'Other Sales Quotation Co', 'code' => 'SQ-OTHER']);
+        $otherUser = User::factory()->create(['company_id' => $otherCompany->id]);
+        $otherCustomer = Customer::create(['company_id' => $otherCompany->id, 'name' => 'Other Quotation Customer', 'is_active' => true]);
+        $otherSupplier = Supplier::create(['company_id' => $otherCompany->id, 'name' => 'Other Quotation Supplier', 'is_active' => true]);
+        $otherUnit = Unit::create(['company_id' => $otherCompany->id, 'name' => 'Other Quotation Each', 'code' => 'SQ-OTHER-EA', 'dimension' => 'count', 'status' => 1, 'is_base' => true]);
+        $otherCategory = Category::create(['company_id' => $otherCompany->id, 'name' => 'Other Quotation Category', 'status' => 1]);
+        $otherProduct = Product::create(['company_id' => $otherCompany->id, 'supplier_id' => $otherSupplier->id, 'unit_id' => $otherUnit->id, 'category_id' => $otherCategory->id, 'name' => 'Other Quotation Product', 'quantity' => 0, 'status' => 1]);
+        Sanctum::actingAs($otherUser, ['sales:write']);
+        $this->patchJson('/api/integration/sales-quotations/'.$quotationId, [
+            'customer_id' => $otherCustomer->id, 'quote_date' => now()->toDateString(),
+            'lines' => [['product_id' => $otherProduct->id, 'quantity' => 1, 'unit_price' => 1, 'discount_amount' => 0]],
+        ])->assertNotFound();
+        Sanctum::actingAs($checker, ['sales:read', 'sales:write']);
         $converted = $this->postJson('/api/integration/sales-quotations/'.$quotationId.'/convert');
         $converted->assertCreated()->assertJsonPath('status', 'sales_order_created')->assertJsonPath('data.customer_id', $customer->id)->assertJsonPath('data.lines.0.discount_amount', '5.000000');
         $this->assertDatabaseHas('sales_quotations', ['id' => $quotationId, 'status' => 'converted']);

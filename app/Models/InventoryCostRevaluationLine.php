@@ -16,4 +16,6 @@ class InventoryCostRevaluationLine extends Model
     public function product() { return $this->belongsTo(Product::class); }
     public function costLayer() { return $this->belongsTo(InventoryCostLayer::class, 'cost_layer_id'); }
     public function location() { return $this->belongsTo(InventoryLocation::class, 'location_id'); }
+    public function department() { return $this->belongsTo(Department::class); }
+    public function costCenter() { return $this->belongsTo(CostCenter::class); }
 }

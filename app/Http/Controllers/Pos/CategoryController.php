@@ -44,11 +44,12 @@ class CategoryController extends Controller
 
     public function CategoryStore(Request $request){
         $companyId = auth()->user()?->company_id;
-        $data = $request->validate(['name' => ['required', 'string', 'max:255'], 'code' => ['nullable', 'string', 'max:50', Rule::unique('categories', 'code')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'parent_id' => ['nullable', 'integer', Rule::exists('categories', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'], 'is_active' => ['nullable', 'boolean'], 'required_attribute_ids' => ['nullable', 'array', 'max:50'], 'required_attribute_ids.*' => ['integer', Rule::exists('product_attributes', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))]]);
+        $data = $request->validate(['name' => ['required', 'string', 'max:255'], 'code' => ['nullable', 'string', 'max:50', Rule::unique('categories', 'code')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'parent_id' => ['nullable', 'integer', Rule::exists('categories', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'], 'is_active' => ['nullable', 'boolean'], 'required_attribute_ids' => ['nullable', 'array', 'max:50'], 'required_attribute_ids.*' => ['integer', Rule::exists('product_attributes', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))], 'default_costing_method' => ['nullable', 'in:fifo,weighted_average,moving_average,standard'], 'default_standard_cost' => ['nullable', 'numeric', 'min:0']]);
+        if (($data['default_costing_method'] ?? null) === 'standard' && (!array_key_exists('default_standard_cost', $data) || $data['default_standard_cost'] === null)) return back()->withErrors(['default_standard_cost' => 'Standard costing requires a default standard cost.'])->withInput();
         $requiredAttributeIds = $this->validatedRequiredAttributeIds($data['required_attribute_ids'] ?? []);
 
         Category::create([
-            'name' => $data['name'], 'code' => $data['code'] ?? 'CAT-'.strtoupper(bin2hex(random_bytes(4))), 'parent_id' => $data['parent_id'] ?? null, 'tax_rate' => $data['tax_rate'] ?? null, 'is_active' => $request->boolean('is_active', true), 'required_attribute_ids' => $requiredAttributeIds,
+            'name' => $data['name'], 'code' => $data['code'] ?? 'CAT-'.strtoupper(bin2hex(random_bytes(4))), 'parent_id' => $data['parent_id'] ?? null, 'tax_rate' => $data['tax_rate'] ?? null, 'is_active' => $request->boolean('is_active', true), 'required_attribute_ids' => $requiredAttributeIds, 'default_costing_method' => $data['default_costing_method'] ?? null, 'default_standard_cost' => $data['default_standard_cost'] ?? null,
             'company_id' => Auth::user()->company_id,
             'created_by' => Auth::user()->id,
             'created_at' => Carbon::now(), 
@@ -78,9 +79,10 @@ class CategoryController extends Controller
 
         $request->validate([
             'id' => ['required', 'integer', Rule::exists('categories', 'id')->where('company_id', $this->companyId())],
-            'name' => ['required', 'string', 'max:255'], 'code' => ['nullable', 'string', 'max:50', Rule::unique('categories', 'code')->ignore($request->id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'parent_id' => ['nullable', 'integer', Rule::exists('categories', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id')), 'not_in:'.$request->id], 'tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'], 'is_active' => ['nullable', 'boolean'], 'required_attribute_ids' => ['nullable', 'array', 'max:50'], 'required_attribute_ids.*' => ['integer', Rule::exists('product_attributes', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))],
+            'name' => ['required', 'string', 'max:255'], 'code' => ['nullable', 'string', 'max:50', Rule::unique('categories', 'code')->ignore($request->id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'parent_id' => ['nullable', 'integer', Rule::exists('categories', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id')), 'not_in:'.$request->id], 'tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'], 'is_active' => ['nullable', 'boolean'], 'required_attribute_ids' => ['nullable', 'array', 'max:50'], 'required_attribute_ids.*' => ['integer', Rule::exists('product_attributes', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'default_costing_method' => ['nullable', 'in:fifo,weighted_average,moving_average,standard'], 'default_standard_cost' => ['nullable', 'numeric', 'min:0'],
         ]);
         $requiredAttributeIds = $this->validatedRequiredAttributeIds($request->input('required_attribute_ids', []));
+        if ($request->default_costing_method === 'standard' && $request->default_standard_cost === null) return back()->withErrors(['default_standard_cost' => 'Standard costing requires a default standard cost.'])->withInput();
 
         $category_id = $request->id;
         if ($request->parent_id && $this->createsCategoryCycle($category_id, (int) $request->parent_id)) {
@@ -88,7 +90,7 @@ class CategoryController extends Controller
         }
 
         $this->companyCategory((int) $category_id)->update([
-            'name' => $request->name, 'code' => $request->code ?: 'CAT-'.strtoupper(bin2hex(random_bytes(4))), 'parent_id' => $request->parent_id, 'tax_rate' => $request->tax_rate, 'is_active' => $request->boolean('is_active', false), 'required_attribute_ids' => $requiredAttributeIds,
+            'name' => $request->name, 'code' => $request->code ?: 'CAT-'.strtoupper(bin2hex(random_bytes(4))), 'parent_id' => $request->parent_id, 'tax_rate' => $request->tax_rate, 'is_active' => $request->boolean('is_active', false), 'required_attribute_ids' => $requiredAttributeIds, 'default_costing_method' => $request->default_costing_method, 'default_standard_cost' => $request->default_standard_cost,
             'updated_by' => Auth::user()->id,
             'updated_at' => Carbon::now(), 
 

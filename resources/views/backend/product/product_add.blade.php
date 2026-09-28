@@ -57,10 +57,10 @@
       <div class="row mb-3">
         <label class="col-sm-2 col-form-label">Category Name </label>
         <div class="col-sm-10">
-            <select name="category_id" class="form-select" aria-label="Default select example">
+            <select name="category_id" id="product-category-select" class="form-select" aria-label="Default select example">
                 <option selected="">Open this select menu</option>
                 @foreach($category as $cat)
-                <option value="{{ $cat->id }}">{{ $cat->name }}</option>
+                <option value="{{ $cat->id }}" data-costing-method="{{ $cat->default_costing_method }}" data-standard-cost="{{ $cat->default_standard_cost }}">{{ $cat->name }}</option>
                @endforeach
                 </select>
         </div>
@@ -73,7 +73,7 @@
             <div class="row mb-3"><label class="col-sm-2 col-form-label">HSN/SAC</label><div class="col-sm-10"><input name="hsn_sac_code" class="form-control" maxlength="30"></div></div>
             <div class="row mb-3"><label class="col-sm-2 col-form-label">Purchase price</label><div class="col-sm-10"><input name="purchase_price" type="number" step="0.000001" min="0" class="form-control"></div></div>
             <div class="row mb-3"><label class="col-sm-2 col-form-label">Sales price</label><div class="col-sm-10"><input name="sales_price" type="number" step="0.000001" min="0" class="form-control"></div></div>
-            <div class="row mb-3"><label class="col-sm-2 col-form-label">Inventory costing</label><div class="col-sm-10 row g-2"><div class="col-md-6"><select name="costing_method" class="form-select"><option value="fifo" @selected(($defaultCostingMethod ?? 'fifo') === 'fifo')>FIFO</option><option value="weighted_average" @selected(($defaultCostingMethod ?? 'fifo') === 'weighted_average')>Weighted average</option><option value="moving_average" @selected(($defaultCostingMethod ?? 'fifo') === 'moving_average')>Moving average</option><option value="standard" @selected(($defaultCostingMethod ?? 'fifo') === 'standard')>Standard cost</option></select></div><div class="col-md-6"><input name="standard_cost" type="number" step="0.000001" min="0" value="{{ $defaultStandardCost ?? '' }}" placeholder="Standard cost (optional)" class="form-control"></div></div></div>
+            <div class="row mb-3"><label class="col-sm-2 col-form-label">Inventory costing</label><div class="col-sm-10 row g-2"><div class="col-md-6"><select name="costing_method" id="product-costing-method" class="form-select"><option value="fifo" @selected(($defaultCostingMethod ?? 'fifo') === 'fifo')>FIFO</option><option value="weighted_average" @selected(($defaultCostingMethod ?? 'fifo') === 'weighted_average')>Weighted average</option><option value="moving_average" @selected(($defaultCostingMethod ?? 'fifo') === 'moving_average')>Moving average</option><option value="standard" @selected(($defaultCostingMethod ?? 'fifo') === 'standard')>Standard cost</option></select></div><div class="col-md-6"><input name="standard_cost" id="product-standard-cost" type="number" step="0.000001" min="0" value="{{ $defaultStandardCost ?? '' }}" placeholder="Standard cost (optional)" class="form-control"></div></div></div>
             <div class="row mb-3"><label class="col-sm-2 col-form-label">Physical dimensions</label><div class="col-sm-10 row g-2"><div class="col-md-3"><input name="weight_kg" type="number" step="0.000001" min="0" placeholder="Weight (kg)" class="form-control"></div><div class="col-md-3"><input name="length_m" type="number" step="0.000001" min="0" placeholder="Length (m)" class="form-control"></div><div class="col-md-3"><input name="width_m" type="number" step="0.000001" min="0" placeholder="Width (m)" class="form-control"></div><div class="col-md-3"><input name="height_m" type="number" step="0.000001" min="0" placeholder="Height (m)" class="form-control"></div></div></div>
             <div class="row mb-3"><label class="col-sm-2 col-form-label">Tax rate (%)</label><div class="col-sm-10"><input name="tax_rate" type="number" step="0.0001" min="0" max="100" value="" placeholder="Use category default" class="form-control"></div></div>
             <div class="row mb-3"><label class="col-sm-2 col-form-label">Configured tax rate</label><div class="col-sm-10"><select name="tax_rate_id" class="form-select"><option value="">Use numeric/category rate</option>@foreach($taxRates as $taxRate)<option value="{{ $taxRate->id }}">{{ $taxRate->code }} — {{ $taxRate->name }} ({{ $taxRate->rate }}%)</option>@endforeach</select></div></div>
@@ -98,6 +98,17 @@
 
 <script type="text/javascript">
     $(document).ready(function (){
+        let costingTouched = false;
+        let standardCostTouched = false;
+        $('#product-costing-method').on('change', function () { costingTouched = true; });
+        $('#product-standard-cost').on('input', function () { standardCostTouched = true; });
+        $('#product-category-select').on('change', function () {
+            const option = $(this).find('option:selected');
+            const method = option.data('costing-method');
+            const standardCost = option.attr('data-standard-cost');
+            if (!costingTouched && method) $('#product-costing-method').val(method);
+            if (!standardCostTouched && method === 'standard' && standardCost !== undefined && standardCost !== '') $('#product-standard-cost').val(standardCost);
+        });
         $('#myForm').validate({
             rules: {
                 name: {

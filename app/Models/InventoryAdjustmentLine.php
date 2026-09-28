@@ -20,4 +20,6 @@ class InventoryAdjustmentLine extends Model
     public function adjustment() { return $this->belongsTo(InventoryAdjustment::class, 'adjustment_id'); }
     public function product() { return $this->belongsTo(Product::class); }
     public function location() { return $this->belongsTo(InventoryLocation::class, 'location_id'); }
+    public function department() { return $this->belongsTo(Department::class); }
+    public function costCenter() { return $this->belongsTo(CostCenter::class); }
 }

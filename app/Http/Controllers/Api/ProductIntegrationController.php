@@ -286,8 +286,11 @@ class ProductIntegrationController extends Controller
         }
         $product = DB::transaction(function () use ($data, $companyId): Product {
             $attributes = $this->productAttributes($data);
-            $attributes['costing_method'] ??= app(\App\Services\ErpSettingService::class)->get('default_inventory_costing_method', 'fifo', $companyId);
-            if (!array_key_exists('standard_cost', $attributes)) $attributes['standard_cost'] = app(\App\Services\ErpSettingService::class)->get('default_standard_cost', null, $companyId);
+            $category = Category::withoutGlobalScopes()->whereKey($data['category_id'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->firstOrFail();
+            $attributes['costing_method'] ??= $category->default_costing_method ?: app(\App\Services\ErpSettingService::class)->get('default_inventory_costing_method', 'fifo', $companyId);
+            if (!array_key_exists('standard_cost', $attributes)) $attributes['standard_cost'] = $attributes['costing_method'] === 'standard'
+                ? ($category->default_standard_cost !== null ? (float) $category->default_standard_cost : app(\App\Services\ErpSettingService::class)->get('default_standard_cost', null, $companyId))
+                : null;
             $product = Product::create($attributes + ['company_id' => $companyId, 'quantity' => 0, 'created_by' => auth()->id()]);
             app(AuditService::class)->record('product.created', $product, null, $product->toArray());
             return $product;
@@ -313,11 +316,11 @@ class ProductIntegrationController extends Controller
         DB::transaction(function () use ($product, $data, $attributes, $before, $effectiveAt, $scheduleCosting): void {
             if ($attributes) $product->update($attributes + ['updated_by' => auth()->id()]);
             if ($scheduleCosting) {
-                app(\App\Services\ProductCostingPolicyService::class)->schedule($product, $data['costing_method'], isset($data['standard_cost']) ? (float) $data['standard_cost'] : null, $effectiveAt, auth()->id(), 'Scheduled through inventory integration.');
+                app(\App\Services\ProductCostingPolicyService::class)->schedule($product, $data['costing_method'], isset($data['standard_cost']) ? (float) $data['standard_cost'] : null, $effectiveAt, auth()->id(), 'Scheduled through inventory integration.', 'integration.product.update', $product->id, $data['external_reference'] ?? null);
                 app(AuditService::class)->record('product.costing.scheduled', $product, null, ['costing_method' => $data['costing_method'], 'standard_cost' => $data['standard_cost'] ?? null, 'effective_at' => $effectiveAt->toISOString(), 'api' => true]);
                 return;
             }
-            if (array_key_exists('costing_method', $attributes) || array_key_exists('standard_cost', $attributes)) app(\App\Services\ProductCostingPolicyService::class)->recordCurrent($product, $product->costing_method, $product->standard_cost !== null ? (float) $product->standard_cost : null, auth()->id(), 'Updated through inventory integration.');
+            if (array_key_exists('costing_method', $attributes) || array_key_exists('standard_cost', $attributes)) app(\App\Services\ProductCostingPolicyService::class)->recordCurrent($product, $product->costing_method, $product->standard_cost !== null ? (float) $product->standard_cost : null, auth()->id(), 'Updated through inventory integration.', 'integration.product.update', $product->id, $data['external_reference'] ?? null);
             app(AuditService::class)->record('product.updated', $product, $before, $product->fresh()->only(array_keys($attributes)));
         });
         return response()->json(['data' => $product->fresh()->load('category', 'unit', 'brand', 'supplier', 'taxRate'), 'status' => $scheduleCosting ? 'costing_scheduled' : 'updated']);
@@ -331,6 +334,12 @@ class ProductIntegrationController extends Controller
             'current' => app(\App\Services\ProductCostingPolicyService::class)->resolve($product),
             'product_id' => $product->id,
         ]);
+    }
+
+    public function costHistory(Request $request, int $id): JsonResponse
+    {
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        return response()->json(['data' => $product->costHistories()->with('changedBy:id,name')->orderBy('effective_at')->orderBy('id')->get(), 'product_id' => $product->id]);
     }
 
     public function deactivate(Request $request, int $id): JsonResponse

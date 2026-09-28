@@ -2,11 +2,17 @@
 
 namespace Tests\Feature;
 
+use App\Models\AccountMapping;
 use App\Models\Category;
+use App\Models\ChartOfAccount;
 use App\Models\Company;
 use App\Models\CostCenter;
+use App\Models\FiscalYear;
+use App\Models\FiscalPeriod;
 use App\Models\Department;
 use App\Models\InventoryMovement;
+use App\Models\InventoryMovementAllocation;
+use App\Models\InventoryCostConsumption;
 use App\Models\InventoryCostLayer;
 use App\Models\Product;
 use App\Models\Supplier;
@@ -92,13 +98,86 @@ class InventoryRevaluationPreviewTest extends TestCase
         $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Dimension item', 'sku' => 'VAL-DIM-ITEM', 'status' => 1]);
         $movement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 4, 'unit_cost' => 12, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'posted_at' => now()->subDay()]);
         $layer = InventoryCostLayer::create(['product_id' => $product->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'original_quantity' => 4, 'remaining_quantity' => 4, 'unit_cost' => 12, 'received_at' => now()->subDay(), 'source_type' => $movement->getMorphClass(), 'source_id' => $movement->id]);
+        $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY VAL DIM', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
+        $period = FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => '2026-09', 'starts_on' => '2026-09-01', 'ends_on' => '2026-09-30', 'status' => 'open']);
 
         Sanctum::actingAs($user, ['inventory:read']);
         $response = $this->getJson('/api/inventory/valuation?department_id='.$department->id.'&cost_center_id='.$costCenter->id);
         $response->assertOk()->assertJsonPath('data.0.id', $product->id);
         $this->assertSame(48.0, (float) $response->json('data.0.ledger_value'));
         $this->assertSame(4.0, (float) $response->json('data.0.valuation_quantity'));
+        $this->getJson('/api/inventory/valuation?fiscal_period_id='.$period->id.'&department_id='.$department->id.'&cost_center_id='.$costCenter->id)
+            ->assertOk()->assertJsonPath('data.0.id', $product->id);
+        $this->getJson('/api/inventory/valuation?fiscal_period_id='.$period->id.'&as_of=2026-09-30')->assertStatus(422);
         $this->getJson('/api/inventory/valuation?department_id=999999')->assertStatus(422);
         $this->assertDatabaseHas('inventory_cost_layers', ['id' => $layer->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id]);
+    }
+
+    public function test_revaluation_reconciliation_matches_linked_posted_journal(): void
+    {
+        $company = Company::create(['name' => 'Revaluation Reconciliation Co', 'code' => 'REVAL-RECON']);
+        $requester = User::factory()->create(['company_id' => $company->id]);
+        $checker = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Reconciliation Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Reconciliation Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Reconciliation Category', 'status' => 1]);
+        $department = Department::create(['company_id' => $company->id, 'code' => 'DEPT-REVAL-RECON', 'name' => 'Revaluation Operations']);
+        $costCenter = CostCenter::create(['company_id' => $company->id, 'code' => 'CC-REVAL-RECON', 'name' => 'Revaluation Cost Center', 'is_active' => true]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Reconciliation item', 'sku' => 'REVAL-RECON-ITEM', 'status' => 1, 'costing_method' => 'standard', 'standard_cost' => 10, 'quantity' => 3]);
+        $layer = InventoryCostLayer::create(['product_id' => $product->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'original_quantity' => 3, 'remaining_quantity' => 3, 'unit_cost' => 7, 'received_at' => now()]);
+        $inventory = ChartOfAccount::create(['company_id' => $company->id, 'code' => 'REVAL-1300', 'name' => 'Inventory', 'account_type' => 'asset', 'is_active' => true]);
+        $gain = ChartOfAccount::create(['company_id' => $company->id, 'code' => 'REVAL-4900', 'name' => 'Revaluation gain', 'account_type' => 'income', 'is_active' => true]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'inventory', 'account_id' => $inventory->id]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'inventory_revaluation_gain', 'account_id' => $gain->id]);
+
+        Sanctum::actingAs($requester, ['inventory:write']);
+        $runId = $this->postJson('/api/inventory/valuation/revaluations', ['external_reference' => 'REVAL-RECON-1'])->assertCreated()->json('data.id');
+        Sanctum::actingAs($checker, ['inventory:write']);
+        $approved = $this->postJson('/api/inventory/valuation/revaluations/'.$runId.'/approve')->assertOk()->assertJsonPath('data.accounting_status', 'posted');
+        $journalId = $approved->json('data.journal_entry_id');
+        $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $journalId, 'account_id' => $inventory->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'debit' => 9]);
+        $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $journalId, 'account_id' => $gain->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'credit' => 9]);
+
+        Sanctum::actingAs($checker, ['inventory:read']);
+        $this->getJson('/api/inventory/valuation/revaluation-reconciliation?from='.now()->toDateString().'&to='.now()->toDateString())
+            ->assertOk()
+            ->assertJsonPath('meta.read_only', true)
+            ->assertJsonPath('summary.revaluations', 1)
+            ->assertJsonPath('summary.expected_value', 9)
+            ->assertJsonPath('summary.posted_value', 9)
+            ->assertJsonPath('data.0.reconciliation_status', 'reconciled')
+            ->assertJsonPath('data.0.revaluation_id', $runId);
+        $this->assertDatabaseHas('inventory_cost_layers', ['id' => $layer->id, 'unit_cost' => 10]);
+    }
+
+    public function test_accounting_period_valuation_reconciles_opening_movements_and_closing_layers(): void
+    {
+        $company = Company::create(['name' => 'Period Valuation Co', 'code' => 'PERIOD-VAL-TEST']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Period Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Period Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Period Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Period item', 'sku' => 'PERIOD-ITEM', 'status' => 1]);
+        $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY PERIOD', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
+        $period = FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => '2026-09', 'starts_on' => '2026-09-01', 'ends_on' => '2026-09-30', 'status' => 'open']);
+        $openingMovement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 10, 'unit_cost' => 5, 'posted_at' => '2026-08-31 10:00:00']);
+        $openingLayer = InventoryCostLayer::create(['product_id' => $product->id, 'original_quantity' => 10, 'remaining_quantity' => 8, 'unit_cost' => 5, 'source_type' => $openingMovement->getMorphClass(), 'source_id' => $openingMovement->id, 'received_at' => '2026-08-31 10:00:00']);
+        $receiptMovement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 4, 'unit_cost' => 8, 'posted_at' => '2026-09-05 10:00:00']);
+        InventoryCostLayer::create(['product_id' => $product->id, 'original_quantity' => 4, 'remaining_quantity' => 4, 'unit_cost' => 8, 'source_type' => $receiptMovement->getMorphClass(), 'source_id' => $receiptMovement->id, 'received_at' => '2026-09-05 10:00:00']);
+        $issueMovement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 2, 'unit_cost' => 5, 'posted_at' => '2026-09-10 10:00:00']);
+        InventoryCostConsumption::create(['cost_layer_id' => $openingLayer->id, 'product_id' => $product->id, 'movement_id' => $issueMovement->id, 'quantity' => 2, 'unit_cost' => 5, 'total_cost' => 10, 'costing_method' => 'fifo']);
+        InventoryMovementAllocation::create(['movement_id' => $issueMovement->id, 'product_id' => $product->id, 'quantity' => 2, 'unit_cost' => 5]);
+
+        Sanctum::actingAs($user, ['inventory:read']);
+        $response = $this->getJson('/api/inventory/valuation/accounting-period?fiscal_period_id='.$period->id);
+
+        $response->assertOk()
+            ->assertJsonPath('period.id', $period->id)
+            ->assertJsonPath('summary.opening_value', 50)
+            ->assertJsonPath('summary.inbound_value', 32)
+            ->assertJsonPath('summary.outbound_value', 10)
+            ->assertJsonPath('summary.closing_value', 72)
+            ->assertJsonPath('summary.unexplained_variance', 0)
+            ->assertJsonPath('data.0.closing_source', 'cost_layers');
     }
 }

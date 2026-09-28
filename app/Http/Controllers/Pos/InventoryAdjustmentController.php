@@ -10,6 +10,8 @@ use App\Models\Product;
 use App\Models\InventoryBatch;
 use App\Models\InventorySerial;
 use App\Models\InventoryLocation;
+use App\Models\Department;
+use App\Models\CostCenter;
 use App\Services\AuditService;
 use App\Services\InventoryLedgerService;
 use App\Services\NumberingSequenceService;
@@ -39,7 +41,9 @@ class InventoryAdjustmentController extends Controller
         $products = Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('name')->get();
         $opening = false;
         $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
-        return view('backend.stock.adjustment_add', compact('products', 'locations', 'opening'));
+        $departments = Department::where('is_active', true)->where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
+        $costCenters = CostCenter::where('is_active', true)->where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
+        return view('backend.stock.adjustment_add', compact('products', 'locations', 'departments', 'costCenters', 'opening'));
     }
 
     public function openingCreate()
@@ -47,7 +51,9 @@ class InventoryAdjustmentController extends Controller
         $products = Product::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('name')->get();
         $opening = true;
         $locations = InventoryLocation::where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
-        return view('backend.stock.adjustment_add', compact('products', 'locations', 'opening'));
+        $departments = Department::where('is_active', true)->where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
+        $costCenters = CostCenter::where('is_active', true)->where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->orderBy('code')->get();
+        return view('backend.stock.adjustment_add', compact('products', 'locations', 'departments', 'costCenters', 'opening'));
     }
 
     public function openingStore(InventoryAdjustmentRequest $request)
@@ -81,6 +87,8 @@ class InventoryAdjustmentController extends Controller
                     'adjustment_id' => $adjustment->id,
                     'product_id' => $productId,
                     'location_id' => $request->location_id[$index] ?? null,
+                    'department_id' => $request->department_id[$index] ?? null,
+                    'cost_center_id' => $request->cost_center_id[$index] ?? null,
                     'direction' => $request->direction[$index],
                     'quantity' => $request->quantity[$index],
                     'unit_cost' => $request->unit_cost[$index] ?? null,
@@ -150,8 +158,8 @@ class InventoryAdjustmentController extends Controller
                     $movementType = $adjustment->reason_code === 'opening_stock'
                         ? 'opening'
                         : ($line->direction === 'in' ? 'adjustment_in' : 'adjustment_out');
-                    if ($serials) foreach ($serials as $serial) app(InventoryLedgerService::class)->post($product->id, $movementType, 1, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id, $serial->id);
-                    else app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id);
+                        if ($serials) foreach ($serials as $serial) app(InventoryLedgerService::class)->post($product->id, $movementType, 1, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id, $serial->id, $line->department_id, $line->cost_center_id);
+                        else app(InventoryLedgerService::class)->post($product->id, $movementType, $quantity, $line->unit_cost ? (float) $line->unit_cost : null, $line->location_id, $adjustment, $adjustment->reason_code, null, $batch?->id, null, $line->department_id, $line->cost_center_id);
                 }
 
                 $adjustment->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);

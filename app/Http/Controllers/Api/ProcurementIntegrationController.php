@@ -263,7 +263,7 @@ class ProcurementIntegrationController extends Controller
                 'tax_mode' => $taxMode, 'tax_exempt' => $taxExempt, 'tax_exemption_number' => $taxExempt ? $supplier->tax_exemption_number : null, 'tax_jurisdiction' => $supplier->tax_jurisdiction,
                 'description' => $data['description'] ?? null, 'created_by' => $request->user()?->id,
             ]);
-            $subtotal = 0; $tax = 0;
+            $subtotal = 0; $tax = 0; $auditLines = [];
             foreach ($data['lines'] as $input) {
                 $poLine = $order->lines->firstWhere('id', $input['purchase_order_line_id']);
                 if (!$poLine) throw new \RuntimeException('Each invoice line must belong to the purchase order.');
@@ -278,9 +278,10 @@ class ProcurementIntegrationController extends Controller
                 $taxResult = $taxMode === 'inclusive' ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $rate) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $rate)];
                 $lineTax = (float) $taxResult['tax']; $subtotal += (float) $taxResult['net']; $tax += $lineTax;
                 PurchaseInvoiceLine::create(['purchase_invoice_id' => $invoice->id, 'purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)]);
+                $auditLines[] = ['purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)];
             }
             $invoice->update(['subtotal_amount' => $subtotal, 'tax_amount' => $tax, 'total_amount' => $subtotal + $tax]);
-            app(AuditService::class)->record('purchase_invoice.created', $invoice, null, $invoice->toArray());
+            app(AuditService::class)->record('purchase_invoice.created', $invoice, null, array_merge($invoice->toArray(), ['lines' => $auditLines]));
             return $invoice;
         });
         return response()->json(['data' => $invoice->load('supplier', 'purchaseOrder', 'lines.product'), 'status' => 'pending_approval'], 201);
@@ -429,7 +430,8 @@ class ProcurementIntegrationController extends Controller
                 if ($uomId) $unitPrice /= max($stockQuantity / $enteredQuantity, 0.000001);
                 PurchaseOrderLine::create(['purchase_order_id' => $order->id, 'product_id' => $product->id, 'location_id' => $line['location_id'] ?? null, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'ordered_qty' => $stockQuantity, 'unit_price' => $unitPrice]);
             }
-            app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray());
+            $lineSnapshots = $order->fresh('lines')->lines->map(fn (PurchaseOrderLine $line): array => $line->only(['product_id', 'location_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price']))->values()->all();
+            app(AuditService::class)->record('purchase_order.created', $order, null, $order->toArray() + ['lines' => $lineSnapshots]);
             return $order;
         });
         return response()->json(['data' => $order->load('supplier', 'priceList', 'lines.product'), 'status' => 'pending_approval'], 201);

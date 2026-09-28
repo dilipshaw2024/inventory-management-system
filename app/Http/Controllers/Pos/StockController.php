@@ -13,6 +13,9 @@ use App\Models\InventoryMovement;
 use App\Models\InventoryCostLayer;
 use App\Models\InventoryLocation;
 use App\Models\InventoryBatch;
+use App\Models\Department;
+use App\Models\CostCenter;
+use App\Models\FiscalPeriod;
 use Auth;
 use Illuminate\Support\Carbon;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -154,7 +157,12 @@ class StockController extends Controller
 
     public function ValuationReport(Request $request)
     {
-        $validated = $request->validate(['product_id' => ['nullable', 'integer', 'exists:products,id'], 'category_id' => ['nullable', 'integer', 'exists:categories,id'], 'location_id' => ['nullable', 'integer', 'exists:inventory_locations,id'], 'batch_id' => ['nullable', 'integer', 'exists:inventory_batches,id'], 'as_of' => ['nullable', 'date']]);
+        $companyId = auth()->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $validated = $request->validate(['product_id' => ['nullable', 'integer', $owned('products')], 'category_id' => ['nullable', 'integer', $owned('categories')], 'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)], 'batch_id' => ['nullable', 'integer', Rule::exists('inventory_batches', 'id')], 'department_id' => ['nullable', 'integer', $owned('departments')], 'cost_center_id' => ['nullable', 'integer', $owned('cost_centers')], 'fiscal_period_id' => ['nullable', 'integer', Rule::exists('fiscal_periods', 'id')->where(fn ($query) => $query->where('company_id', $companyId))], 'as_of' => ['nullable', 'date']]);
+        if (!empty($validated['fiscal_period_id']) && !empty($validated['as_of'])) abort(422, 'Use either fiscal_period_id or as_of, not both.');
+        $period = !empty($validated['fiscal_period_id']) ? FiscalPeriod::where('company_id', $companyId)->findOrFail($validated['fiscal_period_id']) : null;
+        if ($period) $validated['as_of'] = $period->ends_on->toDateString();
         $valuation = Product::with(['unit', 'category'])
             ->select('products.*')
             ->when($validated['product_id'] ?? null, fn ($query, $id) => $query->whereKey($id))
@@ -169,22 +177,50 @@ class StockController extends Controller
                     ->whereColumn('layers.product_id', 'products.id')
                     ->when(!($validated['as_of'] ?? null), fn ($layerQuery) => $layerQuery->where('layers.remaining_quantity', '>', 0))
                     ->when($validated['location_id'] ?? null, fn ($layerQuery, $locationId) => $layerQuery->where('layers.location_id', $locationId))
-                    ->when($validated['batch_id'] ?? null, fn ($layerQuery, $batchId) => $layerQuery->where('layers.batch_id', $batchId));
+                    ->when($validated['batch_id'] ?? null, fn ($layerQuery, $batchId) => $layerQuery->where('layers.batch_id', $batchId))
+                    ->when($validated['department_id'] ?? null, fn ($layerQuery, $departmentId) => $layerQuery->where('layers.department_id', $departmentId))
+                    ->when($validated['cost_center_id'] ?? null, fn ($layerQuery, $costCenterId) => $layerQuery->where('layers.cost_center_id', $costCenterId));
             }, 'ledger_value')
-            ->when(($validated['location_id'] ?? null) || ($validated['batch_id'] ?? null) || ($validated['as_of'] ?? null), function ($query) use ($validated) {
+            ->when(($validated['location_id'] ?? null) || ($validated['batch_id'] ?? null) || ($validated['department_id'] ?? null) || ($validated['cost_center_id'] ?? null) || ($validated['as_of'] ?? null), function ($query) use ($validated) {
                 $query->selectSub(function ($movementQuery) use ($validated) {
                     $companyId = auth()->user()?->company_id;
-                    $movementQuery->from('inventory_movements')->selectRaw("COALESCE(SUM(CASE WHEN movement_type IN ('opening','receipt','transfer_in','adjustment_in','return_in','quarantine_out','release') THEN quantity WHEN movement_type IN ('issue','transfer_out','adjustment_out','return_out','scrap','quarantine_in') THEN -quantity ELSE 0 END), 0)")->whereColumn('product_id', 'products.id')->where(fn ($scope) => $scope->where('inventory_movements.company_id', $companyId)->orWhereNull('inventory_movements.company_id'))->when($validated['location_id'] ?? null, fn ($movementQuery, $locationId) => $movementQuery->where('location_id', $locationId))->when($validated['batch_id'] ?? null, fn ($movementQuery, $batchId) => $movementQuery->where('batch_id', $batchId))->when($validated['as_of'] ?? null, fn ($movementQuery, $date) => $movementQuery->whereDate('posted_at', '<=', $date));
+                    $movementQuery->from('inventory_movements')->selectRaw("COALESCE(SUM(CASE WHEN movement_type IN ('opening','receipt','transfer_in','adjustment_in','return_in','quarantine_out','release') THEN quantity WHEN movement_type IN ('issue','transfer_out','adjustment_out','return_out','scrap','quarantine_in') THEN -quantity ELSE 0 END), 0)")->whereColumn('product_id', 'products.id')->where(fn ($scope) => $scope->where('inventory_movements.company_id', $companyId)->orWhereNull('inventory_movements.company_id'))->when($validated['location_id'] ?? null, fn ($movementQuery, $locationId) => $movementQuery->where('location_id', $locationId))->when($validated['batch_id'] ?? null, fn ($movementQuery, $batchId) => $movementQuery->where('batch_id', $batchId))->when($validated['department_id'] ?? null, fn ($movementQuery, $departmentId) => $movementQuery->where('department_id', $departmentId))->when($validated['cost_center_id'] ?? null, fn ($movementQuery, $costCenterId) => $movementQuery->where('cost_center_id', $costCenterId))->when($validated['as_of'] ?? null, fn ($movementQuery, $date) => $movementQuery->whereDate('posted_at', '<=', $date));
                 }, 'filtered_quantity');
             })
-            ->orderBy('name')->paginate(50)->withQueryString();
+            ->orderBy('name');
+
+        if ($request->input('format') === 'csv') {
+            $rows = $valuation->get();
+            return response()->streamDownload(function () use ($rows): void {
+                $handle = fopen('php://output', 'w');
+                fputcsv($handle, ['Product', 'SKU', 'Category', 'Quantity balance', 'Cost-layer value']);
+                foreach ($rows as $product) {
+                    fputcsv($handle, [$product->name, $product->sku, $product->category?->name, $product->filtered_quantity ?? $product->quantity, $product->ledger_value]);
+                }
+                fclose($handle);
+            }, 'inventory-valuation-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
+        }
+
+        if ($request->input('format') === 'pdf') {
+            $valuation = $valuation->get();
+            return view('backend.pdf.valuation_report_pdf', compact('valuation'));
+        }
+
+        $valuation = $valuation->paginate(50)->withQueryString();
+
+        $periodDrilldown = $period
+            ? app(\App\Services\InventoryPeriodValuationService::class)->drilldown($period, $validated)
+            : null;
 
         $products = Product::orderBy('name')->get(['id', 'name']);
         $categories = \App\Models\Category::orderBy('name')->get(['id', 'name']);
         $locations = \App\Models\InventoryLocation::where('is_active', true)->orderBy('code')->get(['id', 'code', 'name']);
         $batches = \App\Models\InventoryBatch::with('product')->orderBy('batch_no')->get(['id', 'product_id', 'batch_no', 'lot_no']);
+        $departments = Department::orderBy('name')->get(['id', 'code', 'name']);
+        $costCenters = CostCenter::where('is_active', true)->orderBy('code')->get(['id', 'code', 'name']);
+        $fiscalPeriods = FiscalPeriod::where('company_id', $companyId)->orderByDesc('ends_on')->get(['id', 'name', 'starts_on', 'ends_on', 'status']);
 
-        return view('backend.stock.valuation_report', compact('valuation', 'products', 'categories', 'locations', 'batches'));
+        return view('backend.stock.valuation_report', compact('valuation', 'products', 'categories', 'locations', 'batches', 'departments', 'costCenters', 'fiscalPeriods', 'periodDrilldown'));
     }
 
     public function LocationStockReport(Request $request)

@@ -14,8 +14,11 @@ return new class extends Migration
             $table->foreignId('delegator_id')->constrained('users')->cascadeOnDelete();
             $table->foreignId('delegate_id')->constrained('users')->cascadeOnDelete();
             $table->json('document_types')->nullable();
-            $table->timestamp('starts_at');
-            $table->timestamp('ends_at');
+            // DATETIME keeps the required window explicit and remains compatible
+            // with MySQL 5.7, where a non-null TIMESTAMP without a default can
+            // be rejected by the legacy implicit-default rules.
+            $table->dateTime('starts_at');
+            $table->dateTime('ends_at');
             $table->string('reason', 500)->nullable();
             $table->boolean('is_active')->default(true);
             $table->timestamps();

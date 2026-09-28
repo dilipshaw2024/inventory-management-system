@@ -79,6 +79,53 @@ class PurchaseRfqIntegrationController extends Controller
         return response()->json(['data' => $rfq, 'status' => 'submitted'], 201);
     }
 
+    public function comparison(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $rfq = $this->companyScope(PurchaseRfq::with(['lines.product', 'suppliers.supplier', 'suppliers.quotations']), $companyId)->findOrFail($id);
+        $rows = $rfq->suppliers->map(function (PurchaseRfqSupplier $response) use ($rfq): array {
+            $quotes = $response->quotations->keyBy('purchase_rfq_line_id');
+            $lines = $rfq->lines->map(function (PurchaseRfqLine $line) use ($quotes): array {
+                $quote = $quotes->get($line->id);
+                return [
+                    'purchase_rfq_line_id' => $line->id,
+                    'product_id' => $line->product_id,
+                    'product_name' => $line->product?->name,
+                    'requested_qty' => (float) $line->requested_qty,
+                    'quoted' => (bool) $quote,
+                    'unit_price' => $quote ? (float) $quote->unit_price : null,
+                    'extended_amount' => $quote ? round((float) $line->requested_qty * (float) $quote->unit_price, 6) : null,
+                    'lead_days' => $quote?->lead_days,
+                    'valid_until' => $quote?->valid_until,
+                    'supplier_reference' => $quote?->supplier_reference,
+                    'notes' => $quote?->notes,
+                ];
+            })->values();
+            return [
+                'rfq_supplier_id' => $response->id,
+                'supplier_id' => $response->supplier_id,
+                'supplier_name' => $response->supplier?->name,
+                'status' => $response->status,
+                'complete' => $lines->every(fn (array $line): bool => $line['quoted']),
+                'quoted_line_count' => $lines->where('quoted', true)->count(),
+                'line_count' => $lines->count(),
+                'total_amount' => $lines->every(fn (array $line): bool => $line['quoted']) ? round((float) $lines->sum('extended_amount'), 6) : null,
+                'max_lead_days' => $lines->every(fn (array $line): bool => $line['quoted']) ? (int) ($lines->max('lead_days') ?: 0) : null,
+                'lines' => $lines,
+            ];
+        })->values();
+        $completeTotals = $rows->where('complete', true)->pluck('total_amount')->filter(fn ($value): bool => $value !== null)->sort()->values();
+        $ranked = $rows->map(function (array $row) use ($completeTotals): array {
+            $row['rank'] = $row['complete'] && $row['total_amount'] !== null ? $completeTotals->search($row['total_amount']) + 1 : null;
+            return $row;
+        });
+        return response()->json(['data' => [
+            'rfq_id' => $rfq->id, 'rfq_no' => $rfq->rfq_no, 'status' => $rfq->status,
+            'currency_code' => $rfq->currency_code ?? $request->user()?->company?->base_currency,
+            'suppliers' => $ranked,
+        ]]);
+    }
+
     public function quote(Request $request, int $id): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -95,6 +142,8 @@ class PurchaseRfqIntegrationController extends Controller
             DB::transaction(function () use ($data, $rfq, $response, $request): void {
                 $lineIds = collect($data['lines'])->pluck('purchase_rfq_line_id');
                 if ($lineIds->duplicates()->isNotEmpty()) throw new \RuntimeException('A quotation line may appear only once.');
+                $beforeStatus = (string) $response->status;
+                $beforeLines = $response->quotations()->get()->map(fn (PurchaseSupplierQuotation $quote): array => $quote->only(['purchase_rfq_line_id', 'unit_price', 'lead_days', 'valid_until', 'supplier_reference', 'notes']))->values()->all();
                 foreach ($data['lines'] as $lineData) {
                     $line = $rfq->lines->firstWhere('id', (int) $lineData['purchase_rfq_line_id']);
                     if (!$line) throw new \RuntimeException('A quotation line does not belong to the selected RFQ.');
@@ -104,7 +153,8 @@ class PurchaseRfqIntegrationController extends Controller
                     );
                 }
                 $response->update(['status' => 'quoted', 'quoted_at' => now()]);
-                app(AuditService::class)->record('purchase_rfq.quoted', $rfq, null, ['supplier_id' => $response->supplier_id, 'api' => true, 'actor_id' => $request->user()?->id]);
+                $afterLines = $response->fresh('quotations')->quotations->map(fn (PurchaseSupplierQuotation $quote): array => $quote->only(['purchase_rfq_line_id', 'unit_price', 'lead_days', 'valid_until', 'supplier_reference', 'notes']))->values()->all();
+                app(AuditService::class)->record('purchase_rfq.quoted', $rfq, ['status' => $beforeStatus, 'lines' => $beforeLines], ['supplier_id' => $response->supplier_id, 'status' => 'quoted', 'lines' => $afterLines, 'api' => true, 'actor_id' => $request->user()?->id]);
             });
             return response()->json(['data' => $response->fresh('quotations'), 'status' => 'quoted']);
         } catch (\RuntimeException $exception) {

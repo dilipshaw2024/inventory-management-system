@@ -27,6 +27,7 @@ use App\Models\Invoice;
 use App\Models\InvoiceDetail;
 use App\Models\ServiceContract;
 use App\Models\InventorySerial;
+use App\Models\ServiceAssetSerialHandoff;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -191,6 +192,83 @@ class ServiceIntegrationController extends Controller
         return response()->json(['data' => $asset->ownershipTransfers()->with(['previousCustomer', 'newCustomer', 'creator'])->get(), 'asset_id' => $asset->id]);
     }
 
+    public function serialHandoffs(Request $request, int $id): JsonResponse
+    {
+        $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
+        $data = $request->validate([
+            'action' => ['nullable', 'in:installed,removed'],
+            'updated_since' => ['nullable', 'date'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $handoffs = ServiceAssetSerialHandoff::with(['asset', 'serial.product', 'creator'])
+            ->where('company_id', auth()->user()?->company_id)
+            ->where('service_asset_id', $asset->id)
+            ->when($data['action'] ?? null, fn ($query, $action) => $query->where('action', $action))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($handoffs, $request, 'service.asset-serial-handoffs', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeSerialHandoff(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
+        $data = $request->validate([
+            'action' => ['required', 'in:installed,removed'],
+            'inventory_serial_id' => ['required', 'integer'],
+            'effective_at' => ['required', 'date'],
+            'location' => ['nullable', 'string', 'max:500'],
+            'notes' => ['nullable', 'string', 'max:2000'],
+            'external_reference' => ['nullable', 'string', 'max:150'],
+        ]);
+        if (!empty($data['external_reference'])) {
+            $existing = $this->companyScope(ServiceAssetSerialHandoff::query())
+                ->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing->load(['asset', 'serial.product', 'creator']), 'status' => 'duplicate_ignored']);
+        }
+
+        try {
+            $handoff = DB::transaction(function () use ($asset, $data, $companyId, $request): ServiceAssetSerialHandoff {
+                $lockedAsset = $this->companyScope(ServiceAsset::query())->lockForUpdate()->findOrFail($asset->id);
+                $serial = InventorySerial::with('product')->whereKey($data['inventory_serial_id'])
+                    ->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+                    ->lockForUpdate()->firstOrFail();
+                if ($lockedAsset->product_id && (int) $lockedAsset->product_id !== (int) $serial->product_id) {
+                    throw new \RuntimeException('The inventory serial product does not match the service asset product.');
+                }
+
+                if ($data['action'] === 'installed') {
+                    if ($lockedAsset->status === 'retired') throw new \RuntimeException('A retired service asset cannot receive a serial handoff.');
+                    if ($lockedAsset->inventory_serial_id && (int) $lockedAsset->inventory_serial_id !== (int) $serial->id) {
+                        throw new \RuntimeException('Remove the current serial from this service asset before installing another one.');
+                    }
+                    $alreadyInstalled = ServiceAsset::where('company_id', $companyId)
+                        ->where('inventory_serial_id', $serial->id)->where('id', '!=', $lockedAsset->id)->where('status', '!=', 'retired')->exists();
+                    if ($alreadyInstalled) throw new \RuntimeException('This inventory serial is already installed on another active service asset.');
+                    if (!in_array($serial->status, ['available', 'returned', 'issued'], true)) throw new \RuntimeException('This inventory serial is not eligible for service installation.');
+                    if (in_array($serial->status, ['available', 'returned'], true)) $serial->update(['status' => 'issued']);
+                    $lockedAsset->update(['inventory_serial_id' => $serial->id, 'product_id' => $lockedAsset->product_id ?: $serial->product_id, 'serial_no' => $serial->serial_no]);
+                } else {
+                    if ((int) ($lockedAsset->inventory_serial_id ?? 0) !== (int) $serial->id) throw new \RuntimeException('The serial is not currently installed on this service asset.');
+                    $serial->update(['status' => 'returned']);
+                    $lockedAsset->update(['inventory_serial_id' => null, 'serial_no' => null]);
+                }
+
+                $handoff = ServiceAssetSerialHandoff::create([
+                    'company_id' => $companyId, 'service_asset_id' => $lockedAsset->id, 'inventory_serial_id' => $serial->id,
+                    'action' => $data['action'], 'effective_at' => $data['effective_at'], 'location' => $data['location'] ?? null,
+                    'notes' => $data['notes'] ?? null, 'external_reference' => $data['external_reference'] ?? null,
+                    'created_by' => $request->user()?->id,
+                ]);
+                app(AuditService::class)->record('service_asset.serial_handoff.'. $data['action'], $handoff, null, $handoff->toArray() + ['api' => true]);
+                return $handoff;
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $handoff->load(['asset', 'serial.product', 'creator']), 'status' => 'created'], 201);
+    }
+
     public function assetHistory(int $id): JsonResponse
     {
         $asset = $this->companyScope(ServiceAsset::query())->findOrFail($id);
@@ -200,6 +278,7 @@ class ServiceIntegrationController extends Controller
             'maintenance_orders' => $asset->maintenanceOrders()->with(['assignee', 'serviceRequest', 'serviceInvoice', 'laborJournal'])->latest()->get(),
             'warranty_claims' => $asset->warrantyClaims()->with(['customer', 'product', 'contract', 'creator', 'settler'])->latest()->get(),
             'ownership_transfers' => $asset->ownershipTransfers()->with(['previousCustomer', 'newCustomer', 'creator'])->get(),
+            'serial_handoffs' => $asset->serialHandoffs()->with(['serial.product', 'creator'])->get(),
             'depreciation_entries' => $asset->depreciationEntries()->with('journal')->latest('depreciation_date')->get(),
         ], 'asset_id' => $asset->id]);
     }
@@ -549,7 +628,11 @@ class ServiceIntegrationController extends Controller
             ]);
             $total = $taxMode === 'inclusive' ? (float) $data['amount'] : (float) $taxResult['net'] + (float) $taxResult['tax'];
             $invoice->update(['subtotal_amount' => (float) $taxResult['net'], 'tax_amount' => (float) $taxResult['tax'], 'total_amount' => $total]);
-            app(AuditService::class)->record('service_invoice.created', $invoice, null, $invoice->toArray() + ['maintenance_order_id' => $order->id, 'api' => true]);
+            app(AuditService::class)->record('service_invoice.created', $invoice, null, $invoice->toArray() + ['maintenance_order_id' => $order->id, 'api' => true, 'lines' => [[
+                'product_id' => $product->id, 'quantity' => 1.0, 'unit_price' => (float) $data['amount'],
+                'discount' => 0.0, 'tax_rate' => $taxRate, 'tax_amount' => (float) $taxResult['tax'],
+                'source_type' => 'maintenance_order', 'source_id' => $order->id,
+            ]]]);
             return $invoice;
         });
         return response()->json(['data' => $invoice->load('customer', 'invoice_details.product'), 'status' => 'pending_approval'], 201);

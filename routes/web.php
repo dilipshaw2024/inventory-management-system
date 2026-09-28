@@ -229,6 +229,8 @@ Route::controller(StockController::class)->middleware('permission:reports.view')
     Route::get('/stock/movements', 'MovementReport')->name('stock.movements');
     Route::get('/stock/movements/export', 'MovementExport')->name('stock.movements.export')->middleware('permission:reports.export');
     Route::get('/stock/valuation', 'ValuationReport')->name('stock.valuation');
+    Route::get('/stock/valuation/export', 'ValuationReport')->name('stock.valuation.export')->middleware('permission:reports.export');
+    Route::get('/stock/valuation/pdf', 'ValuationReport')->name('stock.valuation.pdf')->middleware('permission:reports.export');
     Route::get('/stock/location-stock', 'LocationStockReport')->name('stock.location.stock');
     Route::get('/stock/expiry', 'ExpiryReport')->name('stock.expiry');
     Route::get('/stock/batch-stock', 'BatchStockReport')->name('stock.batch.stock');
@@ -662,6 +664,7 @@ Route::middleware(['auth', 'permission:users.manage'])->controller(AuditLogContr
     Route::get('/status-history', 'statusHistory')->name('status.history');
     Route::get('/revisions', 'revisions')->name('revisions');
     Route::get('/revisions/{id}/diff', 'revisionDiff')->name('revisions.diff');
+    Route::post('/revisions/{id}/restore', 'restoreRevision')->name('revisions.restore');
     Route::get('/export', 'export')->name('export')->middleware('permission:reports.export');
 });
 Route::middleware(['auth', 'permission:users.manage'])->post('/erp/security/restore/{type}/{id}', [\App\Http\Controllers\SoftDeleteRestoreController::class, 'restore'])->name('erp.security.restore');
