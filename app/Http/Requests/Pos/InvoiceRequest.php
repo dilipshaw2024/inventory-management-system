@@ -45,6 +45,7 @@ class InvoiceRequest extends FormRequest
             'promotion_code' => ['nullable', 'string', 'max:80'],
             'estimated_amount' => ['required', 'numeric', 'min:0'],
             'paid_status' => ['required', 'in:full_paid,full_due,partial_paid'],
+            'payment_method' => ['nullable', 'in:cash,card,bank,transfer,other'],
             'paid_amount' => ['nullable', 'numeric', 'min:0'],
             'customer_id' => ['required'],
             'name' => ['required_if:customer_id,0', 'nullable', 'string', 'max:255'],
@@ -71,6 +72,10 @@ class InvoiceRequest extends FormRequest
 
         $validator->sometimes('paid_amount', ['required', 'numeric', 'min:0'], function ($input) {
             return $input->paid_status === 'partial_paid';
+        });
+
+        $validator->sometimes('payment_method', ['required'], function ($input) {
+            return $input->paid_status !== 'full_due';
         });
     }
 

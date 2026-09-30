@@ -20,6 +20,54 @@ class DeliveryTrackingIntegrationController extends Controller
 {
     public function __construct(private CarrierTrackingAdapterRegistry $carrierAdapters) {}
 
+    public function webhook(Request $request, int $companyId, string $provider): JsonResponse
+    {
+        $provider = strtolower(trim($provider));
+        $setting = CarrierTrackingProviderSetting::where('company_id', $companyId)->where('provider', $provider)->where('is_active', true)->first();
+        $secret = is_array($setting?->connection_config) ? (string) ($setting->connection_config['webhook_secret'] ?? '') : '';
+        if (!$setting || $secret === '') return response()->json(['message' => 'Carrier webhook is not configured.'], 404);
+        $signature = trim((string) $request->header('X-Carrier-Signature', ''));
+        if (str_starts_with($signature, 'sha256=')) $signature = substr($signature, 7);
+        $expected = hash_hmac('sha256', $request->getContent(), $secret);
+        if ($signature === '' || !hash_equals($expected, $signature)) return response()->json(['message' => 'Invalid carrier webhook signature.'], 401);
+
+        $body = json_decode($request->getContent(), true);
+        if (!is_array($body)) return response()->json(['message' => 'Carrier webhook payload must be valid JSON.'], 422);
+        $payloads = $body['events'] ?? $body['data'] ?? $body;
+        $payloads = array_is_list($payloads) ? $payloads : [$payloads];
+        $recorded = 0;
+        $duplicates = 0;
+        foreach ($payloads as $payload) {
+            if (!is_array($payload)) return response()->json(['message' => 'Each carrier webhook event must be an object.'], 422);
+            try {
+                $normalized = $this->carrierAdapters->resolve($provider)->normalize($payload);
+            } catch (\InvalidArgumentException $exception) {
+                return response()->json(['message' => $exception->getMessage()], 422);
+            }
+            $normalized = validator(array_merge($normalized, ['provider' => $provider, 'raw_payload' => $payload]), [
+                'delivery_id' => ['required', 'integer'], 'provider' => ['required', 'string', 'max:50'],
+                'external_reference' => ['nullable', 'string', 'max:150'], 'carrier_status' => ['required', 'in:label_created,picked_up,in_transit,out_for_delivery,delivered,exception,returned'],
+                'event_at' => ['required', 'date'], 'event_location' => ['nullable', 'string', 'max:255'], 'description' => ['nullable', 'string', 'max:3000'], 'raw_payload' => ['nullable', 'array'],
+            ])->validate();
+            if (!empty($normalized['external_reference']) && DeliveryTrackingEvent::where('company_id', $companyId)->where('provider', $provider)->where('external_reference', $normalized['external_reference'])->exists()) {
+                $duplicates++;
+                continue;
+            }
+            DB::transaction(function () use ($normalized, $companyId): void {
+                $delivery = Delivery::where('company_id', $companyId)->with('operations')->lockForUpdate()->findOrFail($normalized['delivery_id']);
+                $event = DeliveryTrackingEvent::create([
+                    'company_id' => $companyId, 'delivery_id' => $normalized['delivery_id'], 'provider' => $normalized['provider'], 'external_reference' => $normalized['external_reference'] ?? null,
+                    'carrier_status' => $normalized['carrier_status'], 'event_at' => $normalized['event_at'], 'event_location' => $normalized['event_location'] ?? null,
+                    'description' => $normalized['description'] ?? null, 'raw_payload' => $normalized['raw_payload'] ?? null,
+                ]);
+                $this->synchronizeDelivery($delivery, $event);
+                app(AuditService::class)->record('delivery_tracking_event.created', $event, null, $event->toArray() + ['webhook' => true]);
+            });
+            $recorded++;
+        }
+        return response()->json(['status' => 'accepted', 'summary' => ['received' => count($payloads), 'recorded' => $recorded, 'duplicates' => $duplicates]]);
+    }
+
     public function carrierTrackingProviders(Request $request): JsonResponse
     {
         return response()->json(CarrierTrackingProviderSetting::where('company_id', $request->user()?->company_id)->orderBy('provider')->paginate(min(100, max(1, (int) $request->input('per_page', 50)))));
@@ -27,10 +75,10 @@ class DeliveryTrackingIntegrationController extends Controller
 
     public function storeCarrierTrackingProvider(Request $request): JsonResponse
     {
-        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
         $this->validateCarrierEndpoint($data['connection_config']['endpoint'] ?? null);
         $data['provider'] = strtolower(trim($data['provider']));
-        if ($data['provider'] !== 'http') abort(422, 'Unsupported carrier tracking provider setting.');
+        if (!in_array($data['provider'], ['http', 'generic'], true)) abort(422, 'Unsupported carrier tracking provider setting.');
         $setting = CarrierTrackingProviderSetting::updateOrCreate(['company_id' => $request->user()?->company_id, 'provider' => $data['provider']], ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true]);
         app(AuditService::class)->record('carrier_tracking_provider.updated', $setting, null, $setting->toArray());
         return response()->json(['data' => $setting, 'status' => 'configured'], 201);
@@ -39,7 +87,7 @@ class DeliveryTrackingIntegrationController extends Controller
     public function updateCarrierTrackingProvider(Request $request, int $id): JsonResponse
     {
         $setting = CarrierTrackingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
-        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
         $this->validateCarrierEndpoint($data['connection_config']['endpoint'] ?? null);
         $setting->update($data);
         app(AuditService::class)->record('carrier_tracking_provider.updated', $setting, null, $setting->toArray());

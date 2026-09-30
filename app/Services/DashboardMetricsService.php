@@ -25,13 +25,20 @@ use Illuminate\Support\Facades\Cache;
 
 class DashboardMetricsService
 {
+    public const WIDGETS = [
+        'month_sales', 'total_products', 'low_stock', 'pending_approvals',
+        'receivables', 'open_service_requests', 'breached_service_requests',
+        'active_maintenance_orders', 'sales_trend', 'exception_drilldowns',
+    ];
+
     public function forCurrentCompany(int $months = 6): array
     {
         $months = max(3, min(24, $months));
         $companyId = auth()->user()?->company_id ?: 'global';
         $ttl = (int) config('erp.dashboard_cache_ttl', 60);
+        $widgetHash = sha1(json_encode($this->enabledWidgets((int) $companyId), JSON_THROW_ON_ERROR));
         if ($ttl === 0) return $this->calculate($months);
-        return Cache::remember('erp.dashboard.metrics.'.$companyId.'.'.$months, now()->addSeconds($ttl), fn (): array => $this->calculate($months));
+        return Cache::remember('erp.dashboard.metrics.'.$companyId.'.'.$months.'.'.$widgetHash, now()->addSeconds($ttl), fn (): array => $this->calculate($months));
     }
 
     public function forUser(User $user, int $months = 6): array
@@ -64,6 +71,7 @@ class DashboardMetricsService
             $metrics['low_stock'] = null;
             $metrics['exception_drilldowns'] = ['low_stock' => [], 'excess_stock' => []];
         }
+        $metrics['widgets'] = collect($metrics)->only($metrics['enabled_widgets'] ?? self::WIDGETS)->all();
         return $metrics;
     }
 
@@ -85,6 +93,7 @@ class DashboardMetricsService
         $openServiceRequests = ServiceRequest::whereIn('status', ['open', 'assigned', 'in_progress'])->count();
         $breachedServiceRequests = ServiceRequest::whereNotNull('response_due_at')->whereNotIn('status', ['resolved', 'cancelled'])->where(function ($query): void { $query->where(function ($nested): void { $nested->whereNull('assigned_at')->where('response_due_at', '<', now()); })->orWhereColumn('assigned_at', '>', 'response_due_at'); })->count();
         $activeMaintenanceOrders = MaintenanceOrder::whereIn('status', ['planned', 'in_progress'])->count();
+        $enabledWidgets = $this->enabledWidgets($companyId);
         return [
             'month_sales' => $monthSales, 'total_products' => $totalProducts, 'low_stock' => $lowStock,
             'pending_approvals' => $pendingApprovals, 'pending_approvals_by_module' => $pendingByModule, 'receivables' => $receivables,
@@ -102,7 +111,28 @@ class DashboardMetricsService
                 'a' => (float) $settings->get('abc_a_threshold_percent', 80, $companyId),
                 'b' => (float) $settings->get('abc_b_threshold_percent', 95, $companyId),
             ],
+            'enabled_widgets' => $enabledWidgets,
+            'widgets' => collect([
+                'month_sales' => $monthSales,
+                'total_products' => $totalProducts,
+                'low_stock' => $lowStock,
+                'pending_approvals' => $pendingApprovals,
+                'receivables' => $receivables,
+                'open_service_requests' => $openServiceRequests,
+                'breached_service_requests' => $breachedServiceRequests,
+                'active_maintenance_orders' => $activeMaintenanceOrders,
+                'sales_trend' => $this->salesTrend($months),
+                'exception_drilldowns' => ['low_stock' => $planning['low_rows'], 'excess_stock' => $planning['excess_rows']],
+            ])->only($enabledWidgets)->all(),
         ];
+    }
+
+    private function enabledWidgets(int $companyId): array
+    {
+        $configured = app(ErpSettingService::class)->get('dashboard_widgets', self::WIDGETS, $companyId);
+        if (!is_array($configured)) return self::WIDGETS;
+        $widgets = array_values(array_intersect(self::WIDGETS, array_map('strval', $configured)));
+        return $widgets ?: self::WIDGETS;
     }
 
     private function salesTrend(int $months): array

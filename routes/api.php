@@ -21,6 +21,16 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
 Route::middleware(['auth:sanctum', 'throttle:api', 'abilities:integration:read'])
     ->get('/integration/providers', [\App\Http\Controllers\Api\IntegrationProviderController::class, 'index']);
 
+Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('pos')->group(function (): void {
+    Route::get('/registers', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'registers'])->middleware('abilities:sales:read');
+    Route::post('/registers', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'storeRegister'])->middleware('abilities:sales:write');
+    Route::post('/registers/{registerId}/sessions', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'openSession'])->middleware('abilities:sales:write');
+    Route::get('/sessions', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'sessions'])->middleware('abilities:sales:read');
+    Route::get('/sessions/{sessionId}/summary', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'sessionSummary'])->middleware('abilities:sales:read');
+    Route::post('/sessions/{sessionId}/cash-movements', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'cashMovement'])->middleware('abilities:sales:write');
+    Route::post('/sessions/{sessionId}/close', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'closeSession'])->middleware('abilities:sales:write');
+});
+
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group(function (): void {
     Route::get('/bank-accounts', [\App\Http\Controllers\Api\BankReconciliationController::class, 'bankAccounts'])->middleware('abilities:accounting:read');
     Route::post('/bank-accounts', [\App\Http\Controllers\Api\BankReconciliationController::class, 'storeBankAccount'])->middleware('abilities:accounting:write');
@@ -165,6 +175,8 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::get('/valuation', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'valuation'])->middleware('abilities:inventory:read');
     Route::get('/valuation/accounting-period', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'accountingPeriodValuation'])->middleware('abilities:inventory:read');
     Route::get('/valuation/revaluation-preview', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'revaluationPreview'])->middleware('abilities:inventory:read');
+    Route::get('/valuation/standard-cost-variance', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'standardCostVariance'])->middleware('abilities:inventory:read');
+    Route::post('/valuation/standard-cost-variance/post', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'postStandardCostVariance'])->middleware('abilities:inventory:write');
     Route::get('/valuation/revaluations', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'revaluationRuns'])->middleware('abilities:inventory:read');
     Route::get('/valuation/revaluation-reconciliation', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'revaluationReconciliation'])->middleware('abilities:inventory:read');
     Route::post('/valuation/revaluations', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'createRevaluationRun'])->middleware('abilities:inventory:write');
@@ -202,7 +214,9 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::get('/replenishment/scenarios/{id}', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'showSavedScenario'])->middleware('abilities:inventory:read');
     Route::get('/replenishment/transfer-suggestions', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'transferSuggestions'])->middleware('abilities:inventory:read');
     Route::post('/replenishment/transfer-suggestions/create-transfer', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'createTransferFromSuggestion'])->middleware('abilities:inventory:write');
+    Route::post('/replenishment/transfer-suggestions/create-transfers', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'createTransfersFromSuggestions'])->middleware('abilities:inventory:write');
     Route::post('/replenishment/purchase-orders', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'createPurchaseOrderFromSuggestion'])->middleware('abilities:inventory:write');
+    Route::post('/replenishment/purchase-orders/batch', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'createPurchaseOrdersFromSuggestions'])->middleware('abilities:inventory:write');
     Route::get('/planning-exceptions', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'exceptions'])->middleware('abilities:inventory:read');
     Route::get('/replenishment-policies', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'policies'])->middleware('abilities:inventory:read');
     Route::post('/replenishment-policies', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'storePolicy'])->middleware('abilities:inventory:write');
@@ -273,6 +287,9 @@ Route::get('/customer-portal/quotations/{token}', [\App\Http\Controllers\Api\Cus
 Route::post('/customer-portal/quotations/{token}/accept', [\App\Http\Controllers\Api\CustomerPortalController::class, 'accept'])->middleware('throttle:api');
 Route::post('/customer-portal/quotations/{token}/decline', [\App\Http\Controllers\Api\CustomerPortalController::class, 'decline'])->middleware('throttle:api');
 
+Route::middleware('throttle:api')->post('/public/bank-statements/{companyId}/{provider}', [\App\Http\Controllers\Api\BankReconciliationController::class, 'webhook']);
+Route::middleware('throttle:api')->post('/public/carrier-tracking/{companyId}/{provider}', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'webhook']);
+
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->group(function (): void {
     Route::post('/sales-orders', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'createSalesOrder'])->middleware('abilities:sales:write');
     Route::get('/sales-quotations', [\App\Http\Controllers\Api\SalesQuotationIntegrationController::class, 'index'])->middleware('abilities:sales:read');
@@ -329,6 +346,12 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::post('/deliveries/{id}/delivered', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'confirmDelivery'])->middleware('abilities:sales:write');
     Route::get('/deliveries/{deliveryId}/packages', [\App\Http\Controllers\Api\DeliveryPackageIntegrationController::class, 'index'])->middleware('abilities:sales:read');
     Route::post('/deliveries/{deliveryId}/packages', [\App\Http\Controllers\Api\DeliveryPackageIntegrationController::class, 'store'])->middleware('abilities:sales:write');
+    Route::get('/logistics/rate-cards', [\App\Http\Controllers\Api\CarrierRateCardIntegrationController::class, 'index'])->middleware('abilities:warehouse:read');
+    Route::post('/logistics/rate-cards', [\App\Http\Controllers\Api\CarrierRateCardIntegrationController::class, 'store'])->middleware('abilities:warehouse:write');
+    Route::patch('/logistics/rate-cards/{id}', [\App\Http\Controllers\Api\CarrierRateCardIntegrationController::class, 'update'])->middleware('abilities:warehouse:write');
+    Route::post('/logistics/rate-cards/{id}/deactivate', [\App\Http\Controllers\Api\CarrierRateCardIntegrationController::class, 'deactivate'])->middleware('abilities:warehouse:write');
+    Route::post('/logistics/rate-quotes', [\App\Http\Controllers\Api\CarrierRateCardIntegrationController::class, 'quote'])->middleware('abilities:warehouse:read');
+    Route::post('/deliveries/{id}/carrier-quote', [\App\Http\Controllers\Api\CarrierRateCardIntegrationController::class, 'selectForDelivery'])->middleware('abilities:warehouse:write');
     Route::get('/delivery-tracking-events', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'index'])->middleware('abilities:sales:read');
     Route::get('/carrier-tracking-providers', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'carrierTrackingProviders'])->middleware('abilities:sales:read');
     Route::post('/carrier-tracking-providers', [\App\Http\Controllers\Api\DeliveryTrackingIntegrationController::class, 'storeCarrierTrackingProvider'])->middleware('ability:sales:write,integration:write');
@@ -454,18 +477,26 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::get('/security/audit-logs', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'auditLogs'])->middleware('abilities:integration:read');
     Route::get('/security/revisions', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'revisions'])->middleware('abilities:integration:read');
     Route::get('/security/revisions/{id}/diff', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'revisionDiff'])->middleware('abilities:integration:read');
+    Route::get('/security/revisions/{id}/restore-preview', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'restorePreview'])->middleware('abilities:integration:read');
     Route::post('/security/revisions/{id}/restore', [\App\Http\Controllers\Api\SecurityIntegrationController::class, 'restoreRevision'])->middleware('abilities:integration:write');
     Route::get('/warehouse/putaway/locations', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'putawayLocations'])->middleware('abilities:warehouse:read');
     Route::get('/warehouse/putaway/tasks', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'putawayTasks'])->middleware('abilities:warehouse:read');
     Route::get('/warehouse/pick-list', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'pickList'])->middleware('abilities:warehouse:read');
     Route::post('/warehouse/pick-list/complete', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'completePickList'])->middleware('abilities:warehouse:write');
+    Route::get('/dispatch/manifests', [\App\Http\Controllers\Api\DispatchManifestIntegrationController::class, 'index'])->middleware('abilities:warehouse:read');
+    Route::post('/dispatch/manifests', [\App\Http\Controllers\Api\DispatchManifestIntegrationController::class, 'store'])->middleware('abilities:warehouse:write');
+    Route::post('/dispatch/manifests/{id}/handoff', [\App\Http\Controllers\Api\DispatchManifestIntegrationController::class, 'handoff'])->middleware('abilities:warehouse:write');
+    Route::post('/dispatch/manifests/{id}/close', [\App\Http\Controllers\Api\DispatchManifestIntegrationController::class, 'close'])->middleware('abilities:warehouse:write');
+    Route::post('/dispatch/manifests/{id}/cancel', [\App\Http\Controllers\Api\DispatchManifestIntegrationController::class, 'cancel'])->middleware('abilities:warehouse:write');
     Route::get('/warehouse/pick-waves', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'pickWaves'])->middleware('abilities:warehouse:read');
+    Route::post('/warehouse/pick-waves/from-pick-list', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'createPickWaveFromPickList'])->middleware('abilities:warehouse:write');
     Route::post('/warehouse/pick-waves', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'createPickWave'])->middleware('abilities:warehouse:write');
     Route::post('/warehouse/pick-waves/{id}/release', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'releasePickWave'])->middleware('abilities:warehouse:write');
     Route::post('/warehouse/pick-waves/{id}/complete', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'completePickWave'])->middleware('abilities:warehouse:write');
     Route::post('/warehouse/pick-waves/{id}/cancel', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'cancelPickWave'])->middleware('abilities:warehouse:write');
     Route::get('/warehouse/report', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'report'])->middleware('abilities:warehouse:read');
     Route::get('/warehouse/location-utilization', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'locationUtilization'])->middleware('abilities:warehouse:read');
+    Route::get('/warehouse/location-utilization-snapshots', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'utilizationSnapshots'])->middleware('abilities:warehouse:read');
     Route::post('/warehouse/putaway/tasks', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'createPutawayTask'])->middleware('ability:inventory:write,integration:write');
     Route::post('/warehouse/transfers', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'createTransfer'])->middleware('ability:inventory:write,integration:write');
     Route::get('/warehouse/transfers/{id}/reconciliation', [\App\Http\Controllers\Api\WarehouseIntegrationController::class, 'transferReconciliation'])->middleware('ability:inventory:read,integration:read');
@@ -565,6 +596,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('manufacturing')->gr
     Route::post('/production-scrap/{id}/approve', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'approveProductionScrap'])->middleware('abilities:manufacturing:write');
     Route::post('/production-scrap/{id}/reject', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'rejectProductionScrap'])->middleware('abilities:manufacturing:write');
     Route::post('/orders', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'storeOrder'])->middleware('abilities:manufacturing:write');
+    Route::post('/orders/from-suggestions/batch', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'storeOrdersFromSuggestions'])->middleware('abilities:manufacturing:write');
     Route::post('/orders/{id}/release', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'releaseOrder'])->middleware('abilities:manufacturing:write');
     Route::post('/orders/{id}/cancel', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'cancelOrder'])->middleware('abilities:manufacturing:write');
     Route::post('/orders/{id}/pause', [\App\Http\Controllers\Api\ManufacturingIntegrationController::class, 'pauseOrder'])->middleware('abilities:manufacturing:write');

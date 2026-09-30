@@ -13,6 +13,7 @@ use App\Models\Category;
 use App\Models\InventoryLocationRule;
 use App\Services\AuditService;
 use App\Services\InventoryLocationLifecycleService;
+use App\Services\StorePosSettingsService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
@@ -271,11 +272,12 @@ class ErpOrganizationController extends Controller
 
     public function store(Request $request)
     {
-        $data = $request->validate(['branch_id' => ['required', 'exists:branches,id'], 'warehouse_id' => ['nullable', 'integer', 'exists:warehouses,id'], 'name' => ['required', 'string', 'max:255'], 'code' => ['required', 'string', 'max:30', 'alpha_dash'], 'address' => ['nullable', 'string', 'max:2000'], 'currency_code' => ['nullable', 'string', 'size:3'], 'default_tax_mode' => ['nullable', 'in:exclusive,inclusive'], 'allow_negative_stock' => ['nullable', 'boolean'], 'pos_settings' => ['nullable', 'array']]);
+        $data = $request->validate(['branch_id' => ['required', 'exists:branches,id'], 'warehouse_id' => ['nullable', 'integer', 'exists:warehouses,id'], 'name' => ['required', 'string', 'max:255'], 'code' => ['required', 'string', 'max:30', 'alpha_dash'], 'address' => ['nullable', 'string', 'max:2000'], 'currency_code' => ['nullable', 'string', 'size:3'], 'default_tax_mode' => ['nullable', 'in:exclusive,inclusive'], 'allow_negative_stock' => ['nullable', 'boolean'], 'pos_settings' => ['nullable', 'array'], 'pos_settings.allowed_tenders' => ['sometimes', 'array', 'min:1'], 'pos_settings.allowed_tenders.*' => ['string', 'in:cash,card,bank,transfer,other', 'distinct'], 'pos_settings.receipt_footer' => ['sometimes', 'nullable', 'string', 'max:500'], 'pos_settings.require_customer' => ['sometimes', 'boolean'], 'pos_settings.auto_print_receipt' => ['sometimes', 'boolean'], 'pos_settings.cash_variance_tolerance' => ['sometimes', 'numeric', 'min:0']]);
         $branch = Branch::findOrFail($data['branch_id']);
         if (auth()->user()?->company_id && (int) $branch->company_id !== (int) auth()->user()->company_id) abort(403);
         if (!empty($data['warehouse_id']) && !Warehouse::whereKey($data['warehouse_id'])->where('branch_id', $branch->id)->where('is_active', true)->exists()) return back()->withErrors(['warehouse_id' => 'The selected fulfillment warehouse must be active and belong to the selected branch.'])->withInput();
         if (Store::where('branch_id', $data['branch_id'])->where('code', $data['code'])->exists()) return back()->withErrors(['code' => 'This store code already exists in the branch.'])->withInput();
+        if (array_key_exists('pos_settings', $data)) $data['pos_settings'] = app(StorePosSettingsService::class)->normalize($data['pos_settings']);
         $store = Store::create($data + ['is_active' => true, 'currency_code' => strtoupper($data['currency_code'] ?? '') ?: null, 'allow_negative_stock' => (bool) ($data['allow_negative_stock'] ?? false)]);
         app(AuditService::class)->record('store.created', $store, null, $store->toArray());
         return back()->with(['message' => 'Store created.', 'alert-type' => 'success']);
@@ -294,9 +296,10 @@ class ErpOrganizationController extends Controller
             'currency_code' => ['nullable', 'string', 'size:3'],
             'default_tax_mode' => ['nullable', 'in:exclusive,inclusive'],
             'allow_negative_stock' => ['nullable', 'boolean'],
-            'pos_settings' => ['nullable', 'array'],
+            'pos_settings' => ['nullable', 'array'], 'pos_settings.allowed_tenders' => ['sometimes', 'array', 'min:1'], 'pos_settings.allowed_tenders.*' => ['string', 'in:cash,card,bank,transfer,other', 'distinct'], 'pos_settings.receipt_footer' => ['sometimes', 'nullable', 'string', 'max:500'], 'pos_settings.require_customer' => ['sometimes', 'boolean'], 'pos_settings.auto_print_receipt' => ['sometimes', 'boolean'], 'pos_settings.cash_variance_tolerance' => ['sometimes', 'numeric', 'min:0'],
             'is_active' => ['nullable', 'boolean'],
         ]);
+        if (array_key_exists('pos_settings', $data)) $data['pos_settings'] = app(StorePosSettingsService::class)->normalize($data['pos_settings']);
         if (Store::where('branch_id', $store->branch_id)->where('code', $data['code'])->where('id', '<>', $id)->exists()) {
             return back()->withErrors(['code' => 'This store code already exists in the branch.'])->withInput();
         }

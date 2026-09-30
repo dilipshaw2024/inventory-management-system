@@ -10,7 +10,10 @@ use App\Models\Delivery;
 use App\Models\DeliveryLine;
 use App\Models\DeliveryOperation;
 use App\Models\DeliveryTrackingEvent;
+use App\Models\CarrierTrackingProviderSetting;
 use App\Models\Product;
+use App\Models\Permission;
+use App\Models\Role;
 use App\Models\SalesOrder;
 use App\Models\Supplier;
 use App\Models\Store;
@@ -69,6 +72,43 @@ class DeliveryIntegrationTest extends TestCase
         $replayed = $this->postJson('/api/integration/deliveries', $payload + ['lines' => [['sales_order_line_id' => $orderLine->id, 'quantity' => 99, 'unit_price' => 99]]]);
         $replayed->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $created->json('data.id'));
         $this->assertSame(1, Delivery::where('company_id', $company->id)->count());
+    }
+
+    public function test_assigned_store_cannot_replay_or_create_delivery_for_another_store(): void
+    {
+        $company = Company::create(['name' => 'Delivery Store Scope Co', 'code' => 'DELIVERY-STORE-SCOPE']);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Store Scope Branch', 'code' => 'DELIVERY-STORE-BRANCH']);
+        $storeA = Store::create(['branch_id' => $branch->id, 'name' => 'Store A', 'code' => 'DELIVERY-STORE-A', 'is_active' => true]);
+        $storeB = Store::create(['branch_id' => $branch->id, 'name' => 'Store B', 'code' => 'DELIVERY-STORE-B', 'is_active' => true]);
+        $creator = User::factory()->create(['company_id' => $company->id]);
+        $assigned = User::factory()->create(['company_id' => $company->id, 'store_id' => $storeB->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Store Scope Customer', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Store Scope Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Store Scope Each', 'code' => 'EA-DELIVERY-STORE', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Store Scope Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Store Scope Item', 'status' => 1, 'is_stock_item' => true, 'can_sell' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'store_id' => $storeA->id, 'order_no' => 'SO-DELIVERY-STORE-SCOPE', 'date' => now()->toDateString(), 'status' => 'approved']);
+        $orderLine = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 1, 'delivered_qty' => 0, 'unit_price' => 10]);
+
+        Sanctum::actingAs($creator, ['sales:write']);
+        $created = $this->postJson('/api/integration/deliveries', [
+            'external_reference' => 'DELIVERY-STORE-SCOPE-1',
+            'sales_order_id' => $order->id,
+            'date' => now()->toDateString(),
+            'lines' => [['sales_order_line_id' => $orderLine->id, 'quantity' => 1, 'unit_price' => 10]],
+        ])->assertCreated();
+
+        Sanctum::actingAs($assigned, ['sales:read', 'sales:write']);
+        $this->postJson('/api/integration/deliveries', [
+            'external_reference' => 'DELIVERY-STORE-SCOPE-1',
+            'sales_order_id' => $order->id,
+            'date' => now()->toDateString(),
+            'lines' => [['sales_order_line_id' => $orderLine->id, 'quantity' => 1, 'unit_price' => 10]],
+        ])->assertForbidden();
+
+        $this->getJson('/api/integration/deliveries')->assertOk()->assertJsonCount(0, 'data');
+        $this->assertDatabaseCount('deliveries', 1);
+        $this->assertSame($created->json('data.id'), Delivery::query()->value('id'));
     }
 
     public function test_delivery_tracking_summary_reports_carrier_sla_metrics(): void
@@ -242,4 +282,113 @@ class DeliveryIntegrationTest extends TestCase
         $this->assertDatabaseHas('delivery_packages', ['id' => $packageId, 'status' => 'delivered']);
         $this->assertDatabaseHas('audit_logs', ['action' => 'delivery.package.created']);
     }
+    public function test_dispatch_manifest_groups_dispatched_deliveries_and_records_handoff_idempotently(): void
+    {
+        $company = Company::create(['name' => 'Dispatch Manifest Co', 'code' => 'DISPATCH-MANIFEST']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Manifest Customer', 'is_active' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-MANIFEST', 'date' => now()->toDateString(), 'status' => 'partially_delivered']);
+        $deliveries = collect([1, 2])->map(function (int $index) use ($company, $order, $user): Delivery {
+            $delivery = Delivery::create([
+                'company_id' => $company->id, 'sales_order_id' => $order->id,
+                'delivery_no' => 'DN-MANIFEST-'.$index, 'date' => now()->toDateString(),
+                'status' => 'approved', 'fulfillment_status' => 'dispatched',
+            ]);
+            DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed', 'performed_by' => $user->id, 'completed_at' => now()]);
+            return $delivery;
+        });
+
+        Sanctum::actingAs($user, ['warehouse:read', 'warehouse:write']);
+        $created = $this->postJson('/api/integration/dispatch/manifests', [
+            'delivery_ids' => $deliveries->pluck('id')->all(),
+            'carrier' => 'Manifest Carrier',
+            'tracking_reference' => 'MANIFEST-TRACK-1',
+            'external_reference' => 'MANIFEST-EXT-1',
+        ]);
+        $created->assertCreated()->assertJsonPath('status', 'planned')->assertJsonPath('data.delivery_count', 2)->assertJsonPath('data.status', 'planned');
+        $manifestId = (int) $created->json('data.id');
+
+        $this->postJson('/api/integration/dispatch/manifests', [
+            'delivery_ids' => [$deliveries->first()->id],
+            'external_reference' => 'MANIFEST-EXT-1',
+        ])->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $manifestId);
+
+        $this->postJson('/api/integration/dispatch/manifests/'.$manifestId.'/handoff', ['event_location' => 'Carrier dock'])
+            ->assertOk()->assertJsonPath('status', 'handed_off')->assertJsonPath('data.status', 'handed_off');
+        $this->assertDatabaseCount('delivery_tracking_events', 2);
+        $this->assertDatabaseHas('delivery_tracking_events', ['delivery_id' => $deliveries->first()->id, 'carrier_status' => 'picked_up']);
+
+        $this->postJson('/api/integration/dispatch/manifests/'.$manifestId.'/handoff')
+            ->assertOk()->assertJsonPath('status', 'already_handed_off');
+        $this->postJson('/api/integration/dispatch/manifests/'.$manifestId.'/close')
+            ->assertOk()->assertJsonPath('status', 'closed')->assertJsonPath('data.status', 'closed');
+        $this->getJson('/api/integration/dispatch/manifests?status=closed')
+            ->assertOk()->assertJsonPath('meta.total', 1)->assertJsonPath('data.0.id', $manifestId);
+    }
+
+    public function test_browser_dispatch_manifest_screen_is_scoped_and_creates_manifest(): void
+    {
+        $company = Company::create(['name' => 'Browser Manifest Co', 'code' => 'BROWSER-MANIFEST']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['name' => 'Warehouse manage', 'code' => 'warehouse.manage', 'module' => 'warehouse']);
+        $role = Role::create(['name' => 'Manifest operator', 'code' => 'manifest-operator']);
+        $role->permissions()->attach($permission);
+        $user->roles()->attach($role);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Browser Manifest Customer', 'is_active' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-BROWSER-MANIFEST', 'date' => now()->toDateString(), 'status' => 'partially_delivered']);
+        $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-BROWSER-MANIFEST', 'date' => now()->toDateString(), 'status' => 'approved', 'fulfillment_status' => 'dispatched', 'carrier' => 'Browser Carrier']);
+        DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed', 'performed_by' => $user->id, 'completed_at' => now()]);
+
+        $this->actingAs($user)->get('/warehouse/dispatch-manifests')->assertOk()->assertSee('DN-BROWSER-MANIFEST');
+        $this->actingAs($user)->post('/warehouse/dispatch-manifests', [
+            'delivery_ids' => [$delivery->id],
+            'carrier' => 'Browser Carrier',
+            'external_reference' => 'BROWSER-MANIFEST-EXT',
+        ])->assertRedirect();
+        $this->assertDatabaseHas('dispatch_manifests', ['company_id' => $company->id, 'external_reference' => 'BROWSER-MANIFEST-EXT', 'status' => 'planned']);
+    }
+
+    public function test_assigned_store_cannot_create_dispatch_manifest_for_another_store(): void
+    {
+        $company = Company::create(['name' => 'Manifest Store Scope Co', 'code' => 'MANIFEST-STORE-SCOPE']);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Manifest Scope Branch', 'code' => 'MANIFEST-SCOPE-BRANCH']);
+        $storeA = Store::create(['branch_id' => $branch->id, 'name' => 'Manifest Store A', 'code' => 'MANIFEST-STORE-A', 'is_active' => true]);
+        $storeB = Store::create(['branch_id' => $branch->id, 'name' => 'Manifest Store B', 'code' => 'MANIFEST-STORE-B', 'is_active' => true]);
+        $user = User::factory()->create(['company_id' => $company->id, 'store_id' => $storeB->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Manifest Scope Customer', 'is_active' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'store_id' => $storeA->id, 'order_no' => 'SO-MANIFEST-SCOPE', 'date' => now()->toDateString(), 'status' => 'partially_delivered']);
+        $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-MANIFEST-SCOPE', 'date' => now()->toDateString(), 'status' => 'approved', 'fulfillment_status' => 'dispatched']);
+        DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed', 'performed_by' => $user->id, 'completed_at' => now()]);
+        Sanctum::actingAs($user, ['warehouse:read', 'warehouse:write']);
+
+        $this->postJson('/api/integration/dispatch/manifests', [
+            'delivery_ids' => [$delivery->id],
+            'external_reference' => 'MANIFEST-STORE-SCOPE-1',
+        ])->assertStatus(422);
+        $this->getJson('/api/integration/dispatch/manifests')->assertOk()->assertJsonPath('meta.total', 0);
+        $this->assertDatabaseCount('dispatch_manifests', 0);
+    }
+
+
+    public function test_signed_carrier_webhook_is_tenant_scoped_and_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Webhook Carrier Co', 'code' => 'WEBHOOK-CARRIER']);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Webhook Customer', 'is_active' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-WEBHOOK', 'date' => now()->toDateString(), 'status' => 'partially_delivered']);
+        $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-WEBHOOK', 'date' => now()->toDateString(), 'status' => 'approved', 'fulfillment_status' => 'pending']);
+        DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed']);
+        CarrierTrackingProviderSetting::create(['company_id' => $company->id, 'provider' => 'generic', 'connection_config' => ['webhook_secret' => 'webhook-secret-123456']]);
+        $body = json_encode(['delivery_id' => $delivery->id, 'status' => 'picked_up', 'event_at' => '2026-09-29 12:00:00', 'event_id' => 'WEBHOOK-EVENT-1', 'location' => 'Carrier Hub'], JSON_THROW_ON_ERROR);
+        $signature = hash_hmac('sha256', $body, 'webhook-secret-123456');
+
+        $this->call('POST', '/api/public/carrier-tracking/'.$company->id.'/generic', [], [], [], ['CONTENT_TYPE' => 'application/json', 'HTTP_X_CARRIER_SIGNATURE' => $signature], $body)
+            ->assertOk()->assertJsonPath('status', 'accepted')->assertJsonPath('summary.recorded', 1);
+        $this->assertDatabaseHas('delivery_tracking_events', ['company_id' => $company->id, 'external_reference' => 'WEBHOOK-EVENT-1', 'provider' => 'generic']);
+        $this->assertDatabaseHas('deliveries', ['id' => $delivery->id, 'fulfillment_status' => 'dispatched']);
+        $this->call('POST', '/api/public/carrier-tracking/'.$company->id.'/generic', [], [], [], ['CONTENT_TYPE' => 'application/json', 'HTTP_X_CARRIER_SIGNATURE' => $signature], $body)
+            ->assertOk()->assertJsonPath('summary.recorded', 0)->assertJsonPath('summary.duplicates', 1);
+        $this->call('POST', '/api/public/carrier-tracking/'.$company->id.'/generic', [], [], [], ['CONTENT_TYPE' => 'application/json', 'HTTP_X_CARRIER_SIGNATURE' => 'invalid'], $body)
+            ->assertUnauthorized();
+    }
+
 }

@@ -6,6 +6,7 @@ use App\Models\Product;
 use App\Models\ProductionOrder;
 use App\Models\InventoryBatch;
 use App\Models\InventorySerial;
+use App\Models\ProductionReceipt;
 use App\Models\StockReservation;
 use Illuminate\Support\Facades\DB;
 
@@ -34,11 +35,25 @@ class ProductionService
         });
     }
 
-    public function complete(int $id, ?float $producedQuantity = null): ProductionOrder
+    public function complete(int $id, ?float $producedQuantity = null, array $outputContext = []): ProductionOrder
     {
         app(ApprovalGuard::class)->assertBeforeTransaction(ProductionOrder::class, $id);
-        return DB::transaction(function () use ($id, $producedQuantity): ProductionOrder {
+        return DB::transaction(function () use ($id, $producedQuantity, $outputContext): ProductionOrder {
             $order = $this->companyScope(ProductionOrder::with(['bom.lines', 'bom.byproducts', 'operations.workCenter', 'operations.routingOperation']))->lockForUpdate()->findOrFail($id);
+            $externalReference = trim((string) ($outputContext['external_reference'] ?? ''));
+            if ($externalReference !== '') {
+                $existingReceipt = ProductionReceipt::query()
+                    ->where('company_id', $order->company_id)
+                    ->where('external_reference', $externalReference)
+                    ->lockForUpdate()
+                    ->first();
+                if ($existingReceipt) {
+                    if ((int) $existingReceipt->production_order_id !== (int) $order->id) {
+                        throw new \RuntimeException('The production receipt external reference is already used by another production order.');
+                    }
+                    return $order->fresh();
+                }
+            }
             if (!in_array($order->status, ['released', 'in_progress'], true)) throw new \RuntimeException('Only released production orders can be completed.');
             app(ApprovalGuard::class)->assertDifferent($order);
             app(ProductionOperationService::class)->assertReadyForCompletion($order);
@@ -112,18 +127,34 @@ class ProductionService
             $finished->quantity = (float) $finished->quantity + $quantity;
             $finished->purchase_price = $quantity > 0 ? max(0, $cost - $byproductValue) / $quantity : $finished->purchase_price;
             $finished->save();
-            $batch = $order->output_batch_no ? InventoryBatch::firstOrCreate(['product_id' => $finished->id, 'batch_no' => $order->output_batch_no], ['location_id' => $order->location_id, 'manufacturing_date' => $order->output_manufacturing_date, 'expiry_date' => $order->output_expiry_date, 'best_before_date' => $order->output_best_before_date, 'warranty_until' => $order->output_warranty_until]) : null;
-            $serialNumbers = $order->output_serial_numbers ? array_values(array_filter(array_map('trim', preg_split('/[,\r\n]+/', $order->output_serial_numbers)))) : [];
+            $outputBatchNo = array_key_exists('output_batch_no', $outputContext) ? $outputContext['output_batch_no'] : $order->output_batch_no;
+            $outputManufacturingDate = array_key_exists('output_manufacturing_date', $outputContext) ? $outputContext['output_manufacturing_date'] : $order->output_manufacturing_date?->toDateString();
+            $outputExpiryDate = array_key_exists('output_expiry_date', $outputContext) ? $outputContext['output_expiry_date'] : $order->output_expiry_date?->toDateString();
+            $outputBestBeforeDate = array_key_exists('output_best_before_date', $outputContext) ? $outputContext['output_best_before_date'] : $order->output_best_before_date?->toDateString();
+            $outputWarrantyUntil = array_key_exists('output_warranty_until', $outputContext) ? $outputContext['output_warranty_until'] : $order->output_warranty_until?->toDateString();
+            $batch = $outputBatchNo ? InventoryBatch::firstOrCreate(['product_id' => $finished->id, 'batch_no' => $outputBatchNo], ['location_id' => $order->location_id, 'manufacturing_date' => $outputManufacturingDate, 'expiry_date' => $outputExpiryDate, 'best_before_date' => $outputBestBeforeDate, 'warranty_until' => $outputWarrantyUntil]) : null;
+            $serialNumbers = array_key_exists('output_serial_numbers', $outputContext)
+                ? (is_array($outputContext['output_serial_numbers']) ? array_values(array_filter(array_map('trim', $outputContext['output_serial_numbers']))) : array_values(array_filter(array_map('trim', preg_split('/[,\r\n]+/', (string) $outputContext['output_serial_numbers'])))))
+                : ($order->output_serial_numbers ? array_values(array_filter(array_map('trim', preg_split('/[,\r\n]+/', $order->output_serial_numbers)))) : []);
+            $netProductionCost = max(0, $cost - $byproductValue);
+            $receipt = ProductionReceipt::create([
+                'company_id' => $order->company_id, 'production_order_id' => $order->id, 'product_id' => $finished->id,
+                'location_id' => $order->location_id, 'batch_id' => $batch?->id, 'external_reference' => $outputContext['external_reference'] ?? null,
+                'quantity' => $quantity, 'unit_cost' => $quantity > 0 ? $netProductionCost / $quantity : 0,
+                'material_cost' => $materialCost, 'operation_cost' => $operationCost, 'byproduct_cost' => $byproductValue,
+                'net_cost' => $netProductionCost, 'serial_numbers' => $serialNumbers ?: null,
+                'manufacturing_date' => $outputManufacturingDate, 'expiry_date' => $outputExpiryDate,
+                'best_before_date' => $outputBestBeforeDate, 'warranty_until' => $outputWarrantyUntil, 'created_by' => auth()->id(),
+            ]);
             if ($finished->tracking_type === 'serial') {
                 if (count($serialNumbers) !== (int) round($quantity)) throw new \RuntimeException('Output serial count must equal production quantity for '.$finished->name.'.');
                 foreach ($serialNumbers as $serialNo) {
-                    $serial = app(SerialLifecycleService::class)->receive($finished, $serialNo, $order->location_id, $batch?->id, $order->output_warranty_until);
-                    app(InventoryLedgerService::class)->post($finished->id, 'receipt', 1, (float) $finished->purchase_price, $order->location_id, $order, 'Production finished goods', null, $batch?->id, $serial->id);
+                    $serial = app(SerialLifecycleService::class)->receive($finished, $serialNo, $order->location_id, $batch?->id, $outputWarrantyUntil);
+                    app(InventoryLedgerService::class)->post($finished->id, 'receipt', 1, (float) $finished->purchase_price, $order->location_id, $receipt, 'Production finished goods', null, $batch?->id, $serial->id);
                 }
-            } else app(InventoryLedgerService::class)->post($finished->id, 'receipt', $quantity, (float) $finished->purchase_price, $order->location_id, $order, 'Production finished goods', null, $batch?->id);
+            } else app(InventoryLedgerService::class)->post($finished->id, 'receipt', $quantity, (float) $finished->purchase_price, $order->location_id, $receipt, 'Production finished goods', null, $batch?->id);
             $completedQuantity = (float) $order->completed_quantity + $quantity;
             $status = $completedQuantity + 0.000001 >= (float) $order->planned_quantity ? 'completed' : 'in_progress';
-            $netProductionCost = max(0, $cost - $byproductValue);
             $order->update(['status' => $status, 'completed_quantity' => $completedQuantity, 'material_cost' => (float) $order->material_cost + $materialCost, 'operation_cost' => (float) $order->operation_cost + $operationCost, 'byproduct_cost' => (float) $order->byproduct_cost + $byproductValue, 'production_cost' => (float) $order->production_cost + $netProductionCost, 'approved_by' => auth()->id(), 'approved_at' => now()]);
             app(AuditService::class)->record('production_order.completed', $order, ['status' => 'released', 'completed_quantity' => (float) $order->completed_quantity - $quantity], ['status' => $status, 'completed_quantity' => $completedQuantity, 'receipt_quantity' => $quantity, 'operation_cost' => $operationCost]);
             return $order;

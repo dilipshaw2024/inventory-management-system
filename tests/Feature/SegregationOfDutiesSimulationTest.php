@@ -7,6 +7,7 @@ use App\Models\ApprovalOverride;
 use App\Models\Company;
 use App\Models\DocumentRevision;
 use App\Models\Permission;
+use App\Models\Product;
 use App\Models\Role;
 use App\Models\Supplier;
 use App\Models\Unit;
@@ -124,6 +125,44 @@ class SegregationOfDutiesSimulationTest extends TestCase
     }
 
 
+    public function test_security_admin_can_restore_product_lifecycle_and_costing_fields_without_stock_mutation(): void
+    {
+        $company = Company::create(['name' => 'Restore Product Co', 'code' => 'RESTORE-PRODUCT']);
+        $admin = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['code' => 'users.manage', 'name' => 'Manage users', 'module' => 'security']);
+        $role = Role::create(['code' => 'product-security-admin', 'name' => 'Product security admin', 'is_active' => true]);
+        $role->permissions()->attach($permission->id);
+        $admin->roles()->attach($role->id);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Product supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Product unit', 'code' => 'PROD-EA', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Product category', 'code' => 'PROD-CAT', 'is_active' => true, 'status' => 1]);
+        $product = Product::create([
+            'company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id,
+            'name' => 'Archived product', 'sku' => 'RESTORE-PROD', 'quantity' => 7, 'status' => 0,
+            'product_type' => 'stock', 'lifecycle_status' => 'archived', 'can_purchase' => false, 'can_sell' => false,
+            'is_stock_item' => true, 'costing_method' => 'fifo', 'standard_cost' => 4, 'purchase_price' => 4, 'sales_price' => 6,
+        ]);
+        $product->delete();
+        $revision = DocumentRevision::create([
+            'company_id' => $company->id, 'document_type' => (new Product)->getMorphClass(), 'document_id' => $product->id,
+            'version' => 1, 'old_values' => [
+                'name' => 'Restored product', 'status' => 1, 'lifecycle_status' => 'active', 'can_purchase' => true,
+                'can_sell' => true, 'costing_method' => 'standard', 'standard_cost' => 5,
+            ], 'new_values' => ['name' => 'Archived product', 'status' => 0, 'lifecycle_status' => 'archived'],
+            'changed_by' => $admin->id, 'changed_at' => now(),
+        ]);
+
+        $this->actingAs($admin)->post('/erp/security/audit/revisions/'.$revision->id.'/restore', ['reason' => 'Restore approved product master.'])->assertRedirect();
+        $restored = Product::withTrashed()->findOrFail($product->id);
+        $this->assertSame('Restored product', $restored->name);
+        $this->assertSame('active', $restored->lifecycle_status);
+        $this->assertTrue((bool) $restored->can_purchase);
+        $this->assertSame(7.0, (float) $restored->quantity);
+        $this->assertNull($restored->deleted_at);
+        $this->assertDatabaseHas('audit_logs', ['action' => 'document_revision.restored', 'auditable_type' => (new Product)->getMorphClass(), 'auditable_id' => $product->id]);
+    }
+
+
     public function test_security_admin_can_restore_catalog_master_revisions(): void
     {
         $company = Company::create(['name' => 'Restore Catalog Co', 'code' => 'RESTORE-CATALOG']);
@@ -204,6 +243,13 @@ class SegregationOfDutiesSimulationTest extends TestCase
         ]);
 
         Sanctum::actingAs($user, ['integration:read', 'integration:write']);
+        $this->getJson('/api/integration/security/revisions/'.$revision->id.'/restore-preview')
+            ->assertOk()
+            ->assertJsonPath('data.safe_to_restore', true)
+            ->assertJsonPath('data.document_type', (new Supplier)->getMorphClass())
+            ->assertJsonPath('data.restorable_fields.name', 'Restored supplier')
+            ->assertJsonPath('data.requires_review', false);
+
         $this->postJson('/api/integration/security/revisions/'.$revision->id.'/restore', [
             'reason' => 'Restore approved supplier master through integration.',
         ])->assertOk()->assertJsonPath('status', 'restored')->assertJsonPath('revision_id', $revision->id);

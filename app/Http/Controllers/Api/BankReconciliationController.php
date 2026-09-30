@@ -21,6 +21,83 @@ class BankReconciliationController extends Controller
 {
     public function __construct(private BankStatementAdapterRegistry $bankAdapters) {}
 
+    public function webhook(Request $request, int $companyId, string $provider): JsonResponse
+    {
+        $provider = strtolower(trim($provider));
+        $body = $request->getContent();
+        $payload = json_decode($body, true);
+        if (!is_array($payload)) {
+            return response()->json(['message' => 'Bank webhook payload must be valid JSON.'], 400);
+        }
+
+        $rows = $payload['lines'] ?? $payload['data'] ?? null;
+        if ($rows === null) {
+            $rows = array_is_list($payload) ? $payload : [$payload];
+        }
+        if (!is_array($rows) || count($rows) < 1 || count($rows) > 500) {
+            return response()->json(['message' => 'Bank webhook must contain between 1 and 500 statement lines.'], 422);
+        }
+
+        try {
+            $this->bankAdapters->resolve($provider);
+        } catch (\InvalidArgumentException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+
+        $accountIds = collect($rows)->map(function ($row) {
+            if (!is_array($row)) return null;
+            return $row['bank_account_id'] ?? $row['account_id'] ?? ($row['payload']['bank_account_id'] ?? $row['payload']['account_id'] ?? null);
+        })->filter(fn ($id) => is_numeric($id))->map(fn ($id) => (int) $id)->unique()->values();
+
+        if ($accountIds->isEmpty()) {
+            return response()->json(['message' => 'Each bank webhook line must identify a bank account.'], 422);
+        }
+
+        $accounts = BankAccount::query()
+            ->where('company_id', $companyId)
+            ->where('provider', $provider)
+            ->where('is_active', true)
+            ->whereIn('id', $accountIds->all())
+            ->get();
+        if ($accounts->count() !== $accountIds->count()) {
+            return response()->json(['message' => 'The webhook contains an inactive, unknown, or mismatched bank account.'], 404);
+        }
+
+        $signature = trim((string) ($request->header('X-Bank-Signature') ?: $request->header('X-ERP-BANK-SIGNATURE')));
+        if (str_starts_with($signature, 'sha256=')) $signature = substr($signature, 7);
+        if ($signature === '') {
+            return response()->json(['message' => 'Missing bank webhook signature.'], 401);
+        }
+
+        foreach ($accounts as $account) {
+            $secret = is_array($account->connection_config) ? (string) ($account->connection_config['webhook_secret'] ?? '') : '';
+            if ($secret === '' || !hash_equals(hash_hmac('sha256', $body, $secret), $signature)) {
+                return response()->json(['message' => 'Invalid bank webhook signature.'], 401);
+            }
+        }
+
+        try {
+            $import = app(BankStatementImportService::class)->import($companyId, $provider, $rows, null, 'webhook');
+        } catch (\Illuminate\Validation\ValidationException $exception) {
+            return response()->json(['message' => 'Bank webhook validation failed.', 'errors' => $exception->errors()], 422);
+        } catch (\InvalidArgumentException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+
+        $accounts->each(fn (BankAccount $account) => $account->update([
+            'last_synced_at' => now(), 'last_sync_status' => 'success', 'last_sync_error' => null,
+        ]));
+
+        $created = collect($import['results'])->where('idempotent', false)->count();
+        $duplicates = collect($import['results'])->where('idempotent', true)->count();
+        return response()->json([
+            'batch_id' => $import['batch']->id,
+            'created' => $created,
+            'duplicates' => $duplicates,
+            'data' => collect($import['results'])->map(fn (array $result) => $result['data'])->values(),
+        ], 201);
+    }
+
     public function lines(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -45,7 +122,7 @@ class BankReconciliationController extends Controller
         $data = $request->validate([
             'name' => ['required', 'string', 'max:150'], 'account_no' => ['nullable', 'string', 'max:80'],
             'currency_code' => ['required', 'string', 'size:3'], 'gl_account_id' => ['nullable', 'integer', Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
-            'provider' => ['nullable', 'string', 'max:50'], 'connection_config' => ['nullable', 'array'],
+            'provider' => ['nullable', 'string', 'max:50'], 'connection_config' => ['nullable', 'array'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'],
         ]);
         $provider = strtolower(trim($data['provider'] ?? 'generic'));
         if (!in_array($provider, ['generic', 'http'], true)) abort(422, 'Unsupported bank statement provider.');
@@ -63,7 +140,7 @@ class BankReconciliationController extends Controller
         $data = $request->validate([
             'name' => ['sometimes', 'required', 'string', 'max:150'], 'account_no' => ['nullable', 'string', 'max:80'],
             'currency_code' => ['sometimes', 'required', 'string', 'size:3'], 'gl_account_id' => ['nullable', 'integer', Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
-            'provider' => ['sometimes', 'required', 'string', 'max:50'], 'connection_config' => ['sometimes', 'nullable', 'array'], 'is_active' => ['sometimes', 'boolean'],
+            'provider' => ['sometimes', 'required', 'string', 'max:50'], 'connection_config' => ['sometimes', 'nullable', 'array'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'], 'is_active' => ['sometimes', 'boolean'],
         ]);
         if (array_key_exists('provider', $data)) {
             $data['provider'] = strtolower(trim($data['provider']));

@@ -16,6 +16,7 @@ use App\Models\User;
 use App\Services\IntegrationCursorService;
 use App\Services\AuditService;
 use App\Services\InventoryLocationLifecycleService;
+use App\Services\StorePosSettingsService;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Http\JsonResponse;
@@ -84,7 +85,8 @@ class OrganizationIntegrationController extends Controller
     public function updateStore(Request $request, int $id): JsonResponse
     {
         $companyId = $request->user()?->company_id;
-        $data = $request->validate($this->updateRules(['branch_id' => ['sometimes', 'required', 'integer', Rule::exists('branches', 'id')->where(fn ($q) => $q->where('company_id', $companyId))], 'warehouse_id' => ['nullable', 'integer'], 'address' => ['nullable', 'string', 'max:2000'], 'allow_negative_stock' => ['nullable', 'boolean'], 'pos_settings' => ['nullable', 'array']]));
+        $data = $request->validate($this->updateRules(['branch_id' => ['sometimes', 'required', 'integer', Rule::exists('branches', 'id')->where(fn ($q) => $q->where('company_id', $companyId))], 'warehouse_id' => ['nullable', 'integer'], 'address' => ['nullable', 'string', 'max:2000'], 'allow_negative_stock' => ['nullable', 'boolean'], 'pos_settings' => ['nullable', 'array'], 'pos_settings.allowed_tenders' => ['sometimes', 'array', 'min:1'], 'pos_settings.allowed_tenders.*' => ['string', 'in:cash,card,bank,transfer,other', 'distinct'], 'pos_settings.receipt_footer' => ['sometimes', 'nullable', 'string', 'max:500'], 'pos_settings.require_customer' => ['sometimes', 'boolean'], 'pos_settings.auto_print_receipt' => ['sometimes', 'boolean'], 'pos_settings.cash_variance_tolerance' => ['sometimes', 'numeric', 'min:0']]));
+        if (array_key_exists('pos_settings', $data)) $data['pos_settings'] = app(StorePosSettingsService::class)->normalize($data['pos_settings']);
         $store = $this->organizationScope(new Store())->findOrFail($id);
         if (array_key_exists('is_active', $data) && !$data['is_active'] && $store->is_active) $this->assertStoreCanDeactivate($store);
         $branchId = (int) ($data['branch_id'] ?? $store->branch_id);
@@ -149,7 +151,8 @@ class OrganizationIntegrationController extends Controller
     public function storeStore(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
-        $data = $request->validate($this->masterRules(['branch_id' => ['required', 'integer', Rule::exists('branches', 'id')->where(fn ($q) => $q->where('company_id', $companyId))], 'warehouse_id' => ['nullable', 'integer'], 'address' => ['nullable', 'string', 'max:2000'], 'allow_negative_stock' => ['nullable', 'boolean'], 'pos_settings' => ['nullable', 'array']]));
+        $data = $request->validate($this->masterRules(['branch_id' => ['required', 'integer', Rule::exists('branches', 'id')->where(fn ($q) => $q->where('company_id', $companyId))], 'warehouse_id' => ['nullable', 'integer'], 'address' => ['nullable', 'string', 'max:2000'], 'allow_negative_stock' => ['nullable', 'boolean'], 'pos_settings' => ['nullable', 'array'], 'pos_settings.allowed_tenders' => ['sometimes', 'array', 'min:1'], 'pos_settings.allowed_tenders.*' => ['string', 'in:cash,card,bank,transfer,other', 'distinct'], 'pos_settings.receipt_footer' => ['sometimes', 'nullable', 'string', 'max:500'], 'pos_settings.require_customer' => ['sometimes', 'boolean'], 'pos_settings.auto_print_receipt' => ['sometimes', 'boolean'], 'pos_settings.cash_variance_tolerance' => ['sometimes', 'numeric', 'min:0']]));
+        if (array_key_exists('pos_settings', $data)) $data['pos_settings'] = app(StorePosSettingsService::class)->normalize($data['pos_settings']);
         if (!empty($data['warehouse_id']) && !Warehouse::whereKey($data['warehouse_id'])->whereHas('branch', fn ($q) => $q->where('company_id', $companyId)->whereKey($data['branch_id']))->exists()) abort(422, 'Warehouse is not authorized for this branch.');
         return $this->createMaster($request, new Store(), $data, 'organization.store.created');
     }

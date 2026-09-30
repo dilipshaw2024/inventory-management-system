@@ -46,4 +46,23 @@ class DashboardMetricsTest extends TestCase
         $response->assertOk()->assertJsonPath('meta.visibility.finance', false)->assertJsonPath('meta.visibility.service', false)->assertJsonPath('data.month_sales', null)->assertJsonPath('data.receivables', null)->assertJsonPath('data.sales_trend', [])->assertJsonPath('data.open_service_requests', null);
         $response->assertJsonPath('meta.visibility.inventory', false)->assertJsonPath('data.total_products', null)->assertJsonPath('data.low_stock', null)->assertJsonPath('data.exception_drilldowns.low_stock', [])->assertJsonPath('data.pending_approvals', null);
     }
+    public function test_company_can_select_dashboard_widgets_without_removing_legacy_fields(): void
+    {
+        $company = Company::create(['name' => 'Widget Dashboard Co', 'code' => 'WIDGET-DASHBOARD']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['integration:write', 'inventory:read']);
+
+        $this->patchJson('/api/accounting/settings', [
+            'dashboard_widgets' => ['month_sales', 'low_stock'],
+        ])->assertOk()->assertJsonPath('data.dashboard_widgets.0', 'month_sales');
+
+        $response = $this->getJson('/api/inventory/dashboard?months=3');
+        $response->assertOk()
+            ->assertJsonPath('data.enabled_widgets.0', 'month_sales')
+            ->assertJsonPath('data.enabled_widgets.1', 'low_stock')
+            ->assertJsonPath('data.widgets.month_sales', 0)
+            ->assertJsonPath('data.widgets.low_stock', 0)
+            ->assertJsonPath('data.open_service_requests', 0);
+    }
+
 }

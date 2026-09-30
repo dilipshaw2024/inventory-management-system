@@ -18,4 +18,5 @@ class ProductionOrder extends Model
     public function closedBy() { return $this->belongsTo(User::class, 'closed_by'); }
     public function operations() { return $this->hasMany(ProductionOperation::class, 'production_order_id')->orderBy('sequence'); }
     public function materialIssueDocuments() { return $this->hasMany(InventoryDocument::class, 'production_order_id')->where('document_type', 'issue'); }
+    public function receipts() { return $this->hasMany(ProductionReceipt::class); }
 }

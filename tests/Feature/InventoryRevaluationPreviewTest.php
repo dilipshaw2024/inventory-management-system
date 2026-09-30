@@ -57,6 +57,98 @@ class InventoryRevaluationPreviewTest extends TestCase
         $this->assertDatabaseHas('inventory_cost_layers', ['id' => $layer->id, 'unit_cost' => 6]);
     }
 
+    public function test_standard_cost_variance_reports_receipt_and_issue_actuals(): void
+    {
+        $company = Company::create(['name' => 'Standard Variance Co', 'code' => 'STD-VAR']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Standard Variance Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Standard Variance Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Standard Variance Category', 'status' => 1]);
+        $product = Product::create([
+            'company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id,
+            'name' => 'Standard variance item', 'sku' => 'STD-VAR-ITEM', 'status' => 1, 'quantity' => 1,
+            'costing_method' => 'standard', 'standard_cost' => 10, 'purchase_price' => 8,
+        ]);
+        $receipt = InventoryMovement::create([
+            'company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt',
+            'quantity' => 2, 'unit_cost' => 12, 'posted_at' => now()->subDays(2),
+        ]);
+        $directLayer = InventoryCostLayer::create([
+            'product_id' => $product->id, 'original_quantity' => 1, 'remaining_quantity' => 1,
+            'unit_cost' => 8, 'received_at' => now()->subDays(2),
+        ]);
+        Sanctum::actingAs($user, ['inventory:read']);
+        $standardTotal = app(\App\Services\InventoryCostingService::class)->consume($product->id, 1);
+        $this->assertSame(10.0, $standardTotal);
+        $this->assertDatabaseHas('inventory_cost_layers', ['id' => $directLayer->id, 'remaining_quantity' => 0]);
+        $this->assertDatabaseHas('inventory_cost_consumptions', ['cost_layer_id' => $directLayer->id, 'unit_cost' => 8, 'total_cost' => 8]);
+
+        $layer = InventoryCostLayer::create([
+            'product_id' => $product->id, 'original_quantity' => 1, 'remaining_quantity' => 0,
+            'unit_cost' => 8, 'received_at' => now()->subDay(),
+        ]);
+        $issue = InventoryMovement::create([
+            'company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue',
+            'quantity' => 1, 'unit_cost' => 10, 'posted_at' => now()->subDay(),
+        ]);
+        InventoryCostConsumption::create([
+            'cost_layer_id' => $layer->id, 'product_id' => $product->id, 'movement_id' => $issue->id,
+            'quantity' => 1, 'unit_cost' => 8, 'total_cost' => 8, 'costing_method' => 'standard',
+        ]);
+
+        Sanctum::actingAs($user, ['inventory:read']);
+        $response = $this->getJson('/api/inventory/valuation/standard-cost-variance?from='.now()->subDays(3)->toDateString().'&to='.now()->toDateString());
+        $response->assertOk()
+            ->assertJsonPath('summary.movement_count', 2)
+            ->assertJsonPath('summary.inbound_count', 1)
+            ->assertJsonPath('summary.outbound_count', 1)
+            ->assertJsonPath('summary.variance_amount', 2)
+            ->assertJsonPath('summary.above_standard_count', 1)
+            ->assertJsonPath('summary.below_standard_count', 1);
+        $rows = collect($response->json('data'))->keyBy('movement_id');
+        $this->assertSame(4.0, (float) $rows->get($receipt->id)['variance_amount']);
+        $this->assertSame(-2.0, (float) $rows->get($issue->id)['variance_amount']);
+        $this->assertSame(8.0, (float) $rows->get($issue->id)['actual_unit_cost']);
+    }
+
+    public function test_standard_cost_variance_can_post_and_replay_settlement_journal(): void
+    {
+        $company = Company::create(['name' => 'Standard Posting Co', 'code' => 'STD-POST']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Standard Posting Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Standard Posting Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Standard Posting Category', 'status' => 1]);
+        $product = Product::create([
+            'company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id,
+            'name' => 'Standard posting item', 'sku' => 'STD-POST-ITEM', 'status' => 1,
+            'costing_method' => 'standard', 'standard_cost' => 10, 'quantity' => 2,
+        ]);
+        $movement = InventoryMovement::create([
+            'company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt',
+            'quantity' => 2, 'unit_cost' => 12, 'posted_at' => now()->subDay(),
+        ]);
+        $inventory = ChartOfAccount::create(['company_id' => $company->id, 'code' => '1400', 'name' => 'Inventory', 'account_type' => 'asset', 'is_active' => true]);
+        $variance = ChartOfAccount::create(['company_id' => $company->id, 'code' => '5190', 'name' => 'Standard Cost Variance', 'account_type' => 'expense', 'is_active' => true]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'inventory', 'account_id' => $inventory->id]);
+        AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'inventory_standard_variance', 'account_id' => $variance->id]);
+
+        Sanctum::actingAs($user, ['inventory:write']);
+        $first = $this->postJson('/api/inventory/valuation/standard-cost-variance/post', ['movement_id' => $movement->id])
+            ->assertCreated()
+            ->assertJsonPath('status', 'posted')
+            ->assertJsonPath('meta.idempotent', true);
+        $journalId = $first->json('data.id');
+        $first->assertJsonPath('data.lines.0.debit', 4);
+        $this->assertDatabaseHas('journal_entries', ['id' => $journalId, 'external_reference' => 'STD-VARIANCE-MOVEMENT-'.$movement->id]);
+        $this->assertSame(1, \App\Models\JournalEntry::where('company_id', $company->id)->where('external_reference', 'STD-VARIANCE-MOVEMENT-'.$movement->id)->count());
+
+        $this->postJson('/api/inventory/valuation/standard-cost-variance/post', ['movement_id' => $movement->id])
+            ->assertOk()
+            ->assertJsonPath('status', 'duplicate_ignored')
+            ->assertJsonPath('data.id', $journalId);
+        $this->assertSame(1, \App\Models\JournalEntry::where('company_id', $company->id)->where('external_reference', 'STD-VARIANCE-MOVEMENT-'.$movement->id)->count());
+    }
+
     public function test_revaluation_run_requires_independent_approval_and_updates_open_layer(): void
     {
         $company = Company::create(['name' => 'Revaluation Approval Co', 'code' => 'REVAL-APPROVAL']);

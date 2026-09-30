@@ -261,7 +261,7 @@ Migration `2026_09_11_000122` adds formal accepted/waived transfer-variance disp
 
 Migrations 2026_09_11_000123 through 000132 add audited maintenance-order execution fields, lifecycle actions, company scope for service records, manufacturing BOM/routing/work-center masters, tax rates, commercial pricing/promotions, warehouse-transfer shipping fields, safe delivery cancellation/reversal fields including issued-serial history, company-scoped demand-forecast overrides, and purchase-order cancellation audit fields. The approved-document tax report is available at /erp/accounting/tax-report and summarizes sales output tax, purchase input tax, and net tax by rate for a selected period.
 Expired-batch outbound issue and costing consumption are blocked centrally by default; authorized administrators can manage the override at /erp/settings.
-The sales analysis report is available at /reports/sales with period, product, and customer filters. Sales orders can apply a valid promotion code across eligible lines; the promotion is persisted and its usage is redeemed only on order approval. Sales orders can explicitly allow backorders; those orders reserve available stock and are automatically allocated newly available stock by the hourly \`erp:inventory:allocate-backorders\` scheduler command. Goods receipts and deliveries can be rejected with a reason before stock posting. Foreign-currency open-balance revaluation is available at /erp/accounting/fx-revaluation. Configure \`fx_gain\` and \`fx_loss\` account mappings before using the controlled, idempotent gain/loss journal posting action.
+The sales analysis report is available at /reports/sales with period, product, and customer filters. Sales orders can apply a valid promotion code across eligible lines; the promotion is persisted and its usage is redeemed only on order approval. Sales orders can explicitly allow backorders; those orders reserve available stock and are automatically allocated newly available stock by the hourly `erp:inventory:allocate-backorders` scheduler command. Goods receipts and deliveries can be rejected with a reason before stock posting. Foreign-currency open-balance revaluation is available at /erp/accounting/fx-revaluation. Configure `fx_gain` and `fx_loss` account mappings before using the controlled, idempotent gain/loss journal posting action.
 
 The example login is:
 
@@ -469,6 +469,14 @@ php artisan view:cache
 
 If the deployment uses release directories, build and migrate in the new release, switch the web-server symlink, then restart PHP-FPM. Keep the previous release available for rollback.
 
+For a guarded release, first verify both the database and private-storage backups, set the deployment environment to `production` or `staging`, and run:
+
+```bash
+ERP_DEPLOY_CONFIRM=I_HAVE_A_BACKUP ./bin/erp-deploy
+```
+
+`bin/erp-deploy` refuses local environments and missing backup confirmation, applies migrations with `--force`, runs the strict ERP health gate, clears and rebuilds configuration cache, and requests a graceful queue restart. Set `ERP_DEPLOY_MIGRATE=0` only when migrations were already applied by a separate controlled step.
+
 ## 7. Nginx example
 
 Replace the domain, PHP-FPM socket, and paths for the target server:
@@ -596,6 +604,10 @@ Laravel migrations should be reviewed for rollback safety before production use.
 - External webhook endpoints and accounting/inventory integrations require operational monitoring, secret rotation, retry inspection, and an approved network policy before high-volume production use.
 
 Complete database-backed tests, migration rehearsal, backup/restore validation, and production scheduler monitoring before treating the application as a high-trust or high-volume deployment. Fiscal-year and fiscal-period close also require all tenant bank statement lines through the close date to be matched, ignored, or settled and all dated bank reconciliations to be closed; resolve or reclose the affected reconciliation before retrying the close.
+POS integrations can administer store registers with GET/POST /api/pos/registers, open cashier sessions with POST /api/pos/registers/{id}/sessions, record cash-in/out/refund movements with POST /api/pos/sessions/{id}/cash-movements, list sessions with GET /api/pos/sessions, and close a shift with POST /api/pos/sessions/{id}/close. Read-only shift reporting is available at GET /api/pos/sessions/{id}/summary. These endpoints use sales:read/sales:write, enforce company/store ownership, support idempotent external references, and calculate expected cash from opening float, cash movements, and approved linked cash payments; card, bank, transfer, and other tenders are reported separately and do not inflate the cash drawer. When a close has a non-zero variance outside the configured store cash-variance tolerance, the system posts cash-over/short accounting automatically if the company has `cash` (or `cash_bank`) and `cash_over_short` account mappings; otherwise it records an `unmapped` status for finance follow-up. Zero variance is recorded as `not_required`. Store `pos_settings` supports `allowed_tenders` (`cash`, `card`, `bank`, `transfer`, `other`), `receipt_footer`, `require_customer`, `auto_print_receipt`, and `cash_variance_tolerance`; legacy stores default to all tenders. Sales invoice integration enforces the configured tender list.
+
+Warehouse utilization history is captured by the scheduled erp:warehouse:capture-utilization command (or manually with --company and --date) into repeat-safe daily snapshots. Tenant-scoped clients can read it through GET /api/integration/warehouse/location-utilization-snapshots with warehouse_id, location_id, from, to, and per_page filters using warehouse:read.
+
 Warehouse integrations can complete pending delivery picking and packing with `POST /api/integration/deliveries/{id}/operations/{pick|pack}/complete` using a token with `warehouse:write`, `sales:write`, or `integration:write`. Send `confirmed_quantities` keyed by delivery-line ID when the scanner confirms quantities; the server enforces exact line quantities and pick-before-pack ordering.
 Warehouse clients can query capacity-aware put-away destinations with `GET /api/integration/warehouse/putaway/locations?quantity=...&product_id=...` using `warehouse:read`, then create an idempotent approval-pending task with `POST /api/integration/warehouse/putaway/tasks` using `warehouse:write` or `integration:write`; both paths enforce configured quantity, weight, and volume limits.
 Warehouse transfer clients can create, approve, dispatch, and receive transfers through `/api/integration/warehouse/transfers` and its `/{id}/approve`, `/{id}/dispatch`, and `/{id}/receive` actions with `warehouse:write` or `integration:write`; receipt requests may provide `received_quantities` keyed by transfer-line ID for partial receiving.
@@ -661,7 +673,7 @@ Tax integrations can read, create, and update rates through `GET/POST/PATCH /api
 Fiscal-period integrations can read and create company-scoped periods through `GET/POST /api/accounting/fiscal-years`; creation rejects overlapping dates and starts the period open.
 Organization integrations can synchronize authorized hierarchy records through `GET /api/integration/organization/companies`, `/branches`, `/warehouses`, and `/locations` using `integration:read`; feeds support `updated_since`, cursor pagination, and relevant parent/type filters.
 The same organization feed supports `/stores` and `/departments`, completing the core company hierarchy used by POS and accounting.
-Security integrations can read credential-free users, roles, and permissions from `/api/integration/security/users`, `/roles`, and `/permissions`; feeds require `integration:read`, support cursor synchronization, and keep tenant/user scope without exposing passwords or MFA secrets.
+Security integrations can read credential-free users, roles, and permissions from `/api/integration/security/users`, `/roles`, and `/permissions`; feeds require `integration:read`, support cursor synchronization, and keep tenant/user scope without exposing passwords or MFA secrets. The user feed includes `store_id`; administrators can assign a user to an active store from the ERP user administration screen. Assigned users are restricted to that store's POS registers and cashier sessions, while users without a store assignment retain company/branch scope.
 
 Security integrations can synchronize tenant-scoped document revisions through `GET /api/integration/security/revisions` with optional `document_type`, `document_id`, `changed_since`, `per_page`, and signed `cursor_mode=1` filters. Use `GET /api/integration/security/revisions/{id}/diff` for the normalized field diff; both endpoints require `integration:read` and never expose credentials or attachment contents.
 They can close or reopen periods with `POST /api/accounting/fiscal-years/{id}/close` and `/reopen`; both require `accounting:write` or `integration:write`, close requires `close_reason`, close captures the fiscal-year-end inventory snapshot, reopen requires `reopen_reason`, and close is blocked while controlled documents remain pending.
@@ -736,3 +748,63 @@ Configure inventory plus inventory_revaluation_gain or inventory_revaluation_los
 Approved revaluation runs can be reversed through POST /api/inventory/valuation/revaluations/{id}/reverse with a required reason. The operation requires unchanged layer costs, restores the snapshotted costs, and reverses the linked journal when one was posted.
 
 Fiscal-period close now blocks when a pending inventory cost revaluation dated on or before the close date remains unresolved. Approve or reject the run before retrying period close.
+
+Browser POS store enforcement: assigned users see and submit only their assigned store, and stores with require_customer enabled reject anonymous POS invoices. The browser form now renders a store-aware tender selector and refreshes the allowed choices when the store changes; server-side allowed_tenders validation remains authoritative.
+
+Approved invoice print views now consume store POS receipt_footer and auto_print_receipt settings. Legacy invoices without a store or settings retain the existing print behavior.
+Store cash-variance tolerance is applied at POS session close: within-tolerance variances remain visible but do not create cash-over/short journals; larger variances follow mapped accounting or unmapped follow-up.
+Browser sales fulfillment now applies assigned user store scope to order creation, order/delivery lists, delivery creation, and order/delivery actions; users without a store assignment retain company behavior.
+
+
+API sales-order and delivery integration endpoints now apply assigned user store scope to duplicate-reference responses, order feeds, approvals, cancellations, delivery creation, approval, confirmation, and warehouse operations. Users without a store assignment retain company-level access.
+
+
+Planning execution now supports `POST /api/inventory/replenishment/purchase-orders/batch`, which converts up to 100 live replenishment proposals into approval-pending purchase orders with company/location validation, per-item failure reporting, and external-reference idempotency.
+
+
+Planning also supports `POST /api/inventory/replenishment/transfer-suggestions/create-transfers` for up to 100 live transfer suggestions, creating approval-pending internal transfers with location validation, partial-result reporting, and external-reference idempotency.
+
+
+Manufacturing planning also supports `POST /api/manufacturing/orders/from-suggestions/batch`, creating up to 100 approval-pending production orders from current BOM suggestions with component-capacity checks, BOM snapshotting, location validation, and external-reference idempotency.
+
+
+Warehouse pick execution also supports POST /api/integration/warehouse/pick-waves/from-pick-list. Supply warehouse_id and optionally location_id, date, sort_by, max_deliveries, wave_date, and external_reference. The endpoint selects pending deliveries using the same deterministic pick-list ordering, excludes deliveries already assigned to an active wave, creates a planned wave, records an audit event, and returns duplicate_ignored when the same company-scoped external reference is replayed. Use the existing release endpoint before submitting scanner quantities through the pick-list completion endpoint.
+
+
+Browser warehouse operators with warehouse.manage can use GET /warehouse/picking to review the optimized pending pick list and create a planned wave through the page. The screen applies company ownership and active-wave exclusion; it complements the integration endpoint at /api/integration/warehouse/pick-waves/from-pick-list.
+
+
+Dispatch manifests are available to warehouse integration clients through GET/POST /api/integration/dispatch/manifests, POST /api/integration/dispatch/manifests/{id}/handoff, POST /api/integration/dispatch/manifests/{id}/close, and POST /api/integration/dispatch/manifests/{id}/cancel. Manifest creation accepts only company-owned approved deliveries already marked dispatched; handoff records immutable picked_up tracking events per delivery and is replay-safe.
+
+
+Warehouse operators with warehouse.manage can use /warehouse/dispatch-manifests to select dispatched deliveries, create a manifest, hand it off to the carrier, close it, or cancel a planned manifest. Assigned-store users see only deliveries belonging to their store; company-wide warehouse users retain company scope.
+
+
+Dispatch-manifest API security note: users assigned to a store can only create, list, hand off, close, or cancel manifests whose deliveries belong to that store. Unassigned company users retain company-wide access.
+
+
+Carrier rate cards are synchronized through GET/POST/PATCH /api/integration/logistics/rate-cards and deactivated through POST /api/integration/logistics/rate-cards/{id}/deactivate. Warehouse clients can request POST /api/integration/logistics/rate-quotes with carrier/service, weight, origin/destination zones, and as-of date; matching active cards return calculated currency totals and transit days.
+
+
+Carrier quote usage: `POST /api/integration/logistics/rate-quotes` may receive `delivery_id` instead of `weight_kg` for a company-owned delivery. The endpoint derives kilograms from the delivery total or package weights and uses the delivery carrier when `carrier` is omitted; explicit request values override these defaults.
+
+
+Delivery carrier selection: after obtaining a rate quote, warehouse clients can call `POST /api/integration/deliveries/{id}/carrier-quote` with `rate_card_id`, optional `weight_kg`, zones, `as_of`, and an idempotent `external_reference`. The endpoint revalidates company/store ownership, delivery status, rate-card validity, weight bands, zones, and date, then snapshots the selected service and price on the delivery.
+
+
+Warehouse users with `warehouse.manage` can maintain carrier rate cards at `/warehouse/logistics/rate-cards`. The screen supports create, edit, and deactivation; API clients and delivery quote selection use the same company-scoped records.
+
+
+Dispatch manifests consume delivery carrier selections: manifest responses and the warehouse screen show each delivery's service code, quote amount/currency, and quoted weight. If the manifest carrier field is omitted, it defaults only when all selected deliveries use the same carrier; mixed-carrier selections remain unassigned at manifest level.
+
+
+Carrier webhooks: configure an encrypted `connection_config.webhook_secret` on the active carrier tracking provider, then send the exact JSON request body to `POST /api/public/carrier-tracking/{companyId}/{provider}` with `X-Carrier-Signature: sha256=<HMAC-SHA256 body signature>`. Payloads may be one event or an `events` array; duplicate external event references are acknowledged without duplicate ledger/lifecycle effects.
+
+
+Tax filing operations are available to users with `accounting.manage` at `/erp/accounting/tax-filings`. The screen filters company-owned snapshots, verifies integrity before export, supports manual filing-reference submission or configured provider submission, and records accepted/rejected decisions; tax filing creation remains available through the accounting integration API.
+
+
+The tax filing screen can create a snapshot for a date range and jurisdiction using the same tax-report calculation as the accounting API; external references make repeated browser creation safe and reuse the existing snapshot.
+
+
+Tax filing gateway configuration is available on the tax filing screen for `accounting.manage` users. The endpoint, encrypted token, timeout, and retry settings are stored through the same provider record used by API submissions; tokens are never displayed back.

@@ -10,7 +10,7 @@ class SalesOrder extends Model
 {
     use BelongsToCompany;
     protected $guarded = [];
-    protected $casts = ['date' => 'date', 'requested_date' => 'date', 'exchange_rate' => 'decimal:12', 'allow_backorders' => 'boolean', 'approved_at' => 'datetime', 'cancelled_at' => 'datetime', 'rejected_at' => 'datetime', 'promotion_ids' => 'array'];
+    protected $casts = ['date' => 'date', 'requested_date' => 'date', 'exchange_rate' => 'decimal:12', 'allow_backorders' => 'boolean', 'fulfillment_priority' => 'integer', 'approved_at' => 'datetime', 'cancelled_at' => 'datetime', 'rejected_at' => 'datetime', 'promotion_ids' => 'array'];
     public function customer() { return $this->belongsTo(Customer::class); }
     public function priceList() { return $this->belongsTo(PriceList::class); }
     public function store() { return $this->belongsTo(Store::class); }

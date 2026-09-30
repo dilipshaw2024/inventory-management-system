@@ -1,6 +1,6 @@
 @extends('admin.admin_master')
 @section('admin')
-<div class="container-fluid"><div class="row g-3 mb-3"><div class="col-md-3"><label class="form-label">Store</label><select id="invoice-store" class="form-select"><option value="">No store</option>@foreach($stores as $store)<option value="{{ $store->id }}" @selected(old('store_id') == $store->id)>{{ $store->name }} ({{ $store->branch->name }})</option>@endforeach</select></div></div></div>
+<div class="container-fluid"><div class="row g-3 mb-3"><div class="col-md-3"><label class="form-label">Store</label><select id="invoice-store" class="form-select"><option value="">No store</option>@foreach($stores as $store)<option value="{{ $store->id }}" data-tenders='@json(app(\App\Services\StorePosSettingsService::class)->allowedTenders($store))' @selected(old('store_id', (int) auth()->user()->store_id ?: null) == $store->id)>{{ $store->name }} ({{ $store->branch->name }})</option>@endforeach</select></div></div></div>
  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
 
 <div class="page-content">
@@ -145,6 +145,14 @@
             </div><br>
 
             <div class="row">
+                <div class="form-group col-md-3">
+                    <label> Payment Method </label>
+                    <select name="payment_method" id="payment_method" class="form-select">
+                        @foreach(\App\Services\StorePosSettingsService::TENDERS as $tender)
+                        <option value="{{ $tender }}" @selected(old('payment_method', 'cash') === $tender)>{{ ucfirst($tender) }}</option>
+                        @endforeach
+                    </select>
+                </div>
                 <div class="form-group col-md-3">
                     <label> Paid Status </label>
                     <select name="paid_status" id="paid_status" class="form-select">
@@ -411,5 +419,28 @@
 
  
 <script>document.addEventListener('DOMContentLoaded',function(){const taxMode=document.querySelector('select[name="tax_mode"]');if(taxMode && !@json(old('tax_mode'))) taxMode.value=@json($defaultTaxMode);});</script>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+    const storeSelect=document.getElementById('invoice-store');
+    const tenderSelect=document.getElementById('payment_method');
+    if(!storeSelect || !tenderSelect) return;
+    const allTenders=@json(\App\Services\StorePosSettingsService::TENDERS);
+    const refreshTenders=function(){
+        const selected=storeSelect.options[storeSelect.selectedIndex];
+        const tenders=selected && selected.dataset.tenders ? JSON.parse(selected.dataset.tenders) : allTenders;
+        const current=tenderSelect.value;
+        tenderSelect.innerHTML='';
+        tenders.forEach(function(tender){
+            const option=document.createElement('option');
+            option.value=tender;
+            option.textContent=tender.charAt(0).toUpperCase()+tender.slice(1);
+            tenderSelect.appendChild(option);
+        });
+        tenderSelect.value=tenders.includes(current) ? current : tenders[0];
+    };
+    storeSelect.addEventListener('change',refreshTenders);
+    refreshTenders();
+});
+</script>
 <script>document.querySelector('form[action="{{ route('invoice.store') }}"]').addEventListener('submit',function(){const input=document.createElement('input');input.type='hidden';input.name='store_id';input.value=document.getElementById('invoice-store').value;this.appendChild(input);});</script>
 @endsection

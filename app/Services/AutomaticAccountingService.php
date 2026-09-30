@@ -95,6 +95,60 @@ class AutomaticAccountingService
         ], $source ?? $movement);
     }
 
+    public function postStandardCostVariance(InventoryMovement $movement): ?\App\Models\JournalEntry
+    {
+        $movement->loadMissing('product', 'allocations');
+        $inbound = in_array((string) $movement->movement_type, ['receipt', 'opening', 'transfer_in', 'adjustment_in', 'return_in'], true);
+        $outbound = in_array((string) $movement->movement_type, ['issue', 'transfer_out', 'adjustment_out', 'scrap', 'return_out'], true);
+        if (!$inbound && !$outbound) return null;
+
+        $companyId = (int) ($movement->company_id ?: auth()->user()?->company_id ?: 0);
+        if (!$companyId || !$movement->product) return null;
+        $at = $movement->posted_at ?: now();
+        $policy = app(ProductCostingPolicyService::class)->resolve($movement->product, $at);
+        if (($policy['costing_method'] ?? null) !== 'standard' || $policy['standard_cost'] === null) return null;
+
+        $quantity = abs((float) $movement->quantity);
+        if ($quantity <= 0) return null;
+        $actual = $inbound
+            ? $quantity * (float) ($movement->unit_cost ?? 0)
+            : (float) $movement->allocations->sum(fn ($allocation): float => (float) $allocation->total_cost);
+        if ($outbound && $actual <= 0) $actual = $quantity * (float) ($movement->unit_cost ?? 0);
+        $standard = $quantity * (float) $policy['standard_cost'];
+        $variance = round($actual - $standard, 6);
+        if (abs($variance) <= 0.000001) return null;
+
+        $externalReference = 'STD-VARIANCE-MOVEMENT-'.$movement->id;
+        $existing = \App\Models\JournalEntry::where('company_id', $companyId)
+            ->where('external_reference', $externalReference)->first();
+        if ($existing) return $existing;
+
+        $inventory = $this->account('inventory', $companyId);
+        $varianceAccount = $this->account('inventory_standard_variance', $companyId);
+        if (!$inventory || !$varianceAccount) return null;
+
+        $amount = abs($variance);
+        $currency = $this->currency($companyId);
+        $dimensions = ['department_id' => $movement->department_id, 'cost_center_id' => $movement->cost_center_id];
+        $lines = $variance > 0
+            ? [
+                ['account_id' => $varianceAccount, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions,
+                ['account_id' => $inventory, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions,
+            ]
+            : [
+                ['account_id' => $inventory, 'debit' => $amount, 'credit' => 0, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions,
+                ['account_id' => $varianceAccount, 'debit' => 0, 'credit' => $amount, 'currency_code' => $currency, 'exchange_rate' => 1] + $dimensions,
+            ];
+
+        return app(AccountingService::class)->post([
+            'company_id' => $companyId,
+            'entry_no' => 'JE-'.strtoupper(bin2hex(random_bytes(6))),
+            'external_reference' => $externalReference,
+            'date' => optional($movement->posted_at)->toDateString() ?: now()->toDateString(),
+            'description' => 'Standard-cost variance settlement for movement '.$movement->id,
+        ], $lines, $movement);
+    }
+
     public function postTransferShortage(InventoryTransfer $transfer): void
     {
         $transfer->loadMissing('lines.product');

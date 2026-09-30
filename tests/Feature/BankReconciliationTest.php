@@ -161,6 +161,54 @@ class BankReconciliationTest extends TestCase
         $this->getJson('/api/accounting/bank-reconciliation/lines?provider=generic')->assertOk()->assertJsonPath('data.0.external_reference', 'BANK-FEED-1');
     }
 
+    public function test_signed_bank_statement_webhook_is_tenant_scoped_and_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Webhook Bank Co', 'code' => 'BANK-WEBHOOK']);
+        $otherCompany = Company::create(['name' => 'Other Webhook Bank Co', 'code' => 'OTHER-WEBHOOK']);
+        $account = BankAccount::create([
+            'company_id' => $company->id, 'name' => 'Webhook account', 'currency_code' => 'USD',
+            'provider' => 'generic', 'connection_config' => ['webhook_secret' => 'webhook-secret-123456'],
+            'is_active' => true,
+        ]);
+        $otherAccount = BankAccount::create([
+            'company_id' => $otherCompany->id, 'name' => 'Other webhook account', 'currency_code' => 'USD',
+            'provider' => 'generic', 'connection_config' => ['webhook_secret' => 'other-secret-123456'],
+            'is_active' => true,
+        ]);
+
+        $payload = ['lines' => [[
+            'account_id' => $account->id, 'date' => '2026-09-25', 'amount' => -75.25,
+            'transaction_id' => 'WEBHOOK-1', 'narration' => 'Provider feed',
+        ]]];
+        $body = json_encode($payload, JSON_THROW_ON_ERROR);
+        $signature = hash_hmac('sha256', $body, 'webhook-secret-123456');
+
+        $created = $this->call('POST', '/api/public/bank-statements/'.$company->id.'/generic', [], [], [], [
+            'CONTENT_TYPE' => 'application/json', 'HTTP_X_BANK_SIGNATURE' => 'sha256='.$signature,
+        ], $body);
+        $created->assertCreated()->assertJsonPath('created', 1)->assertJsonPath('duplicates', 0);
+        $this->assertDatabaseHas('bank_statement_import_batches', ['source' => 'webhook', 'created_lines' => 1]);
+        $this->assertDatabaseHas('bank_statement_lines', ['provider' => 'generic', 'external_reference' => 'WEBHOOK-1', 'company_id' => $company->id]);
+
+        $duplicate = $this->call('POST', '/api/public/bank-statements/'.$company->id.'/generic', [], [], [], [
+            'CONTENT_TYPE' => 'application/json', 'HTTP_X_BANK_SIGNATURE' => $signature,
+        ], $body);
+        $duplicate->assertCreated()->assertJsonPath('created', 0)->assertJsonPath('duplicates', 1);
+
+        $this->call('POST', '/api/public/bank-statements/'.$company->id.'/generic', [], [], [], [
+            'CONTENT_TYPE' => 'application/json', 'HTTP_X_BANK_SIGNATURE' => hash_hmac('sha256', $body, 'wrong-secret'),
+        ], $body)->assertUnauthorized();
+
+        $crossTenantBody = json_encode(['lines' => [[
+            'account_id' => $otherAccount->id, 'date' => '2026-09-25', 'amount' => 10, 'transaction_id' => 'CROSS-TENANT',
+        ]]], JSON_THROW_ON_ERROR);
+        $crossTenantSignature = hash_hmac('sha256', $crossTenantBody, 'webhook-secret-123456');
+        $this->call('POST', '/api/public/bank-statements/'.$company->id.'/generic', [], [], [], [
+            'CONTENT_TYPE' => 'application/json', 'HTTP_X_BANK_SIGNATURE' => $crossTenantSignature,
+        ], $crossTenantBody)->assertNotFound();
+        $this->assertDatabaseMissing('bank_statement_lines', ['external_reference' => 'CROSS-TENANT']);
+    }
+
     public function test_bank_provider_bulk_import_is_atomic_and_reports_duplicates(): void
     {
         $company = Company::create(['name' => 'Bulk Bank Feed Co', 'code' => 'BULK-BANK-FEED']);

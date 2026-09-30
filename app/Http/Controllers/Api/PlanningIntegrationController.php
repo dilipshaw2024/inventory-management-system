@@ -309,6 +309,65 @@ class PlanningIntegrationController extends Controller
         return response()->json(['data' => $transfer->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation'), 'status' => 'pending_approval', 'approval_required' => true], 201);
     }
 
+    public function createTransfersFromSuggestions(Request $request, TransferReplenishmentService $transfers): JsonResponse
+    {
+        $data = $request->validate([
+            'items' => ['required', 'array', 'min:1', 'max:100'],
+            'items.*.external_reference' => ['nullable', 'string', 'max:150'],
+            'items.*.product_id' => ['required', 'integer'],
+            'items.*.source_location_id' => ['required', 'integer'],
+            'items.*.destination_location_id' => ['required', 'integer'],
+            'items.*.quantity' => ['required', 'numeric', 'gt:0'],
+            'items.*.expected_arrival' => ['nullable', 'date'],
+            'items.*.description' => ['nullable', 'string', 'max:2000'],
+        ]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for transfer replenishment.');
+
+        $results = [];
+        foreach ($data['items'] as $item) {
+            try {
+                $this->assertOwnedProduct((int) $item['product_id'], $companyId);
+                if ((int) $item['source_location_id'] === (int) $item['destination_location_id']) throw new \RuntimeException('Source and destination locations must be different.');
+                $this->assertOwnedLocation((int) $item['source_location_id'], $companyId);
+                $this->assertOwnedLocation((int) $item['destination_location_id'], $companyId);
+                if (!empty($item['external_reference'])) {
+                    $existing = InventoryTransfer::where('company_id', $companyId)->where('external_reference', $item['external_reference'])->first();
+                    if ($existing) {
+                        $results[] = ['external_reference' => $item['external_reference'], 'status' => 'duplicate_ignored', 'data' => $existing->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation')];
+                        continue;
+                    }
+                }
+                $suggestion = $transfers->suggestionsForCompany($companyId, (int) $item['product_id'])
+                    ->first(fn (array $row): bool => (int) $row['source_location_id'] === (int) $item['source_location_id']
+                        && (int) $row['destination_location_id'] === (int) $item['destination_location_id']);
+                if (!$suggestion || (float) $item['quantity'] > (float) $suggestion['quantity'] + 0.000001) {
+                    throw new \RuntimeException('The requested transfer exceeds the current replenishment suggestion. Refresh the suggestion and try again.');
+                }
+                $transfer = $transfers->createPendingTransfer($suggestion, $companyId, $request->user()?->id, $item['external_reference'] ?? null, $item['expected_arrival'] ?? null, $item['description'] ?? null);
+                $results[] = [
+                    'external_reference' => $item['external_reference'] ?? null,
+                    'status' => 'pending_approval',
+                    'data' => $transfer->load('lines.product', 'lines.sourceLocation', 'lines.destinationLocation'),
+                ];
+            } catch (\RuntimeException|\Illuminate\Http\Exceptions\HttpResponseException $exception) {
+                $results[] = [
+                    'external_reference' => $item['external_reference'] ?? null,
+                    'status' => 'failed',
+                    'message' => $exception instanceof \Illuminate\Http\Exceptions\HttpResponseException
+                        ? 'The item is not authorized for this company.'
+                        : $exception->getMessage(),
+                ];
+            }
+        }
+
+        $failed = collect($results)->where('status', 'failed')->count();
+        $created = collect($results)->where('status', 'pending_approval')->count();
+        $status = $failed > 0 ? ($created > 0 ? 'partial' : 'failed') : ($created > 0 ? 'completed' : 'duplicate_ignored');
+        $httpStatus = $failed > 0 && $created > 0 ? 207 : ($failed > 0 ? 422 : ($created > 0 ? 201 : 200));
+        return response()->json(['data' => $results, 'status' => $status, 'summary' => ['requested' => count($data['items']), 'created' => $created, 'duplicates' => collect($results)->where('status', 'duplicate_ignored')->count(), 'failed' => $failed]], $httpStatus);
+    }
+
     public function createPurchaseOrderFromSuggestion(Request $request, ReplenishmentPurchaseOrderService $purchaseOrders): JsonResponse
     {
         $data = $request->validate([
@@ -341,5 +400,55 @@ class PlanningIntegrationController extends Controller
         } catch (\RuntimeException $exception) {
             return response()->json(['message' => $exception->getMessage()], 422);
         }
+    }
+
+    public function createPurchaseOrdersFromSuggestions(Request $request, ReplenishmentPurchaseOrderService $purchaseOrders): JsonResponse
+    {
+        $data = $request->validate([
+            'items' => ['required', 'array', 'min:1', 'max:100'],
+            'items.*.external_reference' => ['nullable', 'string', 'max:150'],
+            'items.*.product_id' => ['required', 'integer'],
+            'items.*.location_id' => ['nullable', 'integer'],
+            'items.*.quantity' => ['nullable', 'numeric', 'gt:0'],
+            'items.*.description' => ['nullable', 'string', 'max:2000'],
+        ]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for purchase replenishment.');
+
+        $results = [];
+        foreach ($data['items'] as $item) {
+            try {
+                $this->assertOwnedProduct((int) $item['product_id'], $companyId);
+                if (!empty($item['location_id'])) $this->assertOwnedLocation((int) $item['location_id'], $companyId);
+                $result = $purchaseOrders->createDraft(
+                    $companyId,
+                    (int) $item['product_id'],
+                    isset($item['location_id']) ? (int) $item['location_id'] : null,
+                    isset($item['quantity']) ? (float) $item['quantity'] : null,
+                    $item['external_reference'] ?? null,
+                    $request->user()?->id,
+                    $item['description'] ?? null
+                );
+                $results[] = [
+                    'external_reference' => $item['external_reference'] ?? null,
+                    'status' => $result['duplicate'] ? 'duplicate_ignored' : 'pending_approval',
+                    'data' => $result['order'],
+                ];
+            } catch (\RuntimeException|\Illuminate\Http\Exceptions\HttpResponseException $exception) {
+                $results[] = [
+                    'external_reference' => $item['external_reference'] ?? null,
+                    'status' => 'failed',
+                    'message' => $exception instanceof \Illuminate\Http\Exceptions\HttpResponseException
+                        ? 'The item is not authorized for this company.'
+                        : $exception->getMessage(),
+                ];
+            }
+        }
+
+        $failed = collect($results)->where('status', 'failed')->count();
+        $created = collect($results)->where('status', 'pending_approval')->count();
+        $status = $failed > 0 ? ($created > 0 ? 'partial' : 'failed') : ($created > 0 ? 'completed' : 'duplicate_ignored');
+        $httpStatus = $failed > 0 && $created > 0 ? 207 : ($failed > 0 ? 422 : ($created > 0 ? 201 : 200));
+        return response()->json(['data' => $results, 'status' => $status, 'summary' => ['requested' => count($data['items']), 'created' => $created, 'duplicates' => collect($results)->where('status', 'duplicate_ignored')->count(), 'failed' => $failed]], $httpStatus);
     }
 }

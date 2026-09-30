@@ -245,8 +245,8 @@ class ManufacturingController extends Controller
 
     public function complete(Request $request, int $id)
     {
-        $data = $request->validate(['produced_quantity' => ['nullable', 'numeric', 'gt:0']]);
-        try { $order = app(ProductionService::class)->complete($id, isset($data['produced_quantity']) ? (float) $data['produced_quantity'] : null); return back()->with(['message' => $order->status === 'completed' ? 'Production order completed and stock posted.' : 'Partial production received and order remains in progress.', 'alert-type' => 'success']); }
+        $data = $request->validate(['produced_quantity' => ['nullable', 'numeric', 'gt:0'], 'external_reference' => ['nullable', 'string', 'max:150'], 'output_batch_no' => ['nullable', 'string', 'max:100'], 'output_serial_numbers' => ['nullable', 'string', 'max:10000'], 'output_manufacturing_date' => ['nullable', 'date'], 'output_expiry_date' => ['nullable', 'date'], 'output_best_before_date' => ['nullable', 'date'], 'output_warranty_until' => ['nullable', 'date']]);
+        try { $order = app(ProductionService::class)->complete($id, isset($data['produced_quantity']) ? (float) $data['produced_quantity'] : null, collect(['external_reference', 'output_batch_no', 'output_serial_numbers', 'output_manufacturing_date', 'output_expiry_date', 'output_best_before_date', 'output_warranty_until'])->filter(fn (string $key): bool => array_key_exists($key, $data))->mapWithKeys(fn (string $key): array => [$key => $data[$key]])->all()); return back()->with(['message' => $order->status === 'completed' ? 'Production order completed and stock posted.' : 'Partial production received and order remains in progress.', 'alert-type' => 'success']); }
         catch (\Throwable $e) { return back()->withErrors(['production' => $e->getMessage()]); }
     }
 

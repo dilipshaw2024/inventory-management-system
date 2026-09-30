@@ -76,6 +76,15 @@ class SecurityIntegrationController extends Controller
         ]]);
     }
 
+
+    public function restorePreview(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for revision restoration.');
+        $revision = DocumentRevision::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($id);
+        return response()->json(['data' => app(RevisionRestoreService::class)->preview($revision, $companyId)]);
+    }
+
     public function restoreRevision(Request $request, int $id): JsonResponse
     {
         $data = $request->validate(['reason' => ['required', 'string', 'max:500']]);
@@ -90,8 +99,8 @@ class SecurityIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         $data = $request->validate(['is_active' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $users = User::query()->select(['id', 'name', 'username', 'email', 'company_id', 'branch_id', 'department_id', 'is_active', 'email_verified_at', 'created_at', 'updated_at'])
-            ->with(['roles:id,name,code,is_active'])
+        $users = User::query()->select(['id', 'name', 'username', 'email', 'company_id', 'branch_id', 'store_id', 'department_id', 'is_active', 'email_verified_at', 'created_at', 'updated_at'])
+            ->with(['roles:id,name,code,is_active', 'store:id,name,code,branch_id'])
             ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
             ->when(array_key_exists('is_active', $data), fn ($query) => $query->where('is_active', (bool) $data['is_active']))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))

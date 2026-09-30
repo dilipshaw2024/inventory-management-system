@@ -13,6 +13,7 @@ use App\Models\SalesOrderLine;
 use App\Models\Customer;
 use App\Models\PriceList;
 use App\Models\Store;
+use App\Models\PosSession;
 use App\Models\Delivery;
 use App\Models\DeliveryLine;
 use App\Models\DeliveryOperation;
@@ -42,6 +43,7 @@ use App\Models\ProductionOrder;
 use App\Models\FiscalPeriod;
 use App\Models\JournalEntry;
 use App\Services\AuditService;
+use App\Services\StorePosSettingsService;
 use App\Services\InventoryAvailabilityService;
 use App\Services\IntegrationCursorService;
 use App\Services\NumberingSequenceService;
@@ -60,6 +62,7 @@ use App\Services\TaxRateResolver;
 use App\Services\CurrencyConversionService;
 use App\Services\AutomaticAccountingService;
 use App\Services\InventoryCostingService;
+use App\Services\StandardCostVarianceService;
 use App\Services\InventoryCostRevaluationService;
 use App\Services\InventoryPeriodValuationService;
 use App\Models\Payment;
@@ -83,11 +86,15 @@ class InventoryIntegrationController extends Controller
             'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'],
             'lines.*.batch_no' => ['nullable', 'string', 'max:100'], 'lines.*.serial_numbers' => ['nullable', 'string', 'max:5000'],
         ]);
+        $assignedStoreId = $request->user()?->store_id ? (int) $request->user()->store_id : null;
         if (!empty($data['external_reference'])) {
-            $existing = $this->companyScope(Delivery::query(), $companyId)->where('external_reference', $data['external_reference'])->first();
+            $existing = $this->companyScope(Delivery::query(), $companyId)
+                ->when($assignedStoreId !== null, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', $assignedStoreId)))
+                ->where('external_reference', $data['external_reference'])->first();
             if ($existing) return response()->json(['data' => $existing->load('salesOrder', 'lines.product'), 'status' => 'duplicate_ignored']);
         }
         $order = $this->companyScope(SalesOrder::with('lines.product'), $companyId)->findOrFail($data['sales_order_id']);
+        if ($assignedStoreId !== null && (int) $order->store_id !== $assignedStoreId) abort(403, 'This user is assigned to a different store.');
         if (!in_array($order->status, ['approved', 'partially_delivered'], true)) abort(422, 'Deliveries require an approved or partially delivered sales order.');
         if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
         if ($order->location_id && !empty($data['location_id']) && (int) $order->location_id !== (int) $data['location_id']) abort(422, 'Delivery location must match the sales-order fulfillment location.');
@@ -120,7 +127,7 @@ class InventoryIntegrationController extends Controller
     {
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(Delivery::class, $id);
         $delivery = DB::transaction(function () use ($id): Delivery {
-            $delivery = $this->companyScope(Delivery::with(['lines.salesOrderLine', 'lines.product', 'salesOrder']), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+            $delivery = $this->companyScope(Delivery::with(['lines.salesOrderLine', 'lines.product', 'salesOrder']), auth()->user()?->company_id)->when((int) auth()->user()->store_id > 0, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', (int) auth()->user()->store_id)))->lockForUpdate()->findOrFail($id);
             if ($delivery->status !== 'pending' || ($delivery->fulfillment_status ?: 'pending') !== 'pending') throw new \RuntimeException('This delivery has already been processed.');
             if ($delivery->salesOrder->location_id && (int) $delivery->salesOrder->location_id !== (int) $delivery->location_id) throw new \RuntimeException('Delivery location does not match the sales-order fulfillment location.');
             app(\App\Services\ApprovalGuard::class)->assertDifferent($delivery);
@@ -173,7 +180,7 @@ class InventoryIntegrationController extends Controller
     {
         $data = $request->validate(['proof_of_delivery' => ['nullable', 'string', 'max:255'], 'delivered_at' => ['nullable', 'date']]);
         $delivery = DB::transaction(function () use ($data, $id): Delivery {
-            $delivery = $this->companyScope(Delivery::with('operations'), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+            $delivery = $this->companyScope(Delivery::with('operations'), auth()->user()?->company_id)->when((int) auth()->user()->store_id > 0, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', (int) auth()->user()->store_id)))->lockForUpdate()->findOrFail($id);
             if ($delivery->fulfillment_status === 'cancelled' || $delivery->status !== 'approved' || !$delivery->operations->firstWhere('operation_type', 'dispatch')) {
                 throw new \RuntimeException('Only dispatched deliveries can be marked delivered.');
             }
@@ -203,7 +210,7 @@ class InventoryIntegrationController extends Controller
 
         try {
             $operation = DB::transaction(function () use ($request, $id, $type, $data): DeliveryOperation {
-                $delivery = $this->companyScope(Delivery::with(['lines.product', 'operations']), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                $delivery = $this->companyScope(Delivery::with(['lines.product', 'operations']), auth()->user()?->company_id)->when((int) auth()->user()->store_id > 0, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', (int) auth()->user()->store_id)))->lockForUpdate()->findOrFail($id);
                 $operation = app(WarehouseFulfillmentService::class)->complete(
                     $delivery,
                     $type,
@@ -235,18 +242,25 @@ class InventoryIntegrationController extends Controller
             'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'sales'))],
             'location_id' => ['nullable', 'integer'], 'date' => ['required', 'date'], 'requested_date' => ['nullable', 'date', 'after_or_equal:date'],
             'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'],
-            'allow_backorders' => ['nullable', 'boolean'], 'description' => ['nullable', 'string', 'max:2000'], 'promotion_code' => ['nullable', 'string', 'max:80'], 'promotion_codes' => ['nullable', 'array', 'max:10'], 'promotion_codes.*' => ['string', 'max:80', 'distinct'],
+            'allow_backorders' => ['nullable', 'boolean'], 'fulfillment_priority' => ['nullable', 'integer', 'min:0', 'max:100'], 'description' => ['nullable', 'string', 'max:2000'], 'promotion_code' => ['nullable', 'string', 'max:80'], 'promotion_codes' => ['nullable', 'array', 'max:10'], 'promotion_codes.*' => ['string', 'max:80', 'distinct'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')],
             'lines.*.batch_id' => ['nullable', 'integer'],
             'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
             'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'], 'lines.*.discount_amount' => ['nullable', 'numeric', 'min:0'],
         ]);
+        $assignedStoreId = $request->user()?->store_id ? (int) $request->user()->store_id : null;
         if (!empty($data['external_reference'])) {
-            $existing = $this->companyScope(SalesOrder::query(), $companyId)->where('external_reference', $data['external_reference'])->first();
+            $existing = $this->companyScope(SalesOrder::query(), $companyId)
+                ->when($assignedStoreId !== null, fn ($query) => $query->where('store_id', $assignedStoreId))
+                ->where('external_reference', $data['external_reference'])->first();
             if ($existing) return response()->json(['data' => $existing->load('customer', 'lines.product'), 'status' => 'duplicate_ignored']);
         }
         $customer = $this->companyScope(Customer::query(), $companyId)->findOrFail($data['customer_id']);
+        if ($assignedStoreId !== null && empty($data['store_id'])) $data['store_id'] = $assignedStoreId;
+        if ($assignedStoreId !== null && (int) $data['store_id'] !== $assignedStoreId) abort(403, 'This user is assigned to a different store.');
         $store = !empty($data['store_id']) ? $this->companyScope(Store::query(), $companyId)->findOrFail($data['store_id']) : null;
+        $paymentMethod = $data['payment_method'] ?? 'cash';
+        if ($store && ($data['paid_status'] !== 'full_due' || array_key_exists('payment_method', $data)) && !in_array($paymentMethod, app(StorePosSettingsService::class)->allowedTenders($store), true)) abort(422, 'The selected payment method is not enabled for this store.');
         if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
         $promotionCodes = $data['promotion_codes'] ?? ($promotionCode ? [$promotionCode] : []);
         $priceList = !empty($data['price_list_id']) ? PriceList::where('company_id', $companyId)->where('list_type', 'sales')->findOrFail($data['price_list_id']) : null;
@@ -258,7 +272,7 @@ class InventoryIntegrationController extends Controller
                 'price_list_id' => $priceList?->id,
                 'store_id' => $store?->id, 'location_id' => $data['location_id'] ?? null, 'date' => $data['date'],
                 'requested_date' => $data['requested_date'] ?? null, 'description' => $data['description'] ?? null,
-                'allow_backorders' => $data['allow_backorders'] ?? false, 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')),
+                'allow_backorders' => $data['allow_backorders'] ?? false, 'fulfillment_priority' => $data['fulfillment_priority'] ?? 50, 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')),
                 'exchange_rate' => $data['exchange_rate'] ?? 1, 'order_no' => app(NumberingSequenceService::class)->nextOrFallback('sales_order', 'SO-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
                 'status' => 'submitted', 'created_by' => $request->user()?->id,
             ]);
@@ -290,11 +304,15 @@ class InventoryIntegrationController extends Controller
     public function approveSalesOrder(int $id): JsonResponse
     {
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(SalesOrder::class, $id);
-        $pendingOrder = $this->companyScope(SalesOrder::with('lines'), auth()->user()?->company_id)->findOrFail($id);
+        $pendingOrder = $this->companyScope(SalesOrder::with('lines'), auth()->user()?->company_id)
+            ->when((int) auth()->user()->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->findOrFail($id);
         try { app(\App\Services\SalesDiscountPolicyService::class)->assertCanApprove($pendingOrder); }
         catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
         $order = DB::transaction(function () use ($id): SalesOrder {
-            $order = $this->companyScope(SalesOrder::with(['lines', 'customer']), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+            $order = $this->companyScope(SalesOrder::with(['lines', 'customer']), auth()->user()?->company_id)
+                ->when((int) auth()->user()->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+                ->lockForUpdate()->findOrFail($id);
             if ($order->status !== 'submitted') throw new \RuntimeException('Only submitted sales orders can be approved.');
             app(\App\Services\ApprovalGuard::class)->assertDifferent($order);
             foreach ($order->lines as $line) app(ProductLifecycleService::class)->assertSellable($line->product);
@@ -313,7 +331,9 @@ class InventoryIntegrationController extends Controller
     {
         $data = $request->validate(['cancellation_reason' => ['required', 'string', 'max:2000']]);
         $order = DB::transaction(function () use ($id, $data): SalesOrder {
-            $order = $this->companyScope(SalesOrder::with('lines'), auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+            $order = $this->companyScope(SalesOrder::with('lines'), auth()->user()?->company_id)
+                ->when((int) auth()->user()->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+                ->lockForUpdate()->findOrFail($id);
             if ($order->status === 'cancelled') throw new \RuntimeException('This sales order has already been cancelled.');
             if ($order->status === 'delivered') throw new \RuntimeException('Fully delivered orders cannot be cancelled; use a return workflow.');
             if (!in_array($order->status, ['submitted', 'approved', 'partially_delivered'], true)) throw new \RuntimeException('Only submitted or open sales orders can be cancelled.');
@@ -481,6 +501,61 @@ class InventoryIntegrationController extends Controller
         $period = FiscalPeriod::where('company_id', $companyId)->findOrFail($data['fiscal_period_id']);
         $result = $valuation->drilldown($period, $data);
         return response()->json($result + ['period' => ['id' => $period->id, 'name' => $period->name, 'starts_on' => $period->starts_on?->toDateString(), 'ends_on' => $period->ends_on?->toDateString(), 'status' => $period->status]]);
+    }
+
+    public function standardCostVariance(Request $request, StandardCostVarianceService $varianceService): JsonResponse
+    {
+        $data = $request->validate([
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'product_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for standard-cost variance reporting.');
+        if (!empty($data['product_id']) && !$this->companyScope(Product::query(), $companyId)->whereKey($data['product_id'])->exists()) abort(422, 'Product is not authorized for this company.');
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
+
+        $report = $varianceService->report($companyId, $data['from'] ?? null, $data['to'] ?? null, $data['product_id'] ?? null, $data['location_id'] ?? null);
+        $perPage = (int) ($data['per_page'] ?? 50);
+        $page = max(1, (int) $request->input('page', 1));
+        $rows = $report['data'];
+        return response()->json([
+            'data' => $rows->forPage($page, $perPage)->values(),
+            'summary' => $report['summary'],
+            'meta' => [
+                'from' => $data['from'] ?? null, 'to' => $data['to'] ?? null,
+                'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(),
+                'last_page' => max(1, (int) ceil($rows->count() / $perPage)), 'read_only' => true,
+            ],
+        ]);
+    }
+
+    public function postStandardCostVariance(Request $request): JsonResponse
+    {
+        $data = $request->validate(['movement_id' => ['required', 'integer']]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for standard-cost variance posting.');
+
+        $movement = $this->companyScope(InventoryMovement::with(['product', 'allocations']), $companyId)->findOrFail($data['movement_id']);
+        $journal = app(AutomaticAccountingService::class)->postStandardCostVariance($movement);
+        if (!$journal) {
+            $mapping = \App\Models\AccountMapping::where('mapping_key', 'inventory_standard_variance')
+                ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+                ->exists();
+            return response()->json([
+                'status' => $mapping ? 'no_variance' : 'missing_mapping',
+                'data' => null,
+                'meta' => ['read_only' => false, 'movement_id' => $movement->id],
+            ], $mapping ? 200 : 422);
+        }
+
+        return response()->json([
+            'status' => $journal->wasRecentlyCreated ? 'posted' : 'duplicate_ignored',
+            'data' => $journal->load('lines'),
+            'meta' => ['read_only' => false, 'movement_id' => $movement->id, 'idempotent' => true],
+        ], $journal->wasRecentlyCreated ? 201 : 200);
     }
 
     public function revaluationPreview(Request $request, InventoryCostingService $costing): JsonResponse
@@ -1442,6 +1517,7 @@ class InventoryIntegrationController extends Controller
     public function salesOrders(Request $request): JsonResponse
     {
         $orders = $this->companyScope(SalesOrder::with(['customer', 'promotion', 'lines.product']), $request->user()?->company_id)
+            ->when((int) $request->user()->store_id > 0, fn ($query) => $query->where('store_id', (int) $request->user()->store_id))
             ->when($request->input('status'), fn ($query, $status) => $query->where('status', $status))
             ->when($request->has('updated_since'), fn ($query) => $query->where('updated_at', '>=', $request->date('updated_since')))
             ->orderBy('updated_at')->orderBy('id');
@@ -1486,7 +1562,7 @@ class InventoryIntegrationController extends Controller
             'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
-        $deliveries = $this->companyScope(Delivery::with(['salesOrder.customer', 'location', 'lines.product', 'operations', 'packages.lines.product']), $request->user()?->company_id)
+        $deliveries = $this->companyScope(Delivery::with(['salesOrder.customer', 'location', 'lines.product', 'operations', 'packages.lines.product']), $request->user()?->company_id)->when((int) $request->user()->store_id > 0, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', (int) $request->user()->store_id)))
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where(fn ($scope) => $scope->where('fulfillment_status', $status)->orWhere('status', $status)))
             ->when($data['order_status'] ?? null, fn ($query, $status) => $query->whereHas('salesOrder', fn ($order) => $order->where('status', $status)))
             ->when($data['package_status'] ?? null, fn ($query, $status) => $query->whereHas('packages', fn ($package) => $package->where('status', $status)))
@@ -1524,7 +1600,7 @@ class InventoryIntegrationController extends Controller
             'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'],
             'tax_mode' => ['nullable', 'in:exclusive,inclusive'], 'discount_amount' => ['nullable', 'numeric', 'min:0'],
             'promotion_code' => ['nullable', 'string', 'max:80'], 'promotion_codes' => ['nullable', 'array', 'max:10'], 'promotion_codes.*' => ['string', 'max:80', 'distinct'],
-            'paid_status' => ['required', 'in:full_paid,full_due,partial_paid'], 'paid_amount' => ['nullable', 'numeric', 'min:0'],
+            'paid_status' => ['required', 'in:full_paid,full_due,partial_paid'], 'paid_amount' => ['nullable', 'numeric', 'min:0'], 'payment_method' => ['nullable', 'in:cash,card,bank,transfer,other'],
             'description' => ['nullable', 'string', 'max:2000'], 'lines' => ['required', 'array', 'min:1'],
             'lines.*.product_id' => ['required', 'integer', $owned('products')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
             'lines.*.unit_price' => ['required', 'numeric', 'min:0'], 'lines.*.batch_no' => ['nullable', 'string', 'max:100'],
@@ -1539,6 +1615,12 @@ class InventoryIntegrationController extends Controller
         }
         $customer = $this->companyScope(Customer::query(), $companyId)->findOrFail($data['customer_id']);
         $store = !empty($data['store_id']) ? $this->companyScope(Store::query(), $companyId)->findOrFail($data['store_id']) : null;
+        $posSession = null;
+        if (!empty($data['pos_session_id'])) {
+            $posSession = PosSession::with('register')->where('company_id', $companyId)->findOrFail($data['pos_session_id']);
+            if ($posSession->status !== 'open') abort(422, 'The POS session must be open for new sales.');
+            if (!$store || (int) $posSession->register?->store_id !== (int) $store->id) abort(422, 'The POS session register must belong to the selected store.');
+        }
         $billingContact = !empty($data['billing_contact_id'])
             ? CustomerContact::where('customer_id', $customer->id)->whereKey($data['billing_contact_id'])->where('contact_type', 'billing')->firstOrFail()
             : null;
@@ -1552,7 +1634,7 @@ class InventoryIntegrationController extends Controller
         $taxMode = $data['tax_mode'] ?? app(\App\Services\ErpSettingService::class)->get('default_tax_mode', 'exclusive');
         $taxExempt = (bool) $customer->tax_exempt;
         $promotionCodes = $data['promotion_codes'] ?? (!empty($data['promotion_code']) ? [$data['promotion_code']] : []);
-        $invoice = DB::transaction(function () use ($data, $companyId, $customer, $store, $currency, $exchangeRate, $taxMode, $taxExempt, $billingAddress, $shippingAddress, $request, $promotionCodes): Invoice {
+        $invoice = DB::transaction(function () use ($data, $companyId, $customer, $store, $posSession, $currency, $exchangeRate, $taxMode, $taxExempt, $billingAddress, $shippingAddress, $request, $promotionCodes): Invoice {
             $invoice = Invoice::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
                 'invoice_no' => app(NumberingSequenceService::class)->nextOrFallback('sales_invoice', 'INV-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
@@ -1601,8 +1683,8 @@ class InventoryIntegrationController extends Controller
             if ($paid > $total + 0.000001) throw new \RuntimeException('Paid amount cannot exceed the invoice total.');
             $invoice->update(['subtotal_amount' => $netSubtotal, 'tax_amount' => $taxTotal, 'total_amount' => $total, 'promotion_id' => $promotionResult['promotion']?->id, 'promotion_ids' => collect($promotionResult['promotions'])->pluck('id')->values()->all()]);
             Payment::create([
-                'invoice_id' => $invoice->id, 'customer_id' => $customer->id, 'payment_date' => $data['date'], 'currency_code' => $currency, 'exchange_rate' => $exchangeRate,
-                'paid_status' => $data['paid_status'], 'discount_amount' => $discount, 'total_amount' => $total,
+                'invoice_id' => $invoice->id, 'pos_session_id' => $posSession?->id, 'customer_id' => $customer->id, 'payment_date' => $data['date'], 'currency_code' => $currency, 'exchange_rate' => $exchangeRate,
+                'paid_status' => $data['paid_status'], 'method' => $data['payment_method'] ?? 'cash', 'discount_amount' => $discount, 'total_amount' => $total,
                 'paid_amount' => $paid, 'due_amount' => $total - $paid, 'base_amount' => $paid * (float) ($exchangeRate ?: 1),
             ]);
             app(AuditService::class)->record('invoice.created', $invoice, null, array_merge($invoice->toArray(), ['lines' => $auditLines]));

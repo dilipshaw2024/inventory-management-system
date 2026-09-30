@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\InventoryLocation;
 use App\Models\InventoryMovement;
+use App\Models\WarehouseUtilizationSnapshot;
 use App\Models\InventoryTransfer;
 use App\Models\InventoryTransferLine;
 use App\Models\InventoryTransferSerial;
@@ -270,6 +271,119 @@ class WarehouseIntegrationController extends Controller
         return response()->json(['data' => $this->wavePayload($wave->load(['warehouse', 'deliveries.location', 'deliveries.operations'])), 'status' => 'created'], 201);
     }
 
+    public function createPickWaveFromPickList(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'warehouse_id' => ['required', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'date' => ['nullable', 'date'],
+            'sort_by' => ['nullable', 'in:location,product,delivery_date'],
+            'max_deliveries' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'wave_date' => ['nullable', 'date'],
+            'external_reference' => ['nullable', 'string', 'max:150'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse wave picking.');
+
+        if (!empty($data['external_reference'])) {
+            $existing = PickWave::where('company_id', $companyId)
+                ->where('external_reference', $data['external_reference'])
+                ->first();
+            if ($existing) {
+                return response()->json([
+                    'data' => $this->wavePayload($existing->load(['warehouse', 'deliveries.location', 'deliveries.operations'])),
+                    'status' => 'duplicate_ignored',
+                ]);
+            }
+        }
+
+        try {
+            $result = DB::transaction(function () use ($data, $companyId, $request): array {
+                $warehouse = Warehouse::whereKey($data['warehouse_id'])
+                    ->whereHas('branch', fn ($query) => $query->where('company_id', $companyId))
+                    ->firstOrFail();
+
+                $sortBy = $data['sort_by'] ?? 'location';
+                $deliveries = Delivery::with(['lines.product', 'location.warehouse', 'operations'])
+                    ->where('company_id', $companyId)
+                    ->where('status', 'pending')
+                    ->where(fn ($query) => $query->whereNull('fulfillment_status')->orWhere('fulfillment_status', 'pending'))
+                    ->whereDoesntHave('operations', fn ($query) => $query->where('operation_type', 'pick')->where('status', 'completed'))
+                    ->whereHas('location', fn ($query) => $query->where('warehouse_id', $warehouse->id))
+                    ->when($data['location_id'] ?? null, fn ($query, $id) => $query->where('location_id', $id))
+                    ->when($data['date'] ?? null, fn ($query, $date) => $query->whereDate('date', $date))
+                    ->whereDoesntHave('pickWaves', fn ($query) => $query->whereIn('pick_waves.status', ['planned', 'released', 'in_progress']))
+                    ->orderBy('date')->orderBy('id')
+                    ->lockForUpdate()
+                    ->get()
+                    ->filter(fn (Delivery $delivery): bool => $delivery->lines->isNotEmpty());
+
+                $deliveries = $deliveries->sortBy(function (Delivery $delivery) use ($sortBy): array {
+                    $firstProduct = (string) ($delivery->lines->first()?->product?->name ?? '');
+                    $location = (string) ($delivery->location?->code ?? '');
+                    $date = optional($delivery->date)->toDateString() ?? '';
+                    return match ($sortBy) {
+                        'product' => [$firstProduct, $location, $date, $delivery->id],
+                        'delivery_date' => [$date, $location, $delivery->id],
+                        default => [$location ?: 'ZZZ', $firstProduct, $date, $delivery->id],
+                    };
+                })->values();
+
+                $maxDeliveries = (int) ($data['max_deliveries'] ?? 100);
+                $selected = $deliveries->take($maxDeliveries)->values();
+                if ($selected->isEmpty()) {
+                    throw new \RuntimeException('No eligible pending deliveries were found for the selected warehouse and filters.');
+                }
+
+                $fallback = 'PW-'.now()->format('YmdHis').'-'.Str::upper(Str::random(5));
+                $wave = PickWave::create([
+                    'company_id' => $companyId,
+                    'warehouse_id' => $warehouse->id,
+                    'wave_no' => app(NumberingSequenceService::class)->nextOrFallback('pick_wave', $fallback, $companyId, $warehouse->branch_id),
+                    'external_reference' => $data['external_reference'] ?? null,
+                    'wave_date' => $data['wave_date'] ?? now()->toDateString(),
+                    'status' => 'planned',
+                    'created_by' => $request->user()?->id,
+                ]);
+                $deliveryIds = $selected->pluck('id')->map(fn ($id): int => (int) $id)->values();
+                $wave->deliveries()->attach($deliveryIds->all());
+                app(AuditService::class)->record('pick_wave.created_from_pick_list', $wave, null, [
+                    'delivery_ids' => $deliveryIds->all(),
+                    'warehouse_id' => $warehouse->id,
+                    'location_id' => $data['location_id'] ?? null,
+                    'date' => $data['date'] ?? null,
+                    'sort_by' => $sortBy,
+                    'available_count' => $deliveries->count(),
+                    'selected_count' => $selected->count(),
+                ]);
+
+                return [
+                    'wave' => $wave->load(['warehouse', 'deliveries.location', 'deliveries.operations']),
+                    'available_count' => $deliveries->count(),
+                    'selected_count' => $selected->count(),
+                    'sort_by' => $sortBy,
+                ];
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+
+        return response()->json([
+            'data' => $this->wavePayload($result['wave']),
+            'meta' => [
+                'available_count' => $result['available_count'],
+                'selected_count' => $result['selected_count'],
+                'sort_by' => $result['sort_by'],
+                'filters' => [
+                    'warehouse_id' => (int) $data['warehouse_id'],
+                    'location_id' => $data['location_id'] ?? null,
+                    'date' => $data['date'] ?? null,
+                ],
+            ],
+            'status' => 'created',
+        ], 201);
+    }
+
     public function releasePickWave(Request $request, int $id): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -367,18 +481,39 @@ class WarehouseIntegrationController extends Controller
 
     public function locationUtilization(Request $request): JsonResponse
     {
-        $data = $request->validate(['warehouse_id' => ['nullable', 'integer'], 'type' => ['nullable', 'in:warehouse,zone,rack,shelf,bin'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate([
+            'warehouse_id' => ['nullable', 'integer'],
+            'type' => ['nullable', 'in:warehouse,zone,rack,shelf,bin'],
+            'include_descendants' => ['nullable', 'boolean'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for location utilization reporting.');
         $alertThreshold = (float) app(\App\Services\ErpSettingService::class)->get('warehouse_capacity_alert_percent', 80, (int) $companyId);
         $alertThreshold = $alertThreshold > 0 && $alertThreshold <= 100 ? $alertThreshold : 80;
-        $locations = InventoryLocation::with(['warehouse.branch', 'parent'])
+
+        $allLocations = InventoryLocation::with(['warehouse.branch', 'parent'])
             ->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))
             ->when($data['warehouse_id'] ?? null, fn ($query, $id) => $query->where('warehouse_id', $id))
-            ->when($data['type'] ?? null, fn ($query, $type) => $query->where('type', $type))
-            ->orderBy('warehouse_id')->orderBy('id')->get()
-            ->map(function (InventoryLocation $location) use ($alertThreshold): array {
-                $occupied = app(InventoryLocationCapacityService::class)->occupied($location);
+            ->orderBy('warehouse_id')->orderBy('id')->get();
+        $locationsById = $allLocations->keyBy('id');
+        $occupiedById = $allLocations->mapWithKeys(function (InventoryLocation $location): array {
+            return [$location->id => app(InventoryLocationCapacityService::class)->occupied($location)];
+        });
+        $children = $allLocations->groupBy(fn (InventoryLocation $location) => (string) ($location->parent_id ?? 'root'));
+        $descendantIds = function (int $locationId) use (&$descendantIds, $children): array {
+            $ids = [];
+            foreach ($children->get((string) $locationId, collect()) as $child) {
+                $ids[] = (int) $child->id;
+                $ids = array_merge($ids, $descendantIds((int) $child->id));
+            }
+            return $ids;
+        };
+        $includeDescendants = (bool) ($data['include_descendants'] ?? false);
+        $locations = $allLocations
+            ->when($data['type'] ?? null, fn ($collection, $type) => $collection->where('type', $type))
+            ->map(function (InventoryLocation $location) use ($alertThreshold, $occupiedById, $locationsById, $descendantIds, $includeDescendants): array {
+                $occupied = $occupiedById->get($location->id, ['quantity' => 0, 'weight_kg' => 0, 'volume_m3' => 0]);
                 $quantityCapacity = $location->capacity === null ? null : (float) $location->capacity;
                 $weightCapacity = $location->capacity_weight_kg === null ? null : (float) $location->capacity_weight_kg;
                 $volumeCapacity = $location->capacity_volume_m3 === null ? null : (float) $location->capacity_volume_m3;
@@ -388,6 +523,15 @@ class WarehouseIntegrationController extends Controller
                     $volumeCapacity && $volumeCapacity > 0 ? ($occupied['volume_m3'] / $volumeCapacity) * 100 : null,
                 ], static fn ($value): bool => $value !== null);
                 $maximumUtilization = $utilizations ? max($utilizations) : null;
+                $descendants = $includeDescendants ? $descendantIds((int) $location->id) : [];
+                $subtreeIds = array_merge([(int) $location->id], $descendants);
+                $sumOccupied = static fn (string $key): float => (float) collect($subtreeIds)->sum(fn (int $id): float => (float) ($occupiedById->get($id, [])[$key] ?? 0));
+                $sumCapacity = static fn (string $key): float => (float) collect($subtreeIds)->sum(function (int $id) use ($locationsById, $key): float {
+                    $child = $locationsById->get($id);
+                    return (float) ($child?->{$key} ?? 0);
+                });
+                $subtreeOccupied = ['quantity' => $sumOccupied('quantity'), 'weight_kg' => $sumOccupied('weight_kg'), 'volume_m3' => $sumOccupied('volume_m3')];
+                $subtreeCapacity = ['quantity' => $sumCapacity('capacity'), 'weight_kg' => $sumCapacity('capacity_weight_kg'), 'volume_m3' => $sumCapacity('capacity_volume_m3')];
                 return [
                     'location_id' => (int) $location->id,
                     'warehouse_id' => (int) $location->warehouse_id,
@@ -408,12 +552,51 @@ class WarehouseIntegrationController extends Controller
                     'occupied_volume_m3' => round($occupied['volume_m3'], 6),
                     'capacity_volume_m3' => $volumeCapacity,
                     'volume_utilization_percent' => $volumeCapacity && $volumeCapacity > 0 ? round(min(100, ($occupied['volume_m3'] / $volumeCapacity) * 100), 4) : null,
+                    'descendant_count' => count($descendants),
+                    'subtree_occupied_quantity' => round($subtreeOccupied['quantity'], 6),
+                    'subtree_capacity' => $includeDescendants && $subtreeCapacity['quantity'] > 0 ? round($subtreeCapacity['quantity'], 6) : null,
+                    'subtree_available_capacity' => $includeDescendants && $subtreeCapacity['quantity'] > 0 ? round(max(0, $subtreeCapacity['quantity'] - $subtreeOccupied['quantity']), 6) : null,
+                    'subtree_utilization_percent' => $includeDescendants && $subtreeCapacity['quantity'] > 0 ? round(min(100, ($subtreeOccupied['quantity'] / $subtreeCapacity['quantity']) * 100), 4) : null,
+                    'subtree_occupied_weight_kg' => $includeDescendants ? round($subtreeOccupied['weight_kg'], 6) : null,
+                    'subtree_capacity_weight_kg' => $includeDescendants && $subtreeCapacity['weight_kg'] > 0 ? round($subtreeCapacity['weight_kg'], 6) : null,
+                    'subtree_occupied_volume_m3' => $includeDescendants ? round($subtreeOccupied['volume_m3'], 6) : null,
+                    'subtree_capacity_volume_m3' => $includeDescendants && $subtreeCapacity['volume_m3'] > 0 ? round($subtreeCapacity['volume_m3'], 6) : null,
                 ];
             })->values();
         $perPage = (int) ($data['per_page'] ?? 50);
         $page = max(1, (int) $request->input('page', 1));
         $paginator = new LengthAwarePaginator($locations->forPage($page, $perPage)->values(), $locations->count(), $perPage, $page, ['path' => LengthAwarePaginator::resolveCurrentPath()]);
-        return response()->json(['data' => $paginator->getCollection(), 'meta' => ['current_page' => $paginator->currentPage(), 'per_page' => $paginator->perPage(), 'total' => $paginator->total(), 'last_page' => $paginator->lastPage(), 'warehouse_id' => $data['warehouse_id'] ?? null, 'type' => $data['type'] ?? null]]);
+        return response()->json(['data' => $paginator->getCollection(), 'meta' => ['current_page' => $paginator->currentPage(), 'per_page' => $paginator->perPage(), 'total' => $paginator->total(), 'last_page' => $paginator->lastPage(), 'warehouse_id' => $data['warehouse_id'] ?? null, 'type' => $data['type'] ?? null, 'include_descendants' => $includeDescendants]]);
+    }
+
+    public function utilizationSnapshots(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'warehouse_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for utilization history.');
+        $snapshots = WarehouseUtilizationSnapshot::with(['warehouse', 'location', 'company'])
+            ->where('company_id', $companyId)
+            ->when($data['warehouse_id'] ?? null, fn ($query, $id) => $query->where('warehouse_id', $id))
+            ->when($data['location_id'] ?? null, fn ($query, $id) => $query->where('location_id', $id))
+            ->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('as_of_date', '>=', $date))
+            ->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('as_of_date', '<=', $date))
+            ->orderByDesc('as_of_date')->orderBy('warehouse_id')->orderBy('location_id');
+        $perPage = (int) ($data['per_page'] ?? 50);
+        $paginator = $snapshots->paginate($perPage);
+        return response()->json([
+            'data' => $paginator->getCollection(),
+            'meta' => [
+                'current_page' => $paginator->currentPage(), 'per_page' => $paginator->perPage(),
+                'total' => $paginator->total(), 'last_page' => $paginator->lastPage(),
+                'from' => $data['from'] ?? null, 'to' => $data['to'] ?? null,
+            ],
+        ]);
     }
 
     public function putawayLocations(Request $request): JsonResponse

@@ -11,6 +11,8 @@ use App\Models\DeliveryLine;
 use App\Models\DeliveryOperation;
 use App\Models\InventoryLocation;
 use App\Models\Product;
+use App\Models\Permission;
+use App\Models\Role;
 use App\Models\SalesOrder;
 use App\Models\Supplier;
 use App\Models\Unit;
@@ -142,4 +144,87 @@ class WarehousePickListTest extends TestCase
         $this->postJson('/api/integration/warehouse/pick-waves/'.$waveId.'/complete')->assertOk()->assertJsonPath('data.status', 'completed')->assertJsonPath('data.completed_pick_count', 2);
         $this->getJson('/api/integration/warehouse/pick-waves?status=completed')->assertOk()->assertJsonPath('meta.total', 1)->assertJsonPath('data.0.wave_no', $recreated->json('data.wave_no'));
     }
+    public function test_pick_wave_can_be_created_from_optimized_pick_list_idempotently(): void
+    {
+        $company = Company::create(['name' => 'Wave Automation Co', 'code' => 'WAVE-AUTO']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Wave Automation Branch', 'code' => 'WAVE-AUTO-BRANCH']);
+        $warehouse = Warehouse::create(['branch_id' => $branch->id, 'name' => 'Wave Automation Warehouse', 'code' => 'WAVE-AUTO-WH', 'is_active' => true]);
+        $firstLocation = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'A Bin', 'code' => 'A-01', 'type' => 'bin', 'is_active' => true]);
+        $secondLocation = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'B Bin', 'code' => 'B-01', 'type' => 'bin', 'is_active' => true]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Wave Automation Customer', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Wave Automation Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Wave Automation Each', 'code' => 'EA-WAVE-AUTO', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Wave Automation Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Wave Automation Product', 'sku' => 'WAVE-AUTO-SKU', 'status' => 1, 'is_stock_item' => true, 'can_sell' => true]);
+
+        $makeDelivery = function (string $number, InventoryLocation $location) use ($company, $customer, $product): Delivery {
+            $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-'.$number, 'date' => '2026-09-20', 'status' => 'approved', 'location_id' => $location->id]);
+            $orderLine = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 1, 'delivered_qty' => 0, 'unit_price' => 10]);
+            $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => $number, 'date' => '2026-09-20', 'location_id' => $location->id, 'status' => 'pending', 'fulfillment_status' => 'pending']);
+            DeliveryLine::create(['delivery_id' => $delivery->id, 'sales_order_line_id' => $orderLine->id, 'product_id' => $product->id, 'delivered_qty' => 1, 'unit_price' => 10]);
+            DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'pick', 'status' => 'pending']);
+            return $delivery;
+        };
+
+        $first = $makeDelivery('DN-WAVE-AUTO-1', $firstLocation);
+        $second = $makeDelivery('DN-WAVE-AUTO-2', $secondLocation);
+        Sanctum::actingAs($user, ['warehouse:write']);
+
+        $create = $this->postJson('/api/integration/warehouse/pick-waves/from-pick-list', [
+            'warehouse_id' => $warehouse->id,
+            'sort_by' => 'location',
+            'max_deliveries' => 1,
+            'external_reference' => 'WAVE-AUTO-EXT-1',
+        ]);
+        $create->assertCreated()
+            ->assertJsonPath('status', 'created')
+            ->assertJsonPath('data.status', 'planned')
+            ->assertJsonPath('data.delivery_count', 1)
+            ->assertJsonPath('data.delivery_ids.0', $first->id)
+            ->assertJsonPath('meta.available_count', 2)
+            ->assertJsonPath('meta.selected_count', 1);
+
+        $this->postJson('/api/integration/warehouse/pick-waves/from-pick-list', [
+            'warehouse_id' => $warehouse->id,
+            'max_deliveries' => 100,
+            'external_reference' => 'WAVE-AUTO-EXT-1',
+        ])->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $create->json('data.id'));
+
+        $this->assertDatabaseCount('pick_waves', 1);
+        $this->assertDatabaseHas('pick_wave_deliveries', ['pick_wave_id' => $create->json('data.id'), 'delivery_id' => $first->id]);
+        $this->assertDatabaseMissing('pick_wave_deliveries', ['pick_wave_id' => $create->json('data.id'), 'delivery_id' => $second->id]);
+    }
+
+    public function test_browser_pick_wave_screen_is_permission_protected_and_creates_a_wave(): void
+    {
+        $company = Company::create(['name' => 'Browser Wave Co', 'code' => 'BROWSER-WAVE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['name' => 'Warehouse manage', 'code' => 'warehouse.manage', 'module' => 'warehouse']);
+        $role = Role::create(['name' => 'Warehouse operator', 'code' => 'warehouse-operator']);
+        $role->permissions()->attach($permission);
+        $user->roles()->attach($role);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Browser Branch', 'code' => 'BROWSER-BRANCH']);
+        $warehouse = Warehouse::create(['branch_id' => $branch->id, 'name' => 'Browser Warehouse', 'code' => 'BROWSER-WH', 'is_active' => true]);
+        $location = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Browser Bin', 'code' => 'BROWSER-01', 'type' => 'bin', 'is_active' => true]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Browser Customer', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Browser Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Browser Each', 'code' => 'EA-BROWSER', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Browser Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Browser Product', 'sku' => 'BROWSER-SKU', 'status' => 1, 'is_stock_item' => true, 'can_sell' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-BROWSER-WAVE', 'date' => '2026-09-20', 'status' => 'approved', 'location_id' => $location->id]);
+        $line = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 1, 'delivered_qty' => 0, 'unit_price' => 10]);
+        $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-BROWSER-WAVE', 'date' => '2026-09-20', 'location_id' => $location->id, 'status' => 'pending', 'fulfillment_status' => 'pending']);
+        DeliveryLine::create(['delivery_id' => $delivery->id, 'sales_order_line_id' => $line->id, 'product_id' => $product->id, 'delivered_qty' => 1, 'unit_price' => 10]);
+        DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'pick', 'status' => 'pending']);
+
+        $this->actingAs($user)->get('/warehouse/picking?warehouse_id='.$warehouse->id)->assertOk()->assertSee('DN-BROWSER-WAVE');
+        $this->actingAs($user)->post('/warehouse/picking/waves/from-pick-list', [
+            'warehouse_id' => $warehouse->id,
+            'delivery_ids' => [$delivery->id],
+            'external_reference' => 'BROWSER-WAVE-EXT',
+        ])->assertRedirect();
+        $this->assertDatabaseHas('pick_waves', ['company_id' => $company->id, 'external_reference' => 'BROWSER-WAVE-EXT', 'status' => 'planned']);
+    }
+
 }

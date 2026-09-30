@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Branch;
 use App\Models\Company;
 use App\Models\Department;
+use App\Models\Store;
 use App\Models\User;
 use App\Services\AuditService;
 use Illuminate\Http\Request;
@@ -14,23 +15,28 @@ class UserManagementController extends Controller
     public function index()
     {
         $companyId = auth()->user()?->company_id;
-        $users = User::when($companyId, fn ($query) => $query->where('company_id', $companyId))->with(['company', 'branch', 'department', 'roles'])->orderBy('name')->paginate(50);
+        $users = User::when($companyId, fn ($query) => $query->where('company_id', $companyId))->with(['company', 'branch', 'store', 'department', 'roles'])->orderBy('name')->paginate(50);
         $companies = Company::when($companyId, fn ($query) => $query->whereKey($companyId))->where('is_active', true)->orderBy('name')->get();
         $branches = Branch::when($companyId, fn ($query) => $query->where('company_id', $companyId))->where('is_active', true)->orderBy('name')->get();
         $departments = Department::when($companyId, fn ($query) => $query->where('company_id', $companyId))->where('is_active', true)->orderBy('name')->get();
-        return view('admin.erp.users', compact('users', 'companies', 'branches', 'departments'));
+        $stores = Store::when($companyId, fn ($query) => $query->whereHas('branch', fn ($branch) => $branch->where('company_id', $companyId)))->where('is_active', true)->orderBy('name')->get();
+        return view('admin.erp.users', compact('users', 'companies', 'branches', 'departments', 'stores'));
     }
 
     public function update(Request $request, int $id)
     {
-        $data = $request->validate(['company_id' => ['nullable', 'exists:companies,id'], 'branch_id' => ['nullable', 'exists:branches,id'], 'department_id' => ['nullable', 'exists:departments,id'], 'is_active' => ['nullable', 'boolean']]);
+        $data = $request->validate(['company_id' => ['nullable', 'exists:companies,id'], 'branch_id' => ['nullable', 'exists:branches,id'], 'store_id' => ['nullable', 'exists:stores,id'], 'department_id' => ['nullable', 'exists:departments,id'], 'is_active' => ['nullable', 'boolean']]);
         $companyId = auth()->user()?->company_id;
         if ($companyId && (($data['company_id'] ?? $companyId) != $companyId)) abort(403);
         if ($companyId && !empty($data['branch_id']) && !Branch::whereKey($data['branch_id'])->where('company_id', $companyId)->exists()) abort(403);
         if ($companyId && !empty($data['department_id']) && !Department::whereKey($data['department_id'])->where('company_id', $companyId)->exists()) abort(403);
-        $user = User::when($companyId, fn ($query) => $query->where('company_id', $companyId))->findOrFail($id); $old = $user->only(['company_id', 'branch_id', 'department_id', 'is_active']);
+        if ($companyId && !empty($data['store_id'])) {
+            $store = Store::with('branch')->whereKey($data['store_id'])->first();
+            if (!$store || (int) $store->branch?->company_id !== (int) $companyId || (!empty($data['branch_id']) && (int) $store->branch_id !== (int) $data['branch_id'])) abort(403);
+        }
+        $user = User::when($companyId, fn ($query) => $query->where('company_id', $companyId))->findOrFail($id); $old = $user->only(['company_id', 'branch_id', 'store_id', 'department_id', 'is_active']);
         $user->update($data + ['is_active' => (bool) ($data['is_active'] ?? false)]);
-        app(AuditService::class)->record('security.user.updated', $user, $old, $user->only(['company_id', 'branch_id', 'department_id', 'is_active']));
+        app(AuditService::class)->record('security.user.updated', $user, $old, $user->only(['company_id', 'branch_id', 'store_id', 'department_id', 'is_active']));
         return back()->with(['message' => 'User scope/status updated.', 'alert-type' => 'success']);
     }
 

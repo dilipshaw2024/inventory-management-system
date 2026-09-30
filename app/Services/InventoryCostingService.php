@@ -111,21 +111,9 @@ class InventoryCostingService
         $product = Product::whereKey($productId)->first(['id', 'costing_method', 'tracking_type', 'purchase_price', 'standard_cost']);
         $policy = app(ProductCostingPolicyService::class)->resolve($product, $movement?->posted_at);
         $method = $policy['costing_method'];
-        if ($method === 'standard') {
-            $standard = $policy['standard_cost'];
-            $cost = $fallbackCost ?? (float) ($standard ?? $product?->purchase_price ?? 0);
-            if ($movement) {
-                InventoryMovementAllocation::create([
-                    'movement_id' => $movement->id,
-                    'product_id' => $productId,
-                    'batch_id' => $batchId,
-                    'serial_id' => $serialId,
-                    'quantity' => $quantity,
-                    'unit_cost' => $cost,
-                ]);
-            }
-            return $quantity * $cost;
-        }
+        $standardCost = $method === 'standard'
+            ? (float) ($policy['standard_cost'] ?? $fallbackCost ?? $product?->purchase_price ?? 0)
+            : null;
         $remaining = $quantity;
         $totalCost = 0;
         $hasBatchDate = false;
@@ -182,6 +170,11 @@ class InventoryCostingService
             }
             $cost = $fallbackCost ?? (float) ($product?->purchase_price ?? 0);
             $totalCost += $remaining * $cost;
+        }
+        if ($method === 'standard') {
+            // Layer consumption records actual cost for variance analysis; the
+            // caller finalizes the movement and journal at standard cost.
+            return $quantity * (float) $standardCost;
         }
         return $totalCost;
     }

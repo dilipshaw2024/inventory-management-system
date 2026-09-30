@@ -144,6 +144,81 @@ class ManufacturingIntegrationController extends Controller
         return response()->json(['data' => $order->load('bom', 'product'), 'status' => 'pending_approval'], 201);
     }
 
+    public function storeOrdersFromSuggestions(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'items' => ['required', 'array', 'min:1', 'max:100'],
+            'items.*.external_reference' => ['nullable', 'string', 'max:150'],
+            'items.*.bom_id' => ['required', 'integer'],
+            'items.*.planned_quantity' => ['nullable', 'numeric', 'gt:0'],
+            'items.*.planned_date' => ['nullable', 'date'],
+            'items.*.location_id' => ['nullable', 'integer'],
+            'items.*.description' => ['nullable', 'string', 'max:2000'],
+            'items.*.output_batch_no' => ['nullable', 'string', 'max:100'],
+            'items.*.output_serial_numbers' => ['nullable', 'string', 'max:10000'],
+            'items.*.output_manufacturing_date' => ['nullable', 'date'],
+            'items.*.output_expiry_date' => ['nullable', 'date'],
+            'items.*.output_best_before_date' => ['nullable', 'date'],
+            'items.*.output_warranty_until' => ['nullable', 'date'],
+        ]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for production planning.');
+        $results = [];
+
+        foreach ($data['items'] as $item) {
+            try {
+                if (!empty($item['external_reference'])) {
+                    $existing = $this->companyScope(ProductionOrder::query(), $companyId)->where('external_reference', $item['external_reference'])->first();
+                    if ($existing) {
+                        $results[] = ['external_reference' => $item['external_reference'], 'status' => 'duplicate_ignored', 'data' => $existing->load('bom', 'product')];
+                        continue;
+                    }
+                }
+                $bom = $this->companyScope(BillOfMaterial::query(), $companyId)->findOrFail((int) $item['bom_id']);
+                $suggestion = app(ProductionSuggestionService::class)->forCompany($companyId, $bom->id)->first();
+                if (!$suggestion) throw new \RuntimeException('No current production suggestion exists for the selected BOM.');
+                $quantity = isset($item['planned_quantity']) ? (float) $item['planned_quantity'] : (float) $suggestion['suggested'];
+                if ($quantity <= 0.000001 || $quantity > (float) $suggestion['suggested'] + 0.000001 || $quantity > (float) $suggestion['max_build'] + 0.000001) {
+                    throw new \RuntimeException('The requested production quantity exceeds the current production suggestion or component capacity.');
+                }
+                $plannedDate = Carbon::parse($item['planned_date'] ?? now()->toDateString())->toDateString();
+                if (!$bom->is_active || ($bom->approval_status ?? 'approved') !== 'approved' || ($bom->effective_from && $bom->effective_from->gt($plannedDate)) || ($bom->effective_until && $bom->effective_until->lt($plannedDate))) {
+                    throw new \RuntimeException('The selected BOM is inactive, unapproved, or not effective on the planned production date.');
+                }
+                if (!empty($item['location_id']) && !$this->companyScope(\App\Models\InventoryLocation::query(), $companyId)->whereKey($item['location_id'])->exists()) {
+                    throw new \RuntimeException('Location is not authorized for this company.');
+                }
+                $snapshot = app(\App\Services\BomExplosionService::class)->snapshot($bom, $companyId, $plannedDate);
+                $order = DB::transaction(function () use ($item, $bom, $snapshot, $companyId, $quantity, $plannedDate, $request): ProductionOrder {
+                    return ProductionOrder::create([
+                        'company_id' => $companyId, 'external_reference' => $item['external_reference'] ?? null,
+                        'bom_id' => $bom->id, 'product_id' => $bom->product_id, 'planned_quantity' => $quantity,
+                        'planned_date' => $plannedDate, 'location_id' => $item['location_id'] ?? null,
+                        'description' => $item['description'] ?? null, 'output_batch_no' => $item['output_batch_no'] ?? null,
+                        'output_serial_numbers' => $item['output_serial_numbers'] ?? null,
+                        'output_manufacturing_date' => $item['output_manufacturing_date'] ?? null,
+                        'output_expiry_date' => $item['output_expiry_date'] ?? null,
+                        'output_best_before_date' => $item['output_best_before_date'] ?? null,
+                        'output_warranty_until' => $item['output_warranty_until'] ?? null,
+                        'bom_version' => $bom->version ?: '1', 'bom_snapshot' => $snapshot,
+                        'order_no' => app(NumberingSequenceService::class)->nextOrFallback('production_order', 'MO-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
+                        'created_by' => $request->user()?->id, 'status' => 'draft',
+                    ]);
+                });
+                app(AuditService::class)->record('production_order.created_from_suggestion', $order, null, $order->toArray() + ['suggested_quantity' => $suggestion['suggested'], 'max_build' => $suggestion['max_build'], 'api' => true]);
+                $results[] = ['external_reference' => $item['external_reference'] ?? null, 'status' => 'pending_approval', 'data' => $order->load('bom', 'product')];
+            } catch (\RuntimeException|\Illuminate\Http\Exceptions\HttpResponseException $exception) {
+                $results[] = ['external_reference' => $item['external_reference'] ?? null, 'status' => 'failed', 'message' => $exception instanceof \Illuminate\Http\Exceptions\HttpResponseException ? 'The item is not authorized for this company.' : $exception->getMessage()];
+            }
+        }
+
+        $failed = collect($results)->where('status', 'failed')->count();
+        $created = collect($results)->where('status', 'pending_approval')->count();
+        $status = $failed > 0 ? ($created > 0 ? 'partial' : 'failed') : ($created > 0 ? 'completed' : 'duplicate_ignored');
+        $httpStatus = $failed > 0 && $created > 0 ? 207 : ($failed > 0 ? 422 : ($created > 0 ? 201 : 200));
+        return response()->json(['data' => $results, 'status' => $status, 'summary' => ['requested' => count($data['items']), 'created' => $created, 'duplicates' => collect($results)->where('status', 'duplicate_ignored')->count(), 'failed' => $failed]], $httpStatus);
+    }
+
     public function releaseOrder(int $id): JsonResponse
     {
         $order = app(ProductionService::class)->release($id);
@@ -179,8 +254,9 @@ class ManufacturingIntegrationController extends Controller
 
     public function completeOrder(Request $request, int $id): JsonResponse
     {
-        $data = $request->validate(['produced_quantity' => ['nullable', 'numeric', 'gt:0']]);
-        $order = app(ProductionService::class)->complete($id, array_key_exists('produced_quantity', $data) ? (float) $data['produced_quantity'] : null);
+        $data = $request->validate(['produced_quantity' => ['nullable', 'numeric', 'gt:0'], 'external_reference' => ['nullable', 'string', 'max:150'], 'output_batch_no' => ['nullable', 'string', 'max:100'], 'output_serial_numbers' => ['nullable'], 'output_serial_numbers.*' => ['string', 'max:150'], 'output_manufacturing_date' => ['nullable', 'date'], 'output_expiry_date' => ['nullable', 'date'], 'output_best_before_date' => ['nullable', 'date'], 'output_warranty_until' => ['nullable', 'date']]);
+        $outputContext = collect(['external_reference', 'output_batch_no', 'output_serial_numbers', 'output_manufacturing_date', 'output_expiry_date', 'output_best_before_date', 'output_warranty_until'])->filter(fn (string $key): bool => array_key_exists($key, $data))->mapWithKeys(fn (string $key): array => [$key => $data[$key]])->all();
+        $order = app(ProductionService::class)->complete($id, array_key_exists('produced_quantity', $data) ? (float) $data['produced_quantity'] : null, $outputContext);
         return response()->json(['data' => $order->load('bom', 'product'), 'status' => $order->status]);
     }
 
@@ -229,7 +305,7 @@ class ManufacturingIntegrationController extends Controller
         $orders = $this->companyScope(ProductionOrder::with([
             'bom.lines.component', 'bom.byproducts.product', 'product:id,name,sku', 'location:id,code,name',
             'creator:id,name,email', 'operations.workCenter:id,code,name', 'operations.routingOperation',
-            'operations.starter:id,name,email', 'operations.completer:id,name,email',
+            'operations.starter:id,name,email', 'operations.completer:id,name,email', 'receipts.product:id,name,sku', 'receipts.batch:id,batch_no,lot_no', 'receipts.location:id,code,name',
         ]), $request->user()?->company_id)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['planned_from'] ?? null, fn ($query, $date) => $query->whereDate('planned_date', '>=', $date))

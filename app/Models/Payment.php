@@ -21,6 +21,8 @@ class Payment extends Model
         return $this->belongsTo(Invoice::class,'invoice_id','id')->withDefault();
     }
 
+     public function posSession(){ return $this->belongsTo(PosSession::class, 'pos_session_id'); }
+
      public function allocations(){ return $this->hasMany(CustomerPaymentAllocation::class)->whereNull('voided_at'); }
      public function allAllocations(){ return $this->hasMany(CustomerPaymentAllocation::class); }
      public function creator(){ return $this->belongsTo(User::class, 'created_by'); }

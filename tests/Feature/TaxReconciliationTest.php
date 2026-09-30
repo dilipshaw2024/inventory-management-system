@@ -13,6 +13,11 @@ use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\Category;
 use App\Models\User;
+use App\Models\TaxFiling;
+use App\Models\TaxFilingProviderSetting;
+use App\Models\Permission;
+use App\Models\Role;
+use App\Services\TaxFilingService;
 use Laravel\Sanctum\Sanctum;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -139,4 +144,34 @@ class TaxReconciliationTest extends TestCase
         $this->assertSame('GATEWAY-FILING-RETRY', $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('filing_reference'));
         $this->getJson('/api/accounting/tax-filings?status=draft&has_provider_error=1')->assertOk()->assertJsonPath('data', []);
     }
+
+    public function test_browser_tax_filing_operations_are_permission_protected_and_company_scoped(): void
+    {
+        $company = Company::create(['name' => 'Browser Tax Filing Co', 'code' => 'BROWSER-TAX-FILING']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['name' => 'Accounting manage', 'code' => 'accounting.manage', 'module' => 'accounting']);
+        $role = Role::create(['name' => 'Tax filing operator', 'code' => 'tax-filing-operator']);
+        $role->permissions()->attach($permission);
+        $user->roles()->attach($role);
+        $this->actingAs($user);
+        $this->post('/erp/accounting/tax-filing-providers', [
+            'provider' => 'http', 'endpoint' => 'https://filing-browser.example.test/submit', 'token' => 'browser-secret', 'timeout' => 20,
+        ])->assertRedirect();
+        $provider = TaxFilingProviderSetting::where('company_id', $company->id)->firstOrFail();
+        $this->assertNotSame('browser-secret', (string) $this->app['db']->table('tax_filing_provider_settings')->where('id', $provider->id)->value('connection_config'));
+        $this->post('/erp/accounting/tax-filings', [
+            'from' => '2026-09-01', 'to' => '2026-09-30', 'jurisdiction' => 'IN', 'external_reference' => 'BROWSER-TAX-1',
+        ])->assertRedirect();
+        $filing = TaxFiling::where('company_id', $company->id)->where('external_reference', 'BROWSER-TAX-1')->firstOrFail();
+        $this->get('/erp/accounting/tax-filings')->assertOk()->assertSee($filing->filing_no);
+        $this->post('/erp/accounting/tax-filings/'.$filing->id.'/verify')->assertRedirect();
+        $this->get('/erp/accounting/tax-filings/'.$filing->id.'/export')->assertOk()->assertHeader('content-type', 'text/csv; charset=UTF-8');
+        $this->post('/erp/accounting/tax-filings/'.$filing->id.'/submit', ['filing_reference' => 'BROWSER-PORTAL-1'])->assertRedirect();
+        $this->assertDatabaseHas('tax_filings', ['id' => $filing->id, 'status' => 'submitted', 'filing_reference' => 'BROWSER-PORTAL-1']);
+        $this->post('/erp/accounting/tax-filings/'.$filing->id.'/decision', ['status' => 'accepted'])->assertRedirect();
+        $this->assertDatabaseHas('tax_filings', ['id' => $filing->id, 'status' => 'accepted']);
+        $this->post('/erp/accounting/tax-filing-providers/'.$provider->id.'/deactivate')->assertRedirect();
+        $this->assertDatabaseHas('tax_filing_provider_settings', ['id' => $provider->id, 'is_active' => 0]);
+    }
+
 }

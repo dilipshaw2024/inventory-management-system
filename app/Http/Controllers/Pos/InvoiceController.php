@@ -29,6 +29,7 @@ use App\Services\SerialLifecycleService;
 use App\Services\PromotionService;
 use App\Models\InventoryBatch;
 use App\Models\Store;
+use App\Services\StorePosSettingsService;
 
 class InvoiceController extends Controller
 {
@@ -60,7 +61,9 @@ class InvoiceController extends Controller
         $companyId = $this->companyId();
         $category = Category::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
         $costomer = Customer::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->orderBy('id','desc')->get();
-        $stores = Store::where('is_active', true)->whereHas('branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->with('branch')->orderBy('name')->get();
+        $stores = Store::where('is_active', true)->whereHas('branch', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
+            ->when((int) auth()->user()->store_id > 0, fn ($query) => $query->whereKey((int) auth()->user()->store_id))
+            ->with('branch')->orderBy('name')->get();
         $invoice_data = Invoice::where('company_id', $companyId)->orderBy('id','desc')->first();
         if ($invoice_data == null) {
            $firstReg = '0';
@@ -79,7 +82,23 @@ class InvoiceController extends Controller
 
     public function InvoiceStore(InvoiceRequest $request){
 
-    if ($request->filled('store_id') && !Store::whereKey((int) $request->input('store_id'))->whereHas('branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->exists()) abort(403);
+    $assignedStoreId = (int) (auth()->user()->store_id ?? 0);
+    $requestedStoreId = $request->filled('store_id') ? (int) $request->input('store_id') : null;
+    if ($assignedStoreId > 0 && $requestedStoreId !== null && $requestedStoreId !== $assignedStoreId) {
+        abort(403);
+    }
+    $storeId = $assignedStoreId > 0 ? $assignedStoreId : $requestedStoreId;
+    $store = $storeId ? Store::whereKey($storeId)->whereHas('branch', fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->first() : null;
+    if ($storeId && !$store) {
+        abort(403);
+    }
+    $paymentMethod = (string) ($request->input('payment_method') ?: 'cash');
+    if ($store && $request->paid_status !== 'full_due' && !in_array($paymentMethod, app(StorePosSettingsService::class)->allowedTenders($store), true)) {
+        return redirect()->back()->withInput()->with(['message' => 'The selected payment method is not enabled for this store.', 'alert-type' => 'error']);
+    }
+    if ($store && app(StorePosSettingsService::class)->normalize($store->pos_settings)['require_customer'] && (int) $request->input('customer_id') <= 0) {
+        return redirect()->back()->withInput()->with(['message' => 'This store requires a customer for POS invoices.', 'alert-type' => 'error']);
+    }
 
     if ($request->category_id == null) {
 
@@ -143,7 +162,7 @@ class InvoiceController extends Controller
     $invoice->invoice_no = app(NumberingSequenceService::class)->nextOrFallback('sales_invoice', (string) $request->invoice_no, auth()->user()?->company_id, auth()->user()?->branch_id);
     $invoice->date = date('Y-m-d',strtotime($request->date));
     $invoice->due_date = $request->filled('due_date') ? date('Y-m-d', strtotime($request->due_date)) : null;
-    $invoice->store_id = $request->input('store_id');
+    $invoice->store_id = $storeId;
     $invoice->description = $request->description;
     $invoice->currency_code = strtoupper($request->currency_code ?: (auth()->user()?->company?->base_currency ?? 'USD'));
     $invoice->tax_mode = $taxMode;
@@ -216,6 +235,7 @@ class InvoiceController extends Controller
             $payment->currency_code = $invoice->currency_code;
             $payment->exchange_rate = $invoice->exchange_rate ?: 1;
             $payment->paid_status = $request->paid_status;
+            $payment->method = $paymentMethod;
             $payment->discount_amount = $discount;
             $payment->total_amount = $estimatedAmount;
 
@@ -392,8 +412,9 @@ class InvoiceController extends Controller
 
 
     public function PrintInvoice($id){
-        $invoice = Invoice::where('company_id', $this->companyId())->with('invoice_details')->findOrFail($id);
-        return view('backend.pdf.invoice_pdf',compact('invoice'));
+        $invoice = Invoice::where('company_id', $this->companyId())->with(['invoice_details', 'store'])->findOrFail($id);
+        $posSettings = app(StorePosSettingsService::class)->normalize($invoice->store?->pos_settings) ?? [];
+        return view('backend.pdf.invoice_pdf', compact('invoice', 'posSettings'));
 
     } // End Method
 

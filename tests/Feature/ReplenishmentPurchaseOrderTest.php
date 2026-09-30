@@ -59,6 +59,27 @@ class ReplenishmentPurchaseOrderTest extends TestCase
         $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());
     }
 
+    public function test_batch_replenishment_execution_is_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Batch Replenishment Co', 'code' => 'BATCH-REPLENISH']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Batch Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Batch Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Batch Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch item', 'status' => 1, 'is_stock_item' => true, 'reorder_level' => 10, 'purchase_price' => 5]);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 2, 'unit_cost' => 5, 'posted_at' => now()]);
+        Sanctum::actingAs($user, ['inventory:write']);
+        $payload = ['items' => [['product_id' => $product->id, 'quantity' => 6, 'external_reference' => 'BATCH-REPLENISHMENT-PO-1']]];
+
+        $created = $this->postJson('/api/inventory/replenishment/purchase-orders/batch', $payload)->assertCreated();
+        $created->assertJsonPath('status', 'completed')->assertJsonPath('summary.created', 1)->assertJsonPath('data.0.status', 'pending_approval');
+        $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());
+
+        $this->postJson('/api/inventory/replenishment/purchase-orders/batch', $payload)->assertOk()
+            ->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('summary.duplicates', 1)->assertJsonPath('summary.created', 0);
+        $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());
+    }
+
     public function test_replenishment_purchase_order_preserves_target_location(): void
     {
         $company = Company::create(['name' => 'Located Replenishment Co', 'code' => 'LOCATED-REPLENISH']);

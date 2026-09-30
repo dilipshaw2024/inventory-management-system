@@ -26,6 +26,29 @@ class ProductionSchedulingTest extends TestCase
 {
     use RefreshDatabase;
 
+    public function test_batch_production_execution_from_suggestions_is_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Batch Production Co', 'code' => 'BATCH-PRODUCTION']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Batch Production Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Batch Production Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Batch Production Category', 'status' => 1]);
+        $finished = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch Finished', 'max_stock' => 5, 'status' => 1, 'is_stock_item' => true]);
+        $component = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch Component', 'quantity' => 10, 'status' => 1, 'is_stock_item' => true]);
+        $bom = BillOfMaterial::create(['company_id' => $company->id, 'product_id' => $finished->id, 'code' => 'BOM-BATCH-PRODUCTION', 'name' => 'Batch Production BOM', 'output_quantity' => 1, 'is_active' => true, 'approval_status' => 'approved']);
+        $bom->lines()->create(['company_id' => $company->id, 'component_product_id' => $component->id, 'quantity' => 1]);
+        Sanctum::actingAs($user, ['manufacturing:write']);
+        $payload = ['items' => [['bom_id' => $bom->id, 'planned_quantity' => 5, 'planned_date' => now()->toDateString(), 'external_reference' => 'BATCH-PRODUCTION-ORDER-1']]];
+
+        $created = $this->postJson('/api/manufacturing/orders/from-suggestions/batch', $payload)->assertCreated();
+        $created->assertJsonPath('status', 'completed')->assertJsonPath('summary.created', 1)->assertJsonPath('data.0.status', 'pending_approval');
+        $this->assertSame(1, ProductionOrder::where('company_id', $company->id)->count());
+
+        $this->postJson('/api/manufacturing/orders/from-suggestions/batch', $payload)->assertOk()
+            ->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('summary.duplicates', 1)->assertJsonPath('summary.created', 0);
+        $this->assertSame(1, ProductionOrder::where('company_id', $company->id)->count());
+    }
+
     public function test_operations_are_persisted_in_sequence_against_work_center_capacity(): void
     {
         $company = Company::create(['name' => 'Scheduling Co', 'code' => 'SCHED-TEST']);

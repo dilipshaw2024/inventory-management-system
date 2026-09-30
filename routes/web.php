@@ -450,6 +450,14 @@ Route::middleware(['auth', 'permission:accounting.manage'])->controller(Accounti
     Route::get('/cash-flow', 'cashFlow')->name('cash-flow');
     Route::get('/recurring-journals', 'recurringJournals')->name('recurring-journals');
     Route::get('/tax-report', 'taxReport')->name('tax-report');
+    Route::get('/tax-filings', [\App\Http\Controllers\TaxFilingController::class, 'index'])->name('tax-filings');
+    Route::post('/tax-filings', [\App\Http\Controllers\TaxFilingController::class, 'create'])->name('tax-filings.create');
+    Route::post('/tax-filing-providers', [\App\Http\Controllers\TaxFilingController::class, 'storeProvider'])->name('tax-filing-providers.store');
+    Route::post('/tax-filing-providers/{id}/deactivate', [\App\Http\Controllers\TaxFilingController::class, 'deactivateProvider'])->name('tax-filing-providers.deactivate');
+    Route::post('/tax-filings/{id}/verify', [\App\Http\Controllers\TaxFilingController::class, 'verify'])->name('tax-filings.verify');
+    Route::get('/tax-filings/{id}/export', [\App\Http\Controllers\TaxFilingController::class, 'export'])->name('tax-filings.export');
+    Route::post('/tax-filings/{id}/submit', [\App\Http\Controllers\TaxFilingController::class, 'submit'])->name('tax-filings.submit');
+    Route::post('/tax-filings/{id}/decision', [\App\Http\Controllers\TaxFilingController::class, 'decide'])->name('tax-filings.decision');
     Route::get('/tax-report/export', 'taxReportExport')->name('tax-report.export')->middleware('permission:reports.export');
     Route::get('/fx-revaluation', 'fxRevaluation')->name('fx-revaluation');
     Route::post('/fx-revaluation', 'postFxRevaluation')->name('fx-revaluation.post');
@@ -553,6 +561,23 @@ Route::middleware(['auth', 'permission:reports.view'])->get('/planning/demand-fo
 Route::middleware(['auth', 'permission:reports.view'])->get('/planning/replenishment-scenario', [DemandForecastController::class, 'scenario'])->name('planning.replenishment.scenario');
 Route::middleware(['auth', 'permission:inventory.post'])->post('/planning/replenishment-scenario/save', [DemandForecastController::class, 'saveScenario'])->name('planning.replenishment.scenario.save');
 Route::middleware(['auth', 'permission:inventory.post'])->post('/planning/demand-forecast/override', [DemandForecastController::class, 'storeOverride'])->name('planning.demand.forecast.override');
+Route::middleware(['auth', 'permission:warehouse.manage'])->controller(\App\Http\Controllers\DispatchManifestController::class)->prefix('warehouse/dispatch-manifests')->name('warehouse.dispatch-manifests.')->group(function () {
+    Route::get('/', 'index')->name('index');
+    Route::post('/', 'store')->name('store');
+    Route::post('/{id}/handoff', 'handoff')->name('handoff');
+    Route::post('/{id}/close', 'close')->name('close');
+    Route::post('/{id}/cancel', 'cancel')->name('cancel');
+});
+Route::middleware(['auth', 'permission:warehouse.manage'])->controller(\App\Http\Controllers\CarrierRateCardController::class)->prefix('warehouse/logistics/rate-cards')->name('warehouse.logistics.rate-cards.')->group(function () {
+    Route::get('/', 'index')->name('index');
+    Route::post('/', 'store')->name('store');
+    Route::put('/{id}', 'update')->name('update');
+    Route::post('/{id}/deactivate', 'deactivate')->name('deactivate');
+});
+Route::middleware(['auth', 'permission:warehouse.manage'])->controller(\App\Http\Controllers\WarehousePickWaveController::class)->prefix('warehouse/picking')->name('warehouse.picking.')->group(function () {
+    Route::get('/', 'index')->name('index');
+    Route::post('/waves/from-pick-list', 'createFromPickList')->name('waves.create');
+});
 Route::middleware(['auth', 'permission:inventory.view'])->get('/warehouse/put-away', [PutAwayController::class, 'index'])->name('warehouse.put.away');
 Route::middleware(['auth', 'permission:inventory.post'])->post('/warehouse/put-away', [PutAwayController::class, 'confirm'])->name('warehouse.put.away.confirm');
 Route::middleware(['auth', 'permission:inventory.view'])->get('/planning/mrp', [PlanningController::class, 'mrp'])->name('planning.mrp');

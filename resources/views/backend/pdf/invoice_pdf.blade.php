@@ -207,12 +207,20 @@
                         </table>
                     </div>
 
+                    @if(!empty($posSettings['receipt_footer']))
+                        <div class="text-center mt-4 pt-3 border-top">
+                            {{ $posSettings['receipt_footer'] }}
+                        </div>
+                    @endif
                     <div class="d-print-none">
                         <div class="float-end">
                             <a href="javascript:window.print()" class="btn btn-success waves-effect waves-light"><i class="fa fa-print"></i></a>
                             <a href="#" class="btn btn-primary waves-effect waves-light ms-2">Download</a>
                         </div>
                     </div>
+                    @if(!empty($posSettings['auto_print_receipt']))
+                        <script>window.addEventListener('load', function(){ window.print(); });</script>
+                    @endif
                 </div>
             </div>
 

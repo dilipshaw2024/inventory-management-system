@@ -22,6 +22,34 @@ class TransferReplenishmentTest extends TestCase
 {
     use RefreshDatabase;
 
+    public function test_batch_transfer_execution_is_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Batch Transfer Co', 'code' => 'BATCH-TRANSFER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Batch Transfer Branch', 'code' => 'BATCH-TRANSFER-BRANCH']);
+        $warehouse = $branch->warehouses()->create(['name' => 'Batch Transfer Warehouse', 'code' => 'BATCH-TRANSFER-WH']);
+        $source = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Batch Source', 'code' => 'BATCH-SOURCE', 'type' => 'bin', 'is_active' => true]);
+        $destination = InventoryLocation::create(['warehouse_id' => $warehouse->id, 'name' => 'Batch Destination', 'code' => 'BATCH-DESTINATION', 'type' => 'bin', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Batch Transfer Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Batch Transfer Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Batch Transfer Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch transfer item', 'status' => 1, 'is_stock_item' => true]);
+        foreach ([[$source->id, 2, 10], [$destination->id, 8, 10]] as [$locationId, $reorder, $maximum]) {
+            InventoryReplenishmentPolicy::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $locationId, 'reorder_point' => $reorder, 'min_stock' => $reorder, 'max_stock' => $maximum, 'is_active' => true]);
+        }
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $source->id, 'movement_type' => 'receipt', 'quantity' => 15, 'unit_cost' => 4, 'posted_at' => now()]);
+        Sanctum::actingAs($user, ['inventory:write']);
+        $payload = ['items' => [['external_reference' => 'BATCH-TRANSFER-1', 'product_id' => $product->id, 'source_location_id' => $source->id, 'destination_location_id' => $destination->id, 'quantity' => 10]]];
+
+        $created = $this->postJson('/api/inventory/replenishment/transfer-suggestions/create-transfers', $payload)->assertCreated();
+        $created->assertJsonPath('status', 'completed')->assertJsonPath('summary.created', 1)->assertJsonPath('data.0.status', 'pending_approval');
+        $this->assertSame(1, InventoryTransfer::where('company_id', $company->id)->count());
+
+        $this->postJson('/api/inventory/replenishment/transfer-suggestions/create-transfers', $payload)->assertOk()
+            ->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('summary.duplicates', 1)->assertJsonPath('summary.created', 0);
+        $this->assertSame(1, InventoryTransfer::where('company_id', $company->id)->count());
+    }
+
     public function test_transfer_suggestions_pair_surplus_and_shortage_locations(): void
     {
         $company = Company::create(['name' => 'Transfer Planning Co', 'code' => 'TRANSFER-PLAN']);
