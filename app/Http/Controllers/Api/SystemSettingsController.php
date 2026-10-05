@@ -21,6 +21,7 @@ class SystemSettingsController extends Controller
         'purchase_over_receipt_tolerance_percent',
         'auto_release_production_orders',
         'carrier_sla_hours',
+        'password_expiry_days',
         'branch_carrier_sla_hours', 'dashboard_widgets', 'default_inventory_costing_method', 'default_standard_cost',
     ];
 
@@ -67,6 +68,7 @@ class SystemSettingsController extends Controller
             'dashboard_widgets.*' => ['string', 'in:month_sales,total_products,low_stock,pending_approvals,receivables,open_service_requests,breached_service_requests,active_maintenance_orders,sales_trend,exception_drilldowns'],
             'default_inventory_costing_method' => ['sometimes', 'in:fifo,weighted_average,moving_average,standard'],
             'default_standard_cost' => ['sometimes', 'nullable', 'numeric', 'min:0'],
+            'password_expiry_days' => ['sometimes', 'integer', 'min:0', 'max:3650'],
         ]);
         if (array_key_exists('abc_b_threshold_percent', $data) && !array_key_exists('abc_a_threshold_percent', $data)) {
             $data['abc_a_threshold_percent'] = app(ErpSettingService::class)->get('abc_a_threshold_percent', 80, (int) $companyId);
@@ -86,7 +88,7 @@ class SystemSettingsController extends Controller
         $service = app(ErpSettingService::class);
         $before = $this->values((int) $companyId);
         foreach ($data as $key => $value) {
-            $type = in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars', 'dashboard_widgets'], true) ? 'json' : ($key === 'decimal_precision' || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string')));
+            $type = in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars', 'dashboard_widgets'], true) ? 'json' : ($key === 'decimal_precision' || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string')));
             $service->put($key, $value, $type, (int) $companyId);
         }
         $after = $this->values((int) $companyId);
@@ -124,6 +126,7 @@ class SystemSettingsController extends Controller
             'dashboard_widgets' => $service->get('dashboard_widgets', \App\Services\DashboardMetricsService::WIDGETS, $companyId),
             'default_inventory_costing_method' => $service->get('default_inventory_costing_method', 'fifo', $companyId),
             'default_standard_cost' => $service->get('default_standard_cost', null, $companyId),
+            'password_expiry_days' => $service->get('password_expiry_days', 0, $companyId),
         ];
     }
 

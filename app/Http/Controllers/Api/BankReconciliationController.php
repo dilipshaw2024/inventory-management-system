@@ -122,10 +122,10 @@ class BankReconciliationController extends Controller
         $data = $request->validate([
             'name' => ['required', 'string', 'max:150'], 'account_no' => ['nullable', 'string', 'max:80'],
             'currency_code' => ['required', 'string', 'size:3'], 'gl_account_id' => ['nullable', 'integer', Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
-            'provider' => ['nullable', 'string', 'max:50'], 'connection_config' => ['nullable', 'array'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'],
+            'provider' => ['nullable', 'string', 'max:50'], 'connection_config' => ['nullable', 'array'],
         ]);
         $provider = strtolower(trim($data['provider'] ?? 'generic'));
-        if (!in_array($provider, ['generic', 'http'], true)) abort(422, 'Unsupported bank statement provider.');
+        try { $this->bankAdapters->resolve($provider); } catch (\InvalidArgumentException $exception) { abort(422, $exception->getMessage()); }
         $data['provider'] = $provider;
         $data['currency_code'] = strtoupper($data['currency_code']);
         $account = BankAccount::create($data + ['company_id' => $companyId, 'is_active' => true]);
@@ -140,11 +140,11 @@ class BankReconciliationController extends Controller
         $data = $request->validate([
             'name' => ['sometimes', 'required', 'string', 'max:150'], 'account_no' => ['nullable', 'string', 'max:80'],
             'currency_code' => ['sometimes', 'required', 'string', 'size:3'], 'gl_account_id' => ['nullable', 'integer', Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
-            'provider' => ['sometimes', 'required', 'string', 'max:50'], 'connection_config' => ['sometimes', 'nullable', 'array'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'], 'is_active' => ['sometimes', 'boolean'],
+            'provider' => ['sometimes', 'required', 'string', 'max:50'], 'connection_config' => ['sometimes', 'nullable', 'array'], 'is_active' => ['sometimes', 'boolean'],
         ]);
         if (array_key_exists('provider', $data)) {
             $data['provider'] = strtolower(trim($data['provider']));
-            if (!in_array($data['provider'], ['generic', 'http'], true)) abort(422, 'Unsupported bank statement provider.');
+            try { $this->bankAdapters->resolve($data['provider']); } catch (\InvalidArgumentException $exception) { abort(422, $exception->getMessage()); }
         }
         if (array_key_exists('currency_code', $data)) $data['currency_code'] = strtoupper($data['currency_code']);
         $before = $account->only(array_keys($data));

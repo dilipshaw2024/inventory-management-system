@@ -22,6 +22,7 @@ class User extends Authenticatable implements MustVerifyEmail
         'username',
         'email',
         'password',
+        'password_changed_at',
         'company_id',
         'branch_id',
         'warehouse_id',
@@ -52,6 +53,7 @@ class User extends Authenticatable implements MustVerifyEmail
         'mfa_secret' => 'encrypted',
         'mfa_recovery_codes' => 'encrypted:array',
         'mfa_enabled_at' => 'datetime',
+        'password_changed_at' => 'datetime',
     ];
 
     public function roles() { return $this->belongsToMany(Role::class); }

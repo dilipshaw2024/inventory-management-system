@@ -15,6 +15,7 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
+use Tests\Support\FakeEInvoiceProvider;
 
 class EInvoiceIntegrationTest extends TestCase
 {
@@ -78,6 +79,24 @@ class EInvoiceIntegrationTest extends TestCase
         $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'INV-PENDING', 'status' => 0, 'total_amount' => 10]);
         $token = $user->createToken('einvoice-pending-test', ['accounting:write'])->plainTextToken;
         $this->withToken($token)->postJson('/api/accounting/invoices/'.$invoice->id.'/e-invoice')->assertStatus(422)->assertJsonPath('message', 'Only approved sales invoices can be prepared for e-invoicing.');
+    }
+
+    public function test_configured_provider_can_be_used_for_settings_and_preparation(): void
+    {
+        config(['integrations.e_invoice_adapters' => [FakeEInvoiceProvider::class]]);
+        $this->app->forgetInstance(\App\Services\Integrations\EInvoiceProviderRegistry::class);
+        $company = Company::create(['name' => 'Custom E-Invoice Co', 'code' => 'EINV-CUSTOM']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'INV-CUSTOM', 'status' => 1, 'total_amount' => 10]);
+        $token = $user->createToken('custom-einvoice', ['accounting:write'])->plainTextToken;
+
+        $this->withToken($token)->postJson('/api/accounting/e-invoice-providers', [
+            'provider' => 'TEST-PROVIDER',
+            'connection_config' => ['jurisdiction' => 'EU'],
+        ])->assertCreated()->assertJsonPath('data.provider', 'test-provider');
+
+        $this->withToken($token)->postJson('/api/accounting/invoices/'.$invoice->id.'/e-invoice', ['provider' => 'TEST-PROVIDER'])
+            ->assertCreated()->assertJsonPath('data.provider', 'test-provider')->assertJsonPath('data.payload.provider', 'test-provider');
     }
 
     public function test_http_provider_settings_are_company_scoped_encrypted_and_used_for_submission(): void

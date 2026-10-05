@@ -3,24 +3,36 @@
 namespace App\Services;
 
 use App\Models\TaxFiling;
+use App\Models\CompanyTaxRegistration;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
+use App\Services\Integrations\TaxFilingProviderRegistry;
 
 class TaxFilingService
 {
-    public function createSnapshot(int $companyId, string $from, string $to, ?string $jurisdiction, array $payload, ?string $externalReference = null, string $returnType = 'indirect_tax'): TaxFiling
+    public function __construct(private TaxFilingProviderRegistry $providers) {}
+
+    public function createSnapshot(int $companyId, string $from, string $to, ?string $jurisdiction, array $payload, ?string $externalReference = null, string $returnType = 'indirect_tax', ?int $taxRegistrationId = null): TaxFiling
     {
-        $externalReference = $externalReference ?: 'tax-filing:'.$companyId.':'.$from.':'.$to.':'.($jurisdiction ?: 'all');
+        $registration = null;
+        if ($taxRegistrationId !== null) {
+            $registration = CompanyTaxRegistration::where('company_id', $companyId)->whereKey($taxRegistrationId)->where('is_active', true)->first();
+            if (!$registration) throw new RuntimeException('The selected tax registration is not active or is not owned by this company.');
+            if ($registration->effective_from && $registration->effective_from->toDateString() > $from) throw new RuntimeException('The selected tax registration is not effective for the filing period.');
+            if ($registration->effective_until && $registration->effective_until->toDateString() < $to) throw new RuntimeException('The selected tax registration expires before the filing period ends.');
+            if ($jurisdiction !== null && $registration->jurisdiction !== $jurisdiction) throw new RuntimeException('The tax registration jurisdiction must match the filing jurisdiction.');
+        }
+        $externalReference = $externalReference ?: 'tax-filing:'.$companyId.':'.$from.':'.$to.':'.($jurisdiction ?: 'all').':'.($taxRegistrationId ?: 'none');
         $existing = TaxFiling::where('company_id', $companyId)->where('external_reference', $externalReference)->first();
         if ($existing) return $existing;
-        $snapshot = ['return_type' => $returnType, 'period_from' => $from, 'period_to' => $to, 'jurisdiction' => $jurisdiction, 'report' => $payload];
+        $snapshot = ['return_type' => $returnType, 'period_from' => $from, 'period_to' => $to, 'jurisdiction' => $jurisdiction, 'tax_registration' => $registration?->only(['id', 'jurisdiction', 'scheme', 'registration_number', 'legal_name', 'effective_from', 'effective_until']), 'report' => $payload];
         $snapshotHash = $this->snapshotHash($snapshot);
         $summary = $payload['summary'] ?? $payload;
         return TaxFiling::create([
             'company_id' => $companyId,
             'filing_no' => 'TAX-FILE-'.$from.'-'.$to.($jurisdiction ? '-'.strtoupper(substr(preg_replace('/[^A-Za-z0-9]/', '', $jurisdiction), 0, 12)) : ''),
             'external_reference' => $externalReference,
-            'period_from' => $from, 'period_to' => $to, 'jurisdiction' => $jurisdiction,
+            'period_from' => $from, 'period_to' => $to, 'jurisdiction' => $jurisdiction, 'tax_registration_id' => $registration?->id,
             'return_type' => $returnType, 'sales_tax' => (float) ($summary['sales_tax'] ?? 0), 'purchase_tax' => (float) ($summary['purchase_tax'] ?? 0), 'net_tax' => (float) ($summary['net_tax'] ?? 0),
             'snapshot_payload' => $snapshot, 'snapshot_hash' => $snapshotHash,
             'created_by' => auth()->id(),
@@ -50,13 +62,12 @@ class TaxFilingService
     public function submit(TaxFiling $filing, ?string $reference = null, ?string $provider = null): TaxFiling
     {
         if ($provider !== null) {
-            if ($provider !== 'http') throw new RuntimeException('Unsupported tax filing provider.');
             try {
                 return DB::transaction(function () use ($filing, $provider): TaxFiling {
                     $filing = TaxFiling::lockForUpdate()->findOrFail($filing->id);
                     if ($filing->status !== 'draft') throw new RuntimeException('Only draft tax filings can be submitted.');
                     if (!$this->verifySnapshot($filing)) throw new RuntimeException('Tax filing snapshot integrity verification failed.');
-                    $providerResult = app(\App\Services\Integrations\HttpTaxFilingProvider::class)->submit($filing);
+                    $providerResult = $this->providers->resolve($provider)->submit($filing);
                     $reference = $providerResult['filing_reference'] ?? null;
                     if (!$reference) throw new RuntimeException('The tax filing provider did not return a filing reference.');
                     $filing->update(['status' => $providerResult['status'] ?? 'submitted', 'filing_reference' => $reference, 'submission_provider' => $provider, 'provider_response' => $providerResult['response'] ?? null, 'provider_error' => null, 'submitted_by' => auth()->id(), 'submitted_at' => now()]);

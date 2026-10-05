@@ -41,6 +41,7 @@ class RegisteredUserController extends Controller
             'email' => ['required', 'string', 'email', 'max:255', 'unique:users'],
             'password' => app(PasswordPolicyService::class)->rules(),
         ]);
+        app(PasswordPolicyService::class)->assertNotBreached($request->password);
 
         $username = $request->input('username') ?: Str::before($request->email, '@');
         while (User::where('username', $username)->exists()) {
@@ -52,6 +53,7 @@ class RegisteredUserController extends Controller
             'username' => $username,
             'email' => $request->email,
             'password' => Hash::make($request->password),
+            'password_changed_at' => now(),
             'is_active' => true,
         ]);
 

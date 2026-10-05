@@ -26,6 +26,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use App\Services\Integrations\TaxFilingProviderRegistry;
 
 class FinanceIntegrationController extends Controller
 {
@@ -153,7 +154,7 @@ class FinanceIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for tax filings.');
-        $data = $request->validate(['status' => ['nullable', 'in:draft,submitted,accepted,rejected'], 'submission_provider' => ['nullable', 'in:http'], 'has_provider_error' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['status' => ['nullable', 'in:draft,submitted,accepted,rejected'], 'submission_provider' => ['nullable', 'string', 'max:80'], 'has_provider_error' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $filings = TaxFiling::where('company_id', $companyId)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['submission_provider'] ?? null, fn ($query, $provider) => $query->where('submission_provider', $provider))
@@ -172,7 +173,7 @@ class FinanceIntegrationController extends Controller
     {
         $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'url', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
         $data['provider'] = strtolower(trim($data['provider']));
-        if ($data['provider'] !== 'http') abort(422, 'Unsupported tax filing provider setting.');
+        if (!in_array($data['provider'], app(TaxFilingProviderRegistry::class)->keys(), true)) abort(422, 'Unsupported tax filing provider setting.');
         $setting = TaxFilingProviderSetting::updateOrCreate(['company_id' => $request->user()?->company_id, 'provider' => $data['provider']], ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true]);
         app(AuditService::class)->record('tax_filing_provider.updated', $setting, null, $setting->toArray());
         return response()->json(['data' => $setting, 'status' => 'configured'], 201);
@@ -222,11 +223,12 @@ class FinanceIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for tax filings.');
-        $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'external_reference' => ['nullable', 'string', 'max:180'], 'return_type' => ['nullable', 'string', 'max:40']]);
+        $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'tax_registration_id' => ['nullable', 'integer', Rule::exists('company_tax_registrations', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('is_active', true))], 'external_reference' => ['nullable', 'string', 'max:180'], 'return_type' => ['nullable', 'string', 'max:40']]);
         $report = json_decode($this->taxReport($request)->getContent(), true, 512, JSON_THROW_ON_ERROR);
-        $externalReference = $data['external_reference'] ?? 'tax-filing:'.$companyId.':'.$data['from'].':'.$data['to'].':'.($data['jurisdiction'] ?? 'all');
+        $externalReference = $data['external_reference'] ?? 'tax-filing:'.$companyId.':'.$data['from'].':'.$data['to'].':'.($data['jurisdiction'] ?? 'all').':'.($data['tax_registration_id'] ?? 'none');
         $existing = TaxFiling::where('company_id', $companyId)->where('external_reference', $externalReference)->exists();
-        $filing = app(\App\Services\TaxFilingService::class)->createSnapshot((int) $companyId, $data['from'], $data['to'], $data['jurisdiction'] ?? null, $report, $data['external_reference'] ?? null, $data['return_type'] ?? 'indirect_tax');
+        try { $filing = app(\App\Services\TaxFilingService::class)->createSnapshot((int) $companyId, $data['from'], $data['to'], $data['jurisdiction'] ?? null, $report, $data['external_reference'] ?? null, $data['return_type'] ?? 'indirect_tax', isset($data['tax_registration_id']) ? (int) $data['tax_registration_id'] : null); }
+        catch (\RuntimeException $exception) { abort(422, $exception->getMessage()); }
         return response()->json(['data' => $filing, 'status' => $existing ? 'existing' : 'draft', 'tax_report' => $report['summary'] ?? []], $existing ? 200 : 201);
     }
 
@@ -266,7 +268,7 @@ class FinanceIntegrationController extends Controller
     public function submitTaxFiling(Request $request, int $id): JsonResponse
     {
         $filing = TaxFiling::where('company_id', $request->user()?->company_id)->findOrFail($id);
-        $data = $request->validate(['filing_reference' => ['nullable', 'string', 'max:180'], 'provider' => ['nullable', 'in:http']]);
+        $data = $request->validate(['filing_reference' => ['nullable', 'string', 'max:180'], 'provider' => ['nullable', 'string', 'max:80', Rule::in(app(TaxFilingProviderRegistry::class)->keys())]]);
         if (empty($data['filing_reference']) && empty($data['provider'])) abort(422, 'A filing reference or provider is required.');
         $previousStatus = $filing->status;
         try { $filing = app(\App\Services\TaxFilingService::class)->submit($filing, $data['filing_reference'] ?? null, $data['provider'] ?? null); }

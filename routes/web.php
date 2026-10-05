@@ -454,6 +454,9 @@ Route::middleware(['auth', 'permission:accounting.manage'])->controller(Accounti
     Route::post('/tax-filings', [\App\Http\Controllers\TaxFilingController::class, 'create'])->name('tax-filings.create');
     Route::post('/tax-filing-providers', [\App\Http\Controllers\TaxFilingController::class, 'storeProvider'])->name('tax-filing-providers.store');
     Route::post('/tax-filing-providers/{id}/deactivate', [\App\Http\Controllers\TaxFilingController::class, 'deactivateProvider'])->name('tax-filing-providers.deactivate');
+    Route::post('/tax-registrations', [\App\Http\Controllers\TaxFilingController::class, 'storeRegistration'])->name('tax-registrations.store');
+    Route::patch('/tax-registrations/{id}', [\App\Http\Controllers\TaxFilingController::class, 'updateRegistration'])->name('tax-registrations.update');
+    Route::post('/tax-registrations/{id}/deactivate', [\App\Http\Controllers\TaxFilingController::class, 'deactivateRegistration'])->name('tax-registrations.deactivate');
     Route::post('/tax-filings/{id}/verify', [\App\Http\Controllers\TaxFilingController::class, 'verify'])->name('tax-filings.verify');
     Route::get('/tax-filings/{id}/export', [\App\Http\Controllers\TaxFilingController::class, 'export'])->name('tax-filings.export');
     Route::post('/tax-filings/{id}/submit', [\App\Http\Controllers\TaxFilingController::class, 'submit'])->name('tax-filings.submit');

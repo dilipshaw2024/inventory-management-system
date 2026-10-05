@@ -13,4 +13,5 @@ class TaxFiling extends Model
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }
     public function submitter() { return $this->belongsTo(User::class, 'submitted_by'); }
     public function decider() { return $this->belongsTo(User::class, 'decided_by'); }
+    public function taxRegistration() { return $this->belongsTo(CompanyTaxRegistration::class, 'tax_registration_id'); }
 }

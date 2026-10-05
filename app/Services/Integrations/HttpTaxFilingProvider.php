@@ -6,8 +6,13 @@ use App\Models\TaxFiling;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Http;
 
-class HttpTaxFilingProvider
+class HttpTaxFilingProvider implements TaxFilingProvider
 {
+    public function key(): string
+    {
+        return 'http';
+    }
+
     public function submit(TaxFiling $filing): array
     {
         $connection = $this->connectionConfig($filing);

@@ -27,6 +27,7 @@ use App\Services\CustomerCreditService;
 use App\Services\SupplierPayablesService;
 use App\Services\AccountingReconciliationService;
 use App\Services\EInvoiceService;
+use App\Services\Integrations\EInvoiceProviderRegistry;
 use App\Services\SupplierPaymentProposalService;
 use App\Services\CustomerReceiptProposalService;
 use App\Services\CurrencyConversionService;
@@ -58,18 +59,13 @@ class AccountingIntegrationController extends Controller
     public function storeEInvoiceProvider(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
+        $request->merge(['provider' => strtolower(trim((string) $request->input('provider')))]);
         $data = $request->validate([
-            'provider' => ['required', 'string', 'max:80'],
+            'provider' => ['required', 'string', 'max:80', Rule::in(app(EInvoiceProviderRegistry::class)->keys())],
             'connection_config' => ['required', 'array'],
-            'connection_config.endpoint' => ['nullable', 'url', 'max:2000'],
-            'connection_config.token' => ['nullable', 'string', 'max:2000'],
-            'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'],
-            'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'],
-            'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'],
             'is_active' => ['sometimes', 'boolean'],
         ]);
         $data['provider'] = strtolower(trim($data['provider']));
-        if ($data['provider'] !== 'http') abort(422, 'Unsupported e-invoice provider setting.');
         $setting = EInvoiceProviderSetting::updateOrCreate(
             ['company_id' => $companyId, 'provider' => $data['provider']],
             ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true],
@@ -83,11 +79,6 @@ class AccountingIntegrationController extends Controller
         $setting = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
         $data = $request->validate([
             'connection_config' => ['sometimes', 'required', 'array'],
-            'connection_config.endpoint' => ['nullable', 'url', 'max:2000'],
-            'connection_config.token' => ['nullable', 'string', 'max:2000'],
-            'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'],
-            'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'],
-            'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'],
             'is_active' => ['sometimes', 'boolean'],
         ]);
         $setting->update($data);
@@ -105,7 +96,8 @@ class AccountingIntegrationController extends Controller
 
     public function prepareEInvoice(Request $request, int $id, EInvoiceService $service): JsonResponse
     {
-        $data = $request->validate(['provider' => ['nullable', 'string', 'max:80']]);
+        if ($request->filled('provider')) $request->merge(['provider' => strtolower(trim((string) $request->input('provider')))]);
+        $data = $request->validate(['provider' => ['nullable', 'string', 'max:80', Rule::in(app(EInvoiceProviderRegistry::class)->keys())]]);
         $companyId = $this->requestedCompanyId($request);
         abort_unless($companyId, 403, 'A company is required for e-invoice submissions.');
         $invoice = Invoice::with(['customer', 'invoice_details.product'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($id);

@@ -30,4 +30,9 @@ class Company extends Model
     {
         return $this->hasMany(self::class, 'parent_company_id');
     }
+
+    public function taxRegistrations()
+    {
+        return $this->hasMany(CompanyTaxRegistration::class);
+    }
 }

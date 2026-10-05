@@ -38,6 +38,7 @@ class NewPasswordController extends Controller
             'email' => ['required', 'email'],
             'password' => app(PasswordPolicyService::class)->rules(),
         ]);
+        app(PasswordPolicyService::class)->assertNotBreached($request->password);
 
         // Here we will attempt to reset the user's password. If it is successful we
         // will update the password on an actual user model and persist it to the
@@ -49,6 +50,7 @@ class NewPasswordController extends Controller
                 app(\App\Services\PasswordPolicyService::class)->rememberCurrent($user);
                 $user->forceFill([
                     'password' => Hash::make($request->password),
+                    'password_changed_at' => now(),
                     'remember_token' => Str::random(60),
                 ])->save();
 

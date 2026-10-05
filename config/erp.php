@@ -9,4 +9,10 @@ return [
         'numbers' => filter_var(env('ERP_PASSWORD_NUMBERS', true), FILTER_VALIDATE_BOOLEAN),
         'symbols' => filter_var(env('ERP_PASSWORD_SYMBOLS', true), FILTER_VALIDATE_BOOLEAN),
     ],
+    'password_breach_screening' => [
+        'enabled' => filter_var(env('ERP_PASSWORD_BREACH_SCREENING', false), FILTER_VALIDATE_BOOLEAN),
+        'endpoint' => env('ERP_PASSWORD_BREACH_ENDPOINT', 'https://api.pwnedpasswords.com/range'),
+        'timeout' => max(1, (int) env('ERP_PASSWORD_BREACH_TIMEOUT', 3)),
+        'fail_closed' => filter_var(env('ERP_PASSWORD_BREACH_FAIL_CLOSED', false), FILTER_VALIDATE_BOOLEAN),
+    ],
 ];

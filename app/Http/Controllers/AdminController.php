@@ -90,6 +90,7 @@ class AdminController extends Controller
             'confirm_password' => 'required|same:newpassword',
 
         ]);
+        app(PasswordPolicyService::class)->assertNotBreached($request->newpassword, 'newpassword');
 
         $hashedPassword = Auth::user()->password;
         if (Hash::check($request->oldpassword,$hashedPassword )) {
@@ -97,6 +98,7 @@ class AdminController extends Controller
             app(PasswordPolicyService::class)->assertNotReused($users, $request->newpassword, 'newpassword');
             app(PasswordPolicyService::class)->rememberCurrent($users);
             $users->password = bcrypt($request->newpassword);
+            $users->password_changed_at = now();
             $users->save();
 
             session()->flash('message','Password Updated Successfully');

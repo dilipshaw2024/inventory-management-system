@@ -8,6 +8,8 @@ use App\Services\Integrations\EInvoiceProviderRegistry;
 use App\Services\Integrations\HttpCarrierTrackingAdapter;
 use App\Services\Integrations\HttpBankStatementAdapter;
 use App\Services\Integrations\HttpEInvoiceProvider;
+use App\Services\Integrations\TaxFilingProviderRegistry;
+use App\Services\Integrations\HttpTaxFilingProvider;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -39,6 +41,14 @@ class AppServiceProvider extends ServiceProvider
             $registry = new EInvoiceProviderRegistry();
             $registry->register($app->make(HttpEInvoiceProvider::class));
             foreach ((array) config('integrations.e_invoice_adapters', []) as $providerClass) {
+                $registry->register($app->make($providerClass));
+            }
+            return $registry;
+        });
+        $this->app->singleton(TaxFilingProviderRegistry::class, function ($app): TaxFilingProviderRegistry {
+            $registry = new TaxFilingProviderRegistry();
+            $registry->register($app->make(HttpTaxFilingProvider::class));
+            foreach ((array) config('integrations.tax_filing_adapters', []) as $providerClass) {
                 $registry->register($app->make($providerClass));
             }
             return $registry;

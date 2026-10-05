@@ -4,7 +4,9 @@ namespace App\Services;
 
 use App\Models\PasswordHistory;
 use App\Models\User;
+use App\Services\ErpSettingService;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Carbon;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Validation\Rules\Password;
 
@@ -45,5 +47,24 @@ class PasswordPolicyService
         PasswordHistory::create(['user_id' => $user->getKey(), 'company_id' => $user->company_id, 'password_hash' => $user->password]);
         $history = PasswordHistory::where('user_id', $user->getKey())->latest()->get();
         if ($history->count() > 10) PasswordHistory::where('user_id', $user->getKey())->whereNotIn('id', $history->take(10)->pluck('id'))->delete();
+    }
+
+    public function expiryDays(?int $companyId = null): int
+    {
+        return max(0, (int) app(ErpSettingService::class)->get('password_expiry_days', 0, $companyId));
+    }
+
+    public function isExpired(User $user): bool
+    {
+        $days = $this->expiryDays($user->company_id);
+        return $days > 0 && $user->password_changed_at !== null
+            && $user->password_changed_at->lte(Carbon::now()->subDays($days));
+    }
+
+    public function assertNotBreached(string $plainText, string $attribute = 'password'): void
+    {
+        if (app(PasswordBreachScreeningService::class)->isCompromised($plainText)) {
+            throw ValidationException::withMessages([$attribute => 'This password has appeared in known compromised-password data. Choose a different password.']);
+        }
     }
 }

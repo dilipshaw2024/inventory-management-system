@@ -75,10 +75,11 @@ class DeliveryTrackingIntegrationController extends Controller
 
     public function storeCarrierTrackingProvider(Request $request): JsonResponse
     {
-        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $request->merge(['provider' => strtolower(trim((string) $request->input('provider')))]);
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'is_active' => ['sometimes', 'boolean']]);
         $this->validateCarrierEndpoint($data['connection_config']['endpoint'] ?? null);
         $data['provider'] = strtolower(trim($data['provider']));
-        if (!in_array($data['provider'], ['http', 'generic'], true)) abort(422, 'Unsupported carrier tracking provider setting.');
+        try { $this->carrierAdapters->resolve($data['provider']); } catch (\InvalidArgumentException $exception) { abort(422, $exception->getMessage()); }
         $setting = CarrierTrackingProviderSetting::updateOrCreate(['company_id' => $request->user()?->company_id, 'provider' => $data['provider']], ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true]);
         app(AuditService::class)->record('carrier_tracking_provider.updated', $setting, null, $setting->toArray());
         return response()->json(['data' => $setting, 'status' => 'configured'], 201);
@@ -87,7 +88,7 @@ class DeliveryTrackingIntegrationController extends Controller
     public function updateCarrierTrackingProvider(Request $request, int $id): JsonResponse
     {
         $setting = CarrierTrackingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
-        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'connection_config.endpoint' => ['nullable', 'string', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.webhook_secret' => ['nullable', 'string', 'min:16', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'is_active' => ['sometimes', 'boolean']]);
         $this->validateCarrierEndpoint($data['connection_config']['endpoint'] ?? null);
         $setting->update($data);
         app(AuditService::class)->record('carrier_tracking_provider.updated', $setting, null, $setting->toArray());
