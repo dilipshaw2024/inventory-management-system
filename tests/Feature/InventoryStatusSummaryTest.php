@@ -135,4 +135,32 @@ class InventoryStatusSummaryTest extends TestCase
         $this->assertDatabaseHas('inventory_status_transfers', ['id' => $transferId, 'status' => 'pending']);
         $this->assertDatabaseMissing('inventory_movements', ['reference_id' => $transferId]);
     }
+
+    public function test_available_batch_disposition_cannot_exceed_selected_batch_layer(): void
+    {
+        $company = Company::create(['name' => 'Batch Disposition Co', 'code' => 'BATCH-DISPOSITION']);
+        $creator = User::factory()->create(['company_id' => $company->id]);
+        $checker = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Batch Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Batch Each', 'code' => 'EA-BATCH-DISPOSITION', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Batch Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch disposition item', 'quantity' => 2, 'purchase_price' => 5, 'tracking_type' => 'batch', 'status' => 1]);
+        $firstBatch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'BATCH-DISP-A']);
+        $secondBatch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'BATCH-DISP-B']);
+        Sanctum::actingAs($creator, ['inventory:write']);
+        app(\App\Services\InventoryLedgerService::class)->post($product->id, 'receipt', 1, 5, null, null, 'Batch A receipt', $creator->id, $firstBatch->id);
+        app(\App\Services\InventoryLedgerService::class)->post($product->id, 'receipt', 1, 5, null, null, 'Batch B receipt', $creator->id, $secondBatch->id);
+        $transferId = $this->postJson('/api/inventory/status-transfers', [
+            'product_id' => $product->id, 'batch_id' => $firstBatch->id, 'from_status' => 'available', 'to_status' => 'damaged',
+            'quantity' => 2, 'reason' => 'Batch validation test',
+        ])->assertCreated()->json('data.id');
+
+        Sanctum::actingAs($checker, ['inventory:write']);
+        $this->postJson('/api/inventory/status-transfers/'.$transferId.'/approve')
+            ->assertStatus(422)
+            ->assertJsonPath('message', 'Insufficient available stock in the selected batch for Batch disposition item.');
+        $this->assertDatabaseHas('inventory_status_transfers', ['id' => $transferId, 'status' => 'pending']);
+        $this->assertDatabaseMissing('inventory_movements', ['reference_id' => $transferId]);
+    }
+
 }

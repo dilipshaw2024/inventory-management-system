@@ -21,6 +21,13 @@ trait BelongsToBranchCompany
                     $query->where('company_id', $companyId);
                     if ($user?->branch_id) $query->whereKey($user->branch_id);
                 });
+                if ($user?->warehouse_id) {
+                    if ($builder->getModel() instanceof \App\Models\InventoryLocation) {
+                        $builder->where('warehouse_id', $user->warehouse_id);
+                    } elseif ($builder->getModel() instanceof \App\Models\Warehouse) {
+                        $builder->whereKey($user->warehouse_id);
+                    }
+                }
             }
         });
 
@@ -34,6 +41,15 @@ trait BelongsToBranchCompany
 
             if (!$branch || (int) $branch->company_id !== (int) $user->company_id || (int) $branch->id !== (int) $user->branch_id) {
                 throw new AuthorizationException('This user cannot write records outside the assigned branch.');
+            }
+            if ($user->warehouse_id) {
+                $outsideWarehouse = $model instanceof \App\Models\InventoryLocation
+                    ? (int) $model->warehouse_id !== (int) $user->warehouse_id
+                    : $model instanceof \App\Models\Warehouse
+                        && (!$model->exists || (int) $model->id !== (int) $user->warehouse_id);
+                if ($outsideWarehouse) {
+                    throw new AuthorizationException('This user cannot write records outside the assigned warehouse.');
+                }
             }
         });
     }

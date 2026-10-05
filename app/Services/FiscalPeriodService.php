@@ -47,6 +47,39 @@ class FiscalPeriodService
         if ($draft > 0) throw new \RuntimeException('Close checklist failed: '.$draft.' bank reconciliations remain open through '.$endDate.'.');
     }
 
+    public function assertStandardCostVariancesClosed(int $companyId, string $endDate): void
+    {
+        $movements = \App\Models\InventoryMovement::withoutGlobalScopes()
+            ->with(['product', 'allocations'])
+            ->where('company_id', $companyId)
+            ->whereDate('posted_at', '<=', $endDate)
+            ->whereIn('movement_type', ['receipt', 'opening', 'transfer_in', 'adjustment_in', 'return_in', 'issue', 'transfer_out', 'adjustment_out', 'scrap', 'return_out'])
+            ->get();
+        if ($movements->isEmpty()) return;
+
+        $policyService = app(\App\Services\ProductCostingPolicyService::class);
+        $outstanding = 0;
+        foreach ($movements as $movement) {
+            if (!$movement->product) continue;
+            $policy = $policyService->resolve($movement->product, $movement->posted_at ?: now());
+            if (($policy['costing_method'] ?? null) !== 'standard' || $policy['standard_cost'] === null) continue;
+            $quantity = abs((float) $movement->quantity);
+            if ($quantity <= 0) continue;
+            $inbound = in_array((string) $movement->movement_type, ['receipt', 'opening', 'transfer_in', 'adjustment_in', 'return_in'], true);
+            $actual = $inbound
+                ? $quantity * (float) ($movement->unit_cost ?? 0)
+                : (float) $movement->allocations->sum(fn ($allocation): float => (float) $allocation->total_cost);
+            if (!$inbound && $actual <= 0) $actual = $quantity * (float) ($movement->unit_cost ?? 0);
+            $variance = round($actual - ($quantity * (float) $policy['standard_cost']), 6);
+            if (abs($variance) <= 0.000001) continue;
+            $reference = 'STD-VARIANCE-MOVEMENT-'.$movement->id;
+            if (!\App\Models\JournalEntry::where('company_id', $companyId)->where('external_reference', $reference)->exists()) $outstanding++;
+        }
+        if ($outstanding > 0) {
+            throw new \RuntimeException('Close checklist failed: '.$outstanding.' standard-cost variance journal(s) remain unposted through '.$endDate.'.');
+        }
+    }
+
     public function assertCostRevaluationsClosed(int $companyId, string $endDate): void
     {
         $pending = InventoryCostRevaluationRun::withoutGlobalScopes()

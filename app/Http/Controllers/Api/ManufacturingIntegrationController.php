@@ -649,7 +649,7 @@ class ManufacturingIntegrationController extends Controller
         ]);
         $operations = $this->companyScope(ProductionOperation::with([
             'order:id,company_id,order_no,product_id,status,planned_date', 'order.product:id,name,sku',
-            'routingOperation:id,routing_id,sequence,operation,setup_minutes,run_minutes', 'workCenter:id,code,name',
+            'routingOperation:id,routing_id,sequence,operation,setup_minutes,run_minutes,alternate_work_center_ids', 'workCenter:id,code,name,capacity_hours_per_day,calendar,labor_rate,machine_rate',
             'starter:id,name,email', 'completer:id,name,email',
         ]), $request->user()?->company_id)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))

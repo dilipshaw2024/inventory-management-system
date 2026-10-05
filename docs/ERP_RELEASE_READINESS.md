@@ -19,7 +19,7 @@ php artisan view:cache
 
 ## 2. Background processing
 
-Run a continuously supervised queue worker and the Laravel scheduler. The scheduler drives inventory expiry and low-stock alerts, replenishment generation, production planning, reservation expiry, webhook delivery, accounting jobs, approval escalation, snapshots, audit-chain verification, legacy-versus-ledger reconciliation, and product-import processing. Recurring tasks use `withoutOverlapping` and `onOneServer`; production must use a shared scheduler cache/lock store when more than one application node is active. Audit-chain verification and ledger reconciliation are read-only scheduled controls; monitor failures when integrity or quantity drift is detected.
+Run a continuously supervised queue worker and the Laravel scheduler. The scheduler drives inventory expiry, low-stock, excess-stock, slow-moving, and dead-stock alerts, replenishment generation, production planning, reservation expiry, carrier tracking polling, webhook delivery, accounting jobs, approval escalation, snapshots, audit-chain verification, legacy-versus-ledger reconciliation, and product-import processing. Recurring tasks use `withoutOverlapping` and `onOneServer`; production must use a shared scheduler cache/lock store when more than one application node is active. Audit-chain verification and ledger reconciliation are read-only scheduled controls; monitor failures when integrity or quantity drift is detected.
 
 ```bash
 php artisan queue:work --sleep=3 --tries=3 --timeout=120

@@ -10,6 +10,7 @@ use App\Models\MaintenanceOrder;
 use App\Models\InventoryLocation;
 use App\Models\InventoryCostLayer;
 use App\Models\InventoryBatch;
+use App\Models\InventorySerial;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Collection;
 use App\Services\ErpSettingService;
@@ -101,6 +102,12 @@ class StockReservationService
         if ($remaining > 0.000001) StockReservation::create($base + ['quantity' => $remaining]);
     }
 
+    public function restoreReleasedSerial(StockReservation $reservation): void
+    {
+        if (!$reservation->serial_id) return;
+        InventorySerial::whereKey($reservation->serial_id)->where('status', 'reserved')->update(['status' => 'available']);
+    }
+
     public function releaseForSalesOrderLine(int $lineId, float $quantity, ?int $productId = null): void
     {
         $remaining = $quantity;
@@ -111,6 +118,7 @@ class StockReservationService
             $reservation->released_quantity = (float) $reservation->released_quantity + $release;
             if ($reservation->open_quantity <= 0.000001) $reservation->status = 'released';
             $reservation->save();
+            if ($reservation->status === 'released') $this->restoreReleasedSerial($reservation);
             $remaining -= $release;
         }
     }
@@ -120,6 +128,7 @@ class StockReservationService
         $reservations = StockReservation::whereIn('sales_order_line_id', $order->lines->pluck('id'))->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->lockForUpdate()->get();
         foreach ($reservations as $reservation) {
             $reservation->update(['released_quantity' => $reservation->quantity, 'status' => 'released']);
+            $this->restoreReleasedSerial($reservation);
         }
         return $reservations->count();
     }
@@ -171,6 +180,7 @@ class StockReservationService
             $reservation->released_quantity = (float) $reservation->released_quantity + $release;
             if ($reservation->open_quantity <= 0.000001) $reservation->status = 'released';
             $reservation->save();
+            if ($reservation->status === 'released') $this->restoreReleasedSerial($reservation);
             $remaining -= $release;
         }
         return $quantity - $remaining;
@@ -178,7 +188,8 @@ class StockReservationService
 
     public function releaseForSource(ProductionOrder $order): void
     {
-        StockReservation::where('source_type', $order->getMorphClass())->where('source_id', $order->id)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->update(['released_quantity' => DB::raw('quantity'), 'status' => 'released']);
+        $reservations = StockReservation::where('source_type', $order->getMorphClass())->where('source_id', $order->id)->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))->lockForUpdate()->get();
+        foreach ($reservations as $reservation) { $reservation->update(['released_quantity' => $reservation->quantity, 'status' => 'released']); $this->restoreReleasedSerial($reservation); }
     }
 
     public function releaseForSourceQuantity(ProductionOrder $order, float $quantity): void
@@ -191,6 +202,7 @@ class StockReservationService
             $reservation->released_quantity = (float) $reservation->released_quantity + $release;
             if ($reservation->open_quantity <= 0.000001) $reservation->status = 'released';
             $reservation->save();
+            if ($reservation->status === 'released') $this->restoreReleasedSerial($reservation);
             $remaining -= $release;
         }
         if ($remaining > 0.000001) throw new \RuntimeException('Production reservations do not cover the requested completion quantity.');
@@ -207,6 +219,7 @@ class StockReservationService
                 $reservation->released_quantity = (float) $reservation->released_quantity + $release;
                 if ($reservation->open_quantity <= 0.000001) $reservation->status = 'released';
                 $reservation->save();
+                if ($reservation->status === 'released') $this->restoreReleasedSerial($reservation);
                 $remaining -= $release;
             }
             if ($remaining > 0.000001) throw new \RuntimeException('Production reservations do not cover the requested component quantity.');
@@ -226,6 +239,98 @@ class StockReservationService
             }
             $this->createBatchReservations($product, $quantity, $order->location_id, ['source_type' => $order->getMorphClass(), 'source_id' => $order->id]);
         }
+    }
+
+    /** @return list<StockReservation> */
+    public function assignSerials(StockReservation $reservation, array $serialIds): array
+    {
+        return DB::transaction(function () use ($reservation, $serialIds): array {
+            $reservation = StockReservation::lockForUpdate()->findOrFail($reservation->id);
+            $serialIds = array_values(array_unique(array_map('intval', array_filter($serialIds, fn ($id): bool => (int) $id > 0))));
+            if ($serialIds === []) throw new \RuntimeException('At least one serial is required.');
+            if ($reservation->status !== 'active' || $reservation->open_quantity <= 0.000001) throw new \RuntimeException('Only open reservations can receive serial assignments.');
+            if (abs($reservation->open_quantity - round($reservation->open_quantity)) > 0.000001 || count($serialIds) > (int) round($reservation->open_quantity)) throw new \RuntimeException('Serial assignments must not exceed the open whole-unit reservation quantity.');
+            $product = Product::lockForUpdate()->findOrFail($reservation->product_id);
+            if ($product->tracking_type !== 'serial') throw new \RuntimeException('Serial assignment is only available for serial-tracked products.');
+            $serials = InventorySerial::whereIn('id', $serialIds)->where('product_id', $product->id)->whereIn('status', ['available', 'returned'])
+                ->when($reservation->batch_id !== null, fn ($query) => $query->where('batch_id', $reservation->batch_id))
+                ->when($reservation->location_id !== null, fn ($query) => $query->where(fn ($nested) => $nested->whereNull('location_id')->orWhere('location_id', $reservation->location_id)))
+                ->lockForUpdate()->get()->keyBy('id');
+            if ($serials->count() !== count($serialIds)) throw new \RuntimeException('One or more selected serials are unavailable for '.$product->name.'.');
+            $serials->each(fn (InventorySerial $serial): bool => (bool) $serial->update(['status' => 'reserved']));
+            $alreadyReserved = StockReservation::whereIn('serial_id', $serialIds)->where('status', 'active')->where('id', '!=', $reservation->id)->exists();
+            if ($alreadyReserved) throw new \RuntimeException('One or more selected serials are already reserved.');
+            if ($reservation->serial_id !== null) throw new \RuntimeException('This reservation already has a serial assignment.');
+
+            $open = (int) round($reservation->open_quantity);
+            $released = (float) $reservation->released_quantity;
+            $base = [
+                'company_id' => $reservation->company_id, 'product_id' => $reservation->product_id,
+                'location_id' => $reservation->location_id, 'batch_id' => $reservation->batch_id,
+                'sales_order_line_id' => $reservation->sales_order_line_id, 'source_type' => $reservation->source_type,
+                'source_id' => $reservation->source_id, 'created_by' => $reservation->created_by, 'expires_at' => $reservation->expires_at,
+                'status' => 'active', 'released_quantity' => 0,
+            ];
+            $assigned = [];
+            $first = true;
+            foreach ($serialIds as $serialId) {
+                if ($first) {
+                    $reservation->update(['quantity' => $released + 1, 'serial_id' => $serialId]);
+                    $assigned[] = $reservation->fresh(['product', 'batch', 'serial', 'location']);
+                    $first = false;
+                } else {
+                    $assigned[] = StockReservation::create($base + ['quantity' => 1, 'serial_id' => $serialId]);
+                }
+            }
+            $unassigned = $open - count($serialIds);
+            if ($unassigned > 0) StockReservation::create($base + ['quantity' => $unassigned, 'serial_id' => null]);
+            return $assigned;
+        });
+    }
+
+    /** @return Collection<int, array{serial_id:int|null,batch_id:int|null,quantity:float}> */
+    public function serialAllocations(int $salesOrderLineId, float $quantity, ?int $locationId = null, ?int $productId = null, ?int $batchId = null): Collection
+    {
+        $remaining = (int) round($quantity);
+        $allocations = collect();
+        if ($remaining <= 0) return $allocations;
+        $reservations = StockReservation::where('sales_order_line_id', $salesOrderLineId)->where('status', 'active')->whereNotNull('serial_id')
+            ->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))
+            ->when($productId !== null, fn ($query) => $query->where('product_id', $productId))
+            ->when($locationId !== null, fn ($query) => $query->where(fn ($nested) => $nested->whereNull('location_id')->orWhere('location_id', $locationId)))
+            ->when($batchId !== null, fn ($query) => $query->where('batch_id', $batchId))
+            ->orderBy('id')->lockForUpdate()->get();
+        foreach ($reservations as $reservation) {
+            if ($remaining <= 0) break;
+            $take = min($remaining, (int) floor($reservation->open_quantity));
+            for ($index = 0; $index < $take; $index++) $allocations->push(['serial_id' => (int) $reservation->serial_id, 'batch_id' => $reservation->batch_id, 'quantity' => 1.0]);
+            $remaining -= $take;
+        }
+        return $allocations;
+    }
+
+    public function assignBatch(StockReservation $reservation, int $batchId): StockReservation
+    {
+        return DB::transaction(function () use ($reservation, $batchId): StockReservation {
+            $reservation = StockReservation::lockForUpdate()->findOrFail($reservation->id);
+            if ($reservation->status !== 'active' || $reservation->open_quantity <= 0.000001) throw new \RuntimeException('Only open reservations can receive a batch assignment.');
+            $product = Product::lockForUpdate()->findOrFail($reservation->product_id);
+            if (!in_array($product->tracking_type, ['batch', 'lot'], true)) throw new \RuntimeException('Batch assignment is only available for batch- or lot-tracked products.');
+            $batch = InventoryBatch::whereKey($batchId)->where('product_id', $product->id)->first();
+            if (!$batch) throw new \RuntimeException('The selected batch does not belong to '.$product->name.'.');
+            if ((float) $reservation->batch_id === (float) $batch->id) return $reservation->fresh(['product', 'batch', 'location']);
+
+            $available = (float) InventoryCostLayer::where('product_id', $product->id)->where('batch_id', $batch->id)->where('remaining_quantity', '>', 0)
+                ->when($reservation->location_id !== null, fn ($query) => $query->where('location_id', $reservation->location_id))
+                ->sum('remaining_quantity');
+            $reserved = (float) StockReservation::where('product_id', $product->id)->where('batch_id', $batch->id)->where('status', 'active')->where('id', '!=', $reservation->id)
+                ->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))
+                ->when($reservation->location_id !== null, fn ($query) => $query->where('location_id', $reservation->location_id))
+                ->sum(DB::raw('quantity - released_quantity'));
+            if ($available - $reserved + 0.000001 < $reservation->open_quantity) throw new \RuntimeException('Insufficient available stock in the selected batch for '.$product->name.'.');
+            $reservation->update(['batch_id' => $batch->id]);
+            return $reservation->fresh(['product', 'batch', 'location']);
+        });
     }
 
     public function reassign(StockReservation $reservation, ?int $locationId): StockReservation
@@ -256,7 +361,8 @@ class StockReservationService
             $reservation->released_quantity = (float) $reservation->released_quantity + $quantity;
             if ($reservation->open_quantity <= 0.000001) $reservation->status = 'released';
             $reservation->save();
-            return $reservation->fresh(['product', 'batch', 'location']);
+            if ($reservation->status === 'released') $this->restoreReleasedSerial($reservation);
+            return $reservation->fresh(['product', 'batch', 'serial', 'location']);
         });
     }
 

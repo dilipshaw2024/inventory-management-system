@@ -7,6 +7,7 @@ use App\Models\HrEmployeeBenefit;
 use App\Models\HrPayRun;
 use App\Models\HrPayrollRule;
 use App\Models\HrAttendance;
+use App\Models\HrLeaveRequest;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
@@ -69,8 +70,22 @@ class HrPayrollService
                     $overtimeAmount = $scheduledDays > 0 ? $gross / $scheduledDays / 480 * $overtimeMinutes * (float) $run->overtime_multiplier : 0.0;
                     if ($overtimeAmount > 0) $breakdown['overtime'] = ['name' => 'Overtime', 'type' => 'earning', 'minutes' => $overtimeMinutes, 'multiplier' => (float) $run->overtime_multiplier, 'amount' => round($overtimeAmount, 6)];
                 }
-                $gross += $overtimeAmount; $deductions += $attendanceDeduction; $employerTotal = array_sum($employerContributions); $net = max(0, $gross - $deductions);
-                $run->payslips()->create(['company_id' => $run->company_id, 'employee_id' => $employee->id, 'scheduled_days' => $scheduledDays, 'absent_days' => $absentDays, 'attendance_deduction' => $attendanceDeduction, 'overtime_minutes' => $overtimeMinutes, 'overtime_amount' => $overtimeAmount, 'employer_contribution_total' => $employerTotal, 'gross_amount' => $gross, 'deduction_amount' => $deductions, 'net_amount' => $net, 'currency_code' => $employee->currency_code, 'deductions' => $breakdown, 'statutory_deductions' => $statutoryDeductions, 'employer_contributions' => $employerContributions]);
+                $leaveDays = 0.0; $leaveDeduction = 0.0;
+                if ($run->leave_policy === 'unpaid_leave') {
+                    $leaveRequests = HrLeaveRequest::with('leaveType')->where('company_id', $run->company_id)->where('employee_id', $employee->id)->where('status', 'approved')->where('starts_on', '<=', $run->period_to)->where('ends_on', '>=', $run->period_from)->get();
+                    foreach ($leaveRequests as $leaveRequest) {
+                        if ($leaveRequest->leaveType?->is_paid) continue;
+                        $from = max(Carbon::parse($run->period_from)->startOfDay(), Carbon::parse($leaveRequest->starts_on)->startOfDay());
+                        $to = min(Carbon::parse($run->period_to)->startOfDay(), Carbon::parse($leaveRequest->ends_on)->startOfDay());
+                        $leaveDays += $leaveRequest->leaveType?->counts_working_days
+                            ? app(PlanningCalendarService::class)->countWorkingDays($from->toDateString(), $to->toDateString(), $run->company_id)
+                            : ($from->diffInDays($to) + 1);
+                    }
+                    $leaveDeduction = $scheduledDays > 0 ? min($gross, $gross * $leaveDays / $scheduledDays) : 0.0;
+                    if ($leaveDeduction > 0) $breakdown['unpaid_leave'] = ['name' => 'Unpaid approved leave', 'type' => 'deduction', 'days' => round($leaveDays, 3), 'amount' => round($leaveDeduction, 6)];
+                }
+                $gross += $overtimeAmount; $deductions += $attendanceDeduction + $leaveDeduction; $employerTotal = array_sum($employerContributions); $net = max(0, $gross - $deductions);
+                $run->payslips()->create(['company_id' => $run->company_id, 'employee_id' => $employee->id, 'scheduled_days' => $scheduledDays, 'absent_days' => $absentDays, 'attendance_deduction' => $attendanceDeduction, 'leave_days' => $leaveDays, 'leave_deduction' => $leaveDeduction, 'overtime_minutes' => $overtimeMinutes, 'overtime_amount' => $overtimeAmount, 'employer_contribution_total' => $employerTotal, 'gross_amount' => $gross, 'deduction_amount' => $deductions, 'net_amount' => $net, 'currency_code' => $employee->currency_code, 'deductions' => $breakdown, 'statutory_deductions' => $statutoryDeductions, 'employer_contributions' => $employerContributions]);
             }
             $run->update(['gross_total' => $run->payslips()->sum('gross_amount'), 'deduction_total' => $run->payslips()->sum('deduction_amount'), 'employer_contribution_total' => $run->payslips()->sum('employer_contribution_total'), 'net_total' => $run->payslips()->sum('net_amount')]);
             return $run->fresh('payslips.employee');

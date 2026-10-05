@@ -49,10 +49,18 @@ class ManufacturingController extends Controller
     public function storeWorkCenter(Request $request)
     {
         $companyId = auth()->user()?->company_id;
-        $data = $request->validate(['code' => ['required', 'string', 'max:50', Rule::unique('work_centers', 'code')->where(fn ($query) => $query->where('company_id', $companyId))], 'name' => ['required', 'string', 'max:255'], 'capacity_hours_per_day' => ['required', 'numeric', 'gt:0'], 'labor_rate' => ['nullable', 'numeric', 'min:0'], 'machine_rate' => ['nullable', 'numeric', 'min:0'], 'shift_start' => ['nullable', 'date_format:H:i'], 'shift_end' => ['nullable', 'date_format:H:i']]);
+        $data = $request->validate(['code' => ['required', 'string', 'max:50', Rule::unique('work_centers', 'code')->where(fn ($query) => $query->where('company_id', $companyId))], 'name' => ['required', 'string', 'max:255'], 'capacity_hours_per_day' => ['required', 'numeric', 'gt:0'], 'labor_rate' => ['nullable', 'numeric', 'min:0'], 'machine_rate' => ['nullable', 'numeric', 'min:0'], 'shift_start' => ['nullable', 'date_format:H:i'], 'shift_end' => ['nullable', 'date_format:H:i'], 'shifts' => ['nullable', 'string', 'max:255']]);
         if (!empty($data['shift_start']) && !empty($data['shift_end']) && $data['shift_end'] <= $data['shift_start']) return back()->withErrors(['shift_end' => 'Shift end must be after shift start.'])->withInput();
         $calendar = array_filter(['shift_start' => $data['shift_start'] ?? null, 'shift_end' => $data['shift_end'] ?? null]);
-        unset($data['shift_start'], $data['shift_end']);
+        if (!empty($data['shifts'])) {
+            $windows = [];
+            foreach (preg_split('/\\s*,\\s*/', trim($data['shifts'])) as $window) {
+                if (!preg_match('/^((?:[01]\\d|2[0-3]):[0-5]\\d)-((?:[01]\\d|2[0-3]):[0-5]\\d)$/', $window, $matches) || $matches[2] <= $matches[1]) return back()->withErrors(['shifts' => 'Each shift must use HH:MM-HH:MM with an end after its start.'])->withInput();
+                $windows[] = ['start' => $matches[1], 'end' => $matches[2]];
+            }
+            $calendar['shifts'] = $windows;
+        }
+        unset($data['shift_start'], $data['shift_end'], $data['shifts']);
         $center = WorkCenter::create($data + ['calendar' => $calendar ?: null, 'company_id' => $companyId]);
         app(AuditService::class)->record('work_center.created', $center, null, $center->toArray());
         return back()->with(['message' => 'Work center created.', 'alert-type' => 'success']);
@@ -60,9 +68,9 @@ class ManufacturingController extends Controller
 
     public function storeRouting(Request $request)
     {
-        $data = $request->validate(['bom_id' => ['required', $this->companyExists('bills_of_materials')], 'code' => ['required', 'string', 'max:50'], 'name' => ['required', 'string', 'max:255'], 'work_center_id' => ['required', 'array', 'min:1'], 'work_center_id.*' => ['required', $this->companyExists('work_centers')], 'operation' => ['required', 'array'], 'operation.*' => ['required', 'string', 'max:255'], 'setup_minutes' => ['nullable', 'array'], 'setup_minutes.*' => ['nullable', 'numeric', 'min:0'], 'run_minutes' => ['nullable', 'array'], 'run_minutes.*' => ['nullable', 'numeric', 'min:0']]);
-        $routing = Routing::create(collect($data)->except(['work_center_id', 'operation', 'setup_minutes', 'run_minutes'])->all() + ['company_id' => auth()->user()?->company_id]);
-        foreach ($data['work_center_id'] as $index => $workCenterId) RoutingOperation::create(['company_id' => auth()->user()?->company_id, 'routing_id' => $routing->id, 'work_center_id' => $workCenterId, 'sequence' => $index + 1, 'operation' => $data['operation'][$index], 'setup_minutes' => $data['setup_minutes'][$index] ?? 0, 'run_minutes' => $data['run_minutes'][$index] ?? 0]);
+        $data = $request->validate(['bom_id' => ['required', $this->companyExists('bills_of_materials')], 'code' => ['required', 'string', 'max:50'], 'name' => ['required', 'string', 'max:255'], 'work_center_id' => ['required', 'array', 'min:1'], 'work_center_id.*' => ['required', $this->companyExists('work_centers')], 'operation' => ['required', 'array'], 'operation.*' => ['required', 'string', 'max:255'], 'setup_minutes' => ['nullable', 'array'], 'setup_minutes.*' => ['nullable', 'numeric', 'min:0'], 'run_minutes' => ['nullable', 'array'], 'run_minutes.*' => ['nullable', 'numeric', 'min:0'], 'alternate_work_center_ids' => ['nullable', 'array'], 'alternate_work_center_ids.*' => ['nullable', 'array'], 'alternate_work_center_ids.*.*' => ['integer', $this->companyExists('work_centers')]]);
+        $routing = Routing::create(collect($data)->except(['work_center_id', 'operation', 'setup_minutes', 'run_minutes', 'alternate_work_center_ids'])->all() + ['company_id' => auth()->user()?->company_id]);
+        foreach ($data['work_center_id'] as $index => $workCenterId) RoutingOperation::create(['company_id' => auth()->user()?->company_id, 'routing_id' => $routing->id, 'work_center_id' => $workCenterId, 'alternate_work_center_ids' => array_values(array_filter($data['alternate_work_center_ids'][$index] ?? [], fn ($id): bool => (int) $id !== (int) $workCenterId)), 'sequence' => $index + 1, 'operation' => $data['operation'][$index], 'setup_minutes' => $data['setup_minutes'][$index] ?? 0, 'run_minutes' => $data['run_minutes'][$index] ?? 0]);
         app(AuditService::class)->record('routing.created', $routing, null, $routing->toArray());
         return back()->with(['message' => 'Routing created.', 'alert-type' => 'success']);
     }

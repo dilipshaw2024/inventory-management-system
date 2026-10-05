@@ -47,15 +47,20 @@ class CustomerPaymentTenantScopeTest extends TestCase
         $company = Company::create(['name' => 'Statement Tenant', 'code' => 'STATEMENT-TENANT']);
         $user = User::factory()->create(['company_id' => $company->id]);
         $customer = Customer::create(['company_id' => $company->id, 'name' => 'Statement Customer', 'status' => 1]);
-        $invoice = Invoice::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'invoice_no' => 'INV-STATEMENT', 'date' => '2026-09-05', 'status' => 1, 'total_amount' => 100]);
+        $periodStart = now()->startOfMonth()->toDateString();
+        $periodEnd = now()->endOfMonth()->toDateString();
+        $invoice = Invoice::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'invoice_no' => 'INV-STATEMENT', 'date' => now()->startOfMonth()->toDateString(), 'status' => 1, 'total_amount' => 100]);
         Payment::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'invoice_id' => $invoice->id, 'paid_status' => 'partial_paid', 'paid_amount' => 25, 'due_amount' => 75, 'total_amount' => 100, 'is_reversed' => false]);
         $token = $user->createToken('statement-read-test', ['accounting:read'])->plainTextToken;
 
-        $response = $this->withToken($token)->getJson('/api/accounting/customers/'.$customer->id.'/statement?from=2026-09-01&to=2026-09-30');
+        $response = $this->withToken($token)->getJson('/api/accounting/customers/'.$customer->id.'/statement?from='.$periodStart.'&to='.$periodEnd);
 
         $response->assertOk()->assertJsonPath('summary.opening_balance', 0)->assertJsonPath('summary.closing_balance', 75);
         $this->assertSame(['invoice', 'payment'], collect($response->json('data'))->pluck('type')->all());
         $this->assertEquals(75.0, (float) $response->json('data.1.balance'));
+
+        $ledger = $this->withToken($token)->getJson('/api/accounting/customers/'.$customer->id.'/receivables-ledger?from='.$periodStart.'&to='.$periodEnd);
+        $ledger->assertOk()->assertJsonPath('meta.ledger_type', 'receivables')->assertJsonPath('meta.read_only', true)->assertJsonPath('data.0.source_type', 'invoice')->assertJsonPath('data.1.source_type', 'payment');
     }
 
     public function test_supplier_statement_returns_running_invoice_and_payment_balance(): void
@@ -63,14 +68,19 @@ class CustomerPaymentTenantScopeTest extends TestCase
         $company = Company::create(['name' => 'AP Statement Tenant', 'code' => 'AP-STATEMENT']);
         $user = User::factory()->create(['company_id' => $company->id]);
         $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Statement Supplier', 'is_active' => true]);
-        $invoice = PurchaseInvoice::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'invoice_no' => 'PINV-STATEMENT', 'invoice_date' => '2026-09-05', 'status' => 'approved', 'total_amount' => 100]);
-        SupplierPayment::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'purchase_invoice_id' => $invoice->id, 'payment_no' => 'PAY-STATEMENT', 'payment_date' => '2026-09-10', 'status' => 'approved', 'amount' => 30, 'is_reversed' => false]);
+        $periodStart = now()->startOfMonth()->toDateString();
+        $periodEnd = now()->endOfMonth()->toDateString();
+        $invoice = PurchaseInvoice::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'invoice_no' => 'PINV-STATEMENT', 'invoice_date' => now()->startOfMonth()->toDateString(), 'status' => 'approved', 'total_amount' => 100]);
+        SupplierPayment::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'purchase_invoice_id' => $invoice->id, 'payment_no' => 'PAY-STATEMENT', 'payment_date' => now()->startOfMonth()->toDateString(), 'status' => 'approved', 'amount' => 30, 'is_reversed' => false]);
         $token = $user->createToken('supplier-statement-read-test', ['accounting:read'])->plainTextToken;
 
-        $response = $this->withToken($token)->getJson('/api/accounting/suppliers/'.$supplier->id.'/statement?from=2026-09-01&to=2026-09-30');
+        $response = $this->withToken($token)->getJson('/api/accounting/suppliers/'.$supplier->id.'/statement?from='.$periodStart.'&to='.$periodEnd);
 
         $response->assertOk()->assertJsonPath('summary.opening_balance', 0)->assertJsonPath('summary.closing_balance', 70);
         $this->assertSame(['purchase_invoice', 'supplier_payment'], collect($response->json('data'))->pluck('type')->all());
+
+        $ledger = $this->withToken($token)->getJson('/api/accounting/suppliers/'.$supplier->id.'/payables-ledger?from='.$periodStart.'&to='.$periodEnd);
+        $ledger->assertOk()->assertJsonPath('meta.ledger_type', 'payables')->assertJsonPath('meta.read_only', true)->assertJsonPath('data.0.source_type', 'purchase_invoice')->assertJsonPath('data.1.source_type', 'supplier_payment');
     }
 
     public function test_statements_do_not_double_count_payment_allocations(): void
@@ -78,12 +88,14 @@ class CustomerPaymentTenantScopeTest extends TestCase
         $company = Company::create(['name' => 'Allocation Statement Tenant', 'code' => 'ALLOC-STATEMENT']);
         $user = User::factory()->create(['company_id' => $company->id]);
         $customer = Customer::create(['company_id' => $company->id, 'name' => 'Allocated Customer', 'status' => 1]);
-        $invoice = Invoice::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'invoice_no' => 'INV-ALLOC', 'date' => '2026-09-05', 'status' => 1, 'total_amount' => 100]);
+        $periodStart = now()->startOfMonth()->toDateString();
+        $periodEnd = now()->endOfMonth()->toDateString();
+        $invoice = Invoice::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'invoice_no' => 'INV-ALLOC', 'date' => now()->startOfMonth()->toDateString(), 'status' => 1, 'total_amount' => 100]);
         $payment = Payment::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'paid_status' => 'paid', 'paid_amount' => 40, 'due_amount' => 0, 'total_amount' => 40, 'is_reversed' => false]);
         app(CustomerPaymentAllocationService::class)->allocate($payment, [['invoice_id' => $invoice->id, 'amount' => 40]]);
         $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Allocated Supplier', 'is_active' => true]);
-        $purchaseInvoice = PurchaseInvoice::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'invoice_no' => 'PINV-ALLOC', 'invoice_date' => '2026-09-05', 'status' => 'approved', 'total_amount' => 100]);
-        $supplierPayment = SupplierPayment::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'payment_no' => 'PAY-ALLOC', 'payment_date' => '2026-09-06', 'status' => 'approved', 'amount' => 40, 'is_reversed' => false]);
+        $purchaseInvoice = PurchaseInvoice::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'invoice_no' => 'PINV-ALLOC', 'invoice_date' => now()->startOfMonth()->toDateString(), 'status' => 'approved', 'total_amount' => 100]);
+        $supplierPayment = SupplierPayment::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'payment_no' => 'PAY-ALLOC', 'payment_date' => now()->startOfMonth()->toDateString(), 'status' => 'approved', 'amount' => 40, 'is_reversed' => false]);
         $supplierAllocation = app(SupplierPaymentService::class)->allocate($supplierPayment, $purchaseInvoice->id, 40);
         $this->assertDatabaseHas('payments', ['id' => $payment->id, 'allocation_status' => 'fully_allocated']);
         $this->assertDatabaseHas('supplier_payments', ['id' => $supplierPayment->id, 'allocation_status' => 'fully_allocated']);
@@ -94,11 +106,11 @@ class CustomerPaymentTenantScopeTest extends TestCase
         $supplierFeed = $this->withToken($token)->getJson('/api/accounting/supplier-payments?allocation_status=fully_allocated');
         $supplierFeed->assertOk()->assertJsonPath('data.0.allocation_status', 'fully_allocated');
 
-        $customerResponse = $this->withToken($token)->getJson('/api/accounting/customers/'.$customer->id.'/statement?from=2026-09-01&to=2026-09-30');
+        $customerResponse = $this->withToken($token)->getJson('/api/accounting/customers/'.$customer->id.'/statement?from='.$periodStart.'&to='.$periodEnd);
         $customerResponse->assertOk()->assertJsonPath('summary.closing_balance', 60)->assertJsonPath('data.1.allocated_amount', 40)->assertJsonPath('data.1.allocation_count', 1);
         $this->assertSame(['invoice', 'payment'], collect($customerResponse->json('data'))->pluck('type')->all());
 
-        $supplierResponse = $this->withToken($token)->getJson('/api/accounting/suppliers/'.$supplier->id.'/statement?from=2026-09-01&to=2026-09-30');
+        $supplierResponse = $this->withToken($token)->getJson('/api/accounting/suppliers/'.$supplier->id.'/statement?from='.$periodStart.'&to='.$periodEnd);
         $supplierResponse->assertOk()->assertJsonPath('summary.closing_balance', 60)->assertJsonPath('data.1.allocated_amount', 40)->assertJsonPath('data.1.allocation_count', 1);
         $this->assertSame(['purchase_invoice', 'supplier_payment'], collect($supplierResponse->json('data'))->pluck('type')->all());
 

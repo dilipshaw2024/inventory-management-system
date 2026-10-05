@@ -13,4 +13,5 @@ class GoodsReceiptLine extends Model
     public function product() { return $this->belongsTo(Product::class); }
     public function uom() { return $this->belongsTo(Unit::class, 'uom_id'); }
     public function batch() { return $this->belongsTo(InventoryBatch::class, 'batch_id'); }
+    public function qualityInspection() { return $this->belongsTo(QualityInspection::class, 'quality_inspection_id'); }
 }

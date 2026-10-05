@@ -6,6 +6,7 @@ use App\Models\BillOfMaterial;
 use App\Models\Category;
 use App\Models\Company;
 use App\Models\ProductionOrder;
+use App\Models\ProductionOperation;
 use App\Models\Product;
 use App\Models\Routing;
 use App\Models\RoutingOperation;
@@ -70,6 +71,35 @@ class ProductionSchedulingTest extends TestCase
         $this->assertSame('2026-09-21 08:00', $scheduled->operations->first()->scheduled_start_at->format('Y-m-d H:i'));
         $this->assertSame('2026-09-21 10:30', $scheduled->operations->first()->scheduled_end_at->format('Y-m-d H:i'));
         $this->assertDatabaseHas('production_operations', ['production_order_id' => $order->id, 'routing_operation_id' => $routingOperation->id, 'schedule_status' => 'scheduled']);
+    }
+
+    public function test_scheduler_selects_an_available_alternate_work_center(): void
+    {
+        $company = Company::create(['name' => 'Alternate Scheduling Co', 'code' => 'ALT-SCHED']);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Alternate Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Alternate Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Alternate Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Alternate Finished', 'status' => 1]);
+        $bom = BillOfMaterial::create(['company_id' => $company->id, 'product_id' => $product->id, 'code' => 'BOM-ALT', 'name' => 'Alternate BOM', 'output_quantity' => 1, 'is_active' => true]);
+        $primary = WorkCenter::create(['company_id' => $company->id, 'code' => 'WC-PRIMARY', 'name' => 'Primary Center', 'capacity_hours_per_day' => 8, 'is_active' => true]);
+        $alternate = WorkCenter::create(['company_id' => $company->id, 'code' => 'WC-ALTERNATE', 'name' => 'Alternate Center', 'capacity_hours_per_day' => 8, 'is_active' => true]);
+        $routing = Routing::create(['company_id' => $company->id, 'bom_id' => $bom->id, 'code' => 'RT-ALT', 'name' => 'Alternate Routing', 'is_active' => true]);
+        $routingOperation = RoutingOperation::create(['company_id' => $company->id, 'routing_id' => $routing->id, 'work_center_id' => $primary->id, 'alternate_work_center_ids' => [$alternate->id], 'sequence' => 1, 'operation' => 'Alternate operation', 'setup_minutes' => 0, 'run_minutes' => 60]);
+        $blockedOrder = ProductionOrder::create(['company_id' => $company->id, 'bom_id' => $bom->id, 'product_id' => $product->id, 'planned_quantity' => 1, 'planned_date' => '2026-09-18', 'status' => 'draft', 'order_no' => 'MO-ALT-BLOCKED']);
+        ProductionOperation::create(['company_id' => $company->id, 'production_order_id' => $blockedOrder->id, 'routing_operation_id' => $routingOperation->id, 'work_center_id' => $primary->id, 'sequence' => 1, 'operation' => 'Existing primary load', 'planned_quantity' => 1, 'status' => 'pending', 'scheduled_start_at' => '2026-09-18 08:00:00', 'scheduled_end_at' => '2026-09-18 16:00:00', 'schedule_status' => 'scheduled']);
+        $order = ProductionOrder::create(['company_id' => $company->id, 'bom_id' => $bom->id, 'product_id' => $product->id, 'planned_quantity' => 1, 'planned_date' => '2026-09-18', 'status' => 'draft', 'order_no' => 'MO-ALT-TARGET']);
+
+        $scheduled = app(ProductionSchedulingService::class)->schedule($order, '2026-09-18 08:00:00');
+
+        $this->assertSame($alternate->id, $scheduled->operations->first()->work_center_id);
+        $this->assertSame('2026-09-18 08:00', $scheduled->operations->first()->scheduled_start_at->format('Y-m-d H:i'));
+        $this->assertDatabaseHas('production_operations', ['production_order_id' => $order->id, 'work_center_id' => $alternate->id, 'schedule_status' => 'scheduled']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['manufacturing:read']);
+        $this->getJson('/api/manufacturing/operations?production_order_id='.$order->id)
+            ->assertOk()
+            ->assertJsonPath('data.0.work_center.id', $alternate->id)
+            ->assertJsonPath('data.0.routing_operation.alternate_work_center_ids.0', $alternate->id);
     }
 
     public function test_bom_component_uom_is_normalized_and_snapshotted_as_stock_quantity(): void

@@ -29,9 +29,14 @@ class ServiceContractWarrantyClaimTest extends TestCase
         $category = Category::create(['name' => 'Contract Category', 'status' => 1]);
         $product = Product::create(['company_id' => $company->id, 'name' => 'Contract Product', 'unit_id' => $unit->id, 'category_id' => $category->id, 'status' => 1]);
         $asset = ServiceAsset::create(['company_id' => $company->id, 'asset_no' => 'ASSET-CONTRACT-1', 'name' => 'Contract Asset', 'product_id' => $product->id, 'customer_id' => $customer->id, 'status' => 'active']);
-        $contract = ServiceContract::create(['company_id' => $company->id, 'contract_no' => 'SC-CONTRACT-1', 'customer_id' => $customer->id, 'asset_id' => $asset->id, 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'coverage_type' => 'full', 'status' => 'active']);
+        $contract = ServiceContract::create(['company_id' => $company->id, 'contract_no' => 'SC-CONTRACT-1', 'customer_id' => $customer->id, 'asset_id' => $asset->id, 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'coverage_type' => 'full', 'request_limit' => 1, 'status' => 'active']);
 
         Sanctum::actingAs($user, ['service:read', 'service:write']);
+        $serviceRequest = $this->postJson('/api/service/requests', ['request_no' => 'SR-CONTRACT-1', 'customer_id' => $customer->id, 'asset_id' => $asset->id, 'contract_id' => $contract->id, 'priority' => 'normal', 'description' => 'Covered service request.'])
+            ->assertCreated()->assertJsonPath('data.contract_id', $contract->id);
+        $this->assertDatabaseHas('service_contracts', ['id' => $contract->id, 'requests_used' => 1]);
+        $this->getJson('/api/service/contracts?status=active')->assertOk()->assertJsonPath('data.0.remaining_requests', 0);
+        $this->postJson('/api/service/requests', ['request_no' => 'SR-CONTRACT-2', 'customer_id' => $customer->id, 'asset_id' => $asset->id, 'contract_id' => $contract->id, 'priority' => 'normal', 'description' => 'Second covered request.'])->assertStatus(422);
         $claim = $this->postJson('/api/service/warranty-claims', ['asset_id' => $asset->id, 'contract_id' => $contract->id, 'supplier_id' => $supplier->id, 'received_at' => '2026-09-21', 'issue' => 'Covered service issue.'])
             ->assertCreated()->assertJsonPath('data.contract_id', $contract->id)->assertJsonPath('data.supplier_id', $supplier->id)->assertJsonPath('data.coverage_status', 'contract_covered');
         $claimId = $claim->json('data.id');

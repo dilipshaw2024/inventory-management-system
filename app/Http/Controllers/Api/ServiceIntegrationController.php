@@ -449,7 +449,7 @@ class ServiceIntegrationController extends Controller
             'external_reference' => ['nullable', 'string', 'max:150', $this->companyUnique('service_contracts', 'external_reference')],
             'customer_id' => ['required', 'integer', $this->companyExists('customers')], 'asset_id' => ['nullable', 'integer', $this->companyExists('service_assets')],
             'starts_on' => ['required', 'date'], 'ends_on' => ['required', 'date', 'after_or_equal:starts_on'],
-            'coverage_type' => ['required', 'in:full,parts,labor,preventive'], 'response_hours' => ['nullable', 'integer', 'min:1'],
+            'coverage_type' => ['required', 'in:full,parts,labor,preventive'], 'response_hours' => ['nullable', 'integer', 'min:1'], 'request_limit' => ['nullable', 'integer', 'min:0'],
             'contract_value' => ['nullable', 'numeric', 'min:0'], 'currency_code' => ['nullable', 'string', 'size:3'], 'notes' => ['nullable', 'string', 'max:3000'],
         ]);
         if (!empty($data['asset_id'])) {
@@ -461,7 +461,7 @@ class ServiceIntegrationController extends Controller
             'company_id' => $companyId, 'contract_no' => $data['contract_no'] ?? app(NumberingSequenceService::class)->nextOrFallback('service_contract', 'SC-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId),
             'external_reference' => $data['external_reference'] ?? null, 'customer_id' => $data['customer_id'], 'asset_id' => $data['asset_id'] ?? null,
             'starts_on' => $data['starts_on'], 'ends_on' => $data['ends_on'], 'coverage_type' => $data['coverage_type'], 'response_hours' => $data['response_hours'] ?? null,
-            'contract_value' => $data['contract_value'] ?? 0, 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')), 'notes' => $data['notes'] ?? null,
+            'contract_value' => $data['contract_value'] ?? 0, 'request_limit' => $data['request_limit'] ?? null, 'requests_used' => 0, 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')), 'notes' => $data['notes'] ?? null,
         ]);
         app(AuditService::class)->record('service_contract.created', $contract, null, $contract->toArray() + ['api' => true]);
         return response()->json(['data' => $contract->load(['customer', 'asset']), 'status' => 'created'], 201);
@@ -470,8 +470,9 @@ class ServiceIntegrationController extends Controller
     public function updateContract(Request $request, int $id): JsonResponse
     {
         $contract = $this->companyScope(ServiceContract::query())->findOrFail($id);
-        $data = $request->validate(['status' => ['sometimes', 'in:active,expired,cancelled'], 'ends_on' => ['sometimes', 'date'], 'response_hours' => ['sometimes', 'nullable', 'integer', 'min:1'], 'contract_value' => ['sometimes', 'numeric', 'min:0'], 'notes' => ['sometimes', 'nullable', 'string', 'max:3000']]);
+        $data = $request->validate(['status' => ['sometimes', 'in:active,expired,cancelled'], 'ends_on' => ['sometimes', 'date'], 'response_hours' => ['sometimes', 'nullable', 'integer', 'min:1'], 'request_limit' => ['sometimes', 'nullable', 'integer', 'min:0'], 'contract_value' => ['sometimes', 'numeric', 'min:0'], 'notes' => ['sometimes', 'nullable', 'string', 'max:3000']]);
         if (isset($data['ends_on']) && $data['ends_on'] < $contract->starts_on->toDateString()) abort(422, 'Contract end date cannot precede its start date.');
+        if (array_key_exists('request_limit', $data) && $data['request_limit'] !== null && (int) $data['request_limit'] < (int) $contract->requests_used) abort(422, 'The request limit cannot be lower than requests already used.');
         $before = $contract->only(array_keys($data));
         $contract->update($data);
         app(AuditService::class)->record('service_contract.updated', $contract, $before, $contract->fresh()->only(array_keys($data)) + ['api' => true]);
@@ -500,7 +501,16 @@ class ServiceIntegrationController extends Controller
             $data['asset_id'] = $data['asset_id'] ?? $contract->asset_id;
             $data['response_due_at'] = $contract->response_hours ? now()->addHours((int) $contract->response_hours) : null;
         }
-        $serviceRequest = ServiceRequest::create($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id()]);
+        $serviceRequest = DB::transaction(function () use ($data, $contract): ServiceRequest {
+            if ($contract) {
+                $lockedContract = ServiceContract::where('company_id', auth()->user()?->company_id)->lockForUpdate()->findOrFail($contract->id);
+                if ($lockedContract->request_limit !== null && (int) $lockedContract->requests_used >= (int) $lockedContract->request_limit) abort(422, 'The service contract request entitlement has been exhausted.');
+                $serviceRequest = ServiceRequest::create($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id()]);
+                $lockedContract->increment('requests_used');
+                return $serviceRequest;
+            }
+            return ServiceRequest::create($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id()]);
+        });
         app(AuditService::class)->record('service_request.created', $serviceRequest, null, $serviceRequest->toArray());
         return response()->json(['data' => $serviceRequest->load(['asset', 'customer']), 'status' => 'open'], 201);
     }

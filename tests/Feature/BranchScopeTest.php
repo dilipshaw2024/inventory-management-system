@@ -21,6 +21,37 @@ class BranchScopeTest extends TestCase
 {
     use RefreshDatabase;
 
+    public function test_company_localization_profile_is_tenant_scoped_and_audited(): void
+    {
+        $company = Company::create(['name' => 'Localization Co', 'code' => 'LOCALIZATION-CO']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['integration:read', 'integration:write']);
+
+        $this->patchJson('/api/integration/organization/company', [
+            'country_code' => 'in',
+            'locale' => 'en_IN',
+            'timezone' => 'Asia/Kolkata',
+            'date_format' => 'd/m/Y',
+            'decimal_separator' => '.',
+            'thousands_separator' => ',',
+            'tax_registration_scheme' => 'GSTIN',
+            'tax_registration_number' => '29ABCDE1234F1Z5',
+        ])->assertOk()->assertJsonPath('data.country_code', 'IN')->assertJsonPath('data.locale', 'en_IN')->assertJsonPath('data.tax_registration_scheme', 'GSTIN');
+
+        $this->getJson('/api/integration/organization/companies')->assertOk()->assertJsonPath('data.0.country_code', 'IN')->assertJsonPath('data.0.timezone', 'Asia/Kolkata');
+        $this->assertDatabaseHas('audit_logs', ['company_id' => $company->id, 'action' => 'organization.company.updated']);
+    }
+
+    public function test_company_localization_profile_rejects_invalid_timezone_and_locale(): void
+    {
+        $company = Company::create(['name' => 'Localization Validation Co', 'code' => 'LOCALIZATION-VALIDATION']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['integration:write']);
+
+        $this->patchJson('/api/integration/organization/company', ['timezone' => 'Not/A_Timezone', 'locale' => 'invalid locale'])->assertStatus(422);
+        $this->assertDatabaseMissing('companies', ['id' => $company->id, 'timezone' => 'Not/A_Timezone']);
+    }
+
     public function test_assigned_branch_user_sees_only_locations_in_their_branch(): void
     {
         $company = Company::create(['name' => 'Branch Scope Co', 'code' => 'BRANCH-SCOPE']);

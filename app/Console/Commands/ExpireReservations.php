@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\Company;
 use App\Models\StockReservation;
 use App\Services\AuditService;
+use App\Services\StockReservationService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -31,6 +32,7 @@ class ExpireReservations extends Command
                             if (!$locked || $locked->status !== 'active' || !$locked->expires_at || $locked->expires_at->isFuture()) return;
                             $old = ['status' => $locked->status, 'released_quantity' => $locked->released_quantity, 'expires_at' => $locked->expires_at?->toISOString()];
                             $locked->update(['status' => 'released', 'released_quantity' => $locked->quantity]);
+                            app(StockReservationService::class)->restoreReleasedSerial($locked);
                             $audit->record('stock_reservation.expired', $locked, $old, ['status' => $locked->status, 'released_quantity' => $locked->released_quantity, 'expires_at' => $locked->expires_at?->toISOString()]);
                             $expired++;
                         });

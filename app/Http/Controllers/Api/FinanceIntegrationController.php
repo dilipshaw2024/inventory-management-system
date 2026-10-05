@@ -364,6 +364,7 @@ class FinanceIntegrationController extends Controller
                 $pending = collect($checks)->mapWithKeys(fn (array $check): array => [$check[2] => $this->companyScope($check[0]::query(), $year->company_id)->where('status', $check[1])->count()])->filter(fn (int $count): bool => $count > 0);
                 if ($pending->isNotEmpty()) throw new \RuntimeException('Close checklist failed: '.$pending->map(fn (int $count, string $label): string => $count.' '.$label)->implode('; ').'.');
                 app(\App\Services\FiscalPeriodService::class)->assertBankReconciliationsClosed((int) $year->company_id, $year->ends_on->toDateString());
+                app(\App\Services\FiscalPeriodService::class)->assertStandardCostVariancesClosed((int) $year->company_id, $year->ends_on->toDateString());
                 $snapshot = app(\App\Services\InventorySnapshotService::class)->capture((int) $year->company_id, $year->ends_on, auth()->id());
                 if ($snapshot->status === 'variance') throw new \RuntimeException('Close checklist failed: inventory snapshot #'.$snapshot->id.' contains negative-balance variances. Resolve the inventory reconciliation before closing.');
                 $before = $year->only(['status', 'closed_at', 'closed_by', 'inventory_snapshot_id']);
@@ -433,6 +434,12 @@ class FinanceIntegrationController extends Controller
             ->whereDate('statement_date', '<=', $endDate)->where('status', 'draft')->count();
         $pendingRevaluations = \App\Models\InventoryCostRevaluationRun::withoutGlobalScopes()
             ->where('company_id', $companyId)->where('status', 'pending')->whereDate('as_of_date', '<=', $endDate)->count();
+        $unpostedStandardCostVariances = 0;
+        try {
+            app(\App\Services\FiscalPeriodService::class)->assertStandardCostVariancesClosed($companyId, $endDate);
+        } catch (\RuntimeException $exception) {
+            if (preg_match('/^(?:Close checklist failed: )?(\\d+)/', $exception->getMessage(), $matches)) $unpostedStandardCostVariances = (int) $matches[1];
+        }
         $snapshot = \App\Models\InventoryReconciliationSnapshot::where('company_id', $companyId)
             ->whereDate('as_of_date', $endDate)->latest('id')->first();
         $checks = [
@@ -440,6 +447,7 @@ class FinanceIntegrationController extends Controller
             ['key' => 'bank_reconciliations', 'label' => 'Bank reconciliations finalized', 'passed' => $draftReconciliations === 0, 'count' => $draftReconciliations],
             ['key' => 'inventory_revaluations', 'label' => 'Inventory cost revaluations completed', 'passed' => $pendingRevaluations === 0, 'count' => $pendingRevaluations],
             ['key' => 'inventory_snapshot', 'label' => 'Inventory snapshot ready or capturable', 'passed' => !$snapshot || $snapshot->status === 'balanced', 'count' => $snapshot ? 1 : 0, 'status' => $snapshot?->status ?? 'will_capture_on_close'],
+            ['key' => 'standard_cost_variances', 'label' => 'Standard-cost variance journals posted', 'passed' => $unpostedStandardCostVariances === 0, 'count' => $unpostedStandardCostVariances],
         ];
         $passed = collect($checks)->every(fn (array $check): bool => $check['passed']);
         return response()->json(['data' => ['period' => $period, 'checks' => $checks, 'ready_to_close' => $passed], 'status' => $passed ? 'ready' : 'blocked']);
@@ -457,6 +465,7 @@ class FinanceIntegrationController extends Controller
                 if (!$year || $year->status !== 'open') throw new \RuntimeException('The parent fiscal year must be open.');
                 app(\App\Services\FiscalPeriodService::class)->assertBankReconciliationsClosed((int) $period->company_id, $period->ends_on->toDateString());
                 app(\App\Services\FiscalPeriodService::class)->assertCostRevaluationsClosed((int) $period->company_id, $period->ends_on->toDateString());
+                app(\App\Services\FiscalPeriodService::class)->assertStandardCostVariancesClosed((int) $period->company_id, $period->ends_on->toDateString());
                 app(\App\Services\FiscalPeriodSettlementService::class)->settle($period, $request->user()?->id);
                 $snapshot = app(\App\Services\InventorySnapshotService::class)->capture((int) $period->company_id, $period->ends_on, $request->user()?->id);
                 if ($snapshot->status === 'variance') throw new \RuntimeException('The fiscal-period close failed because the inventory snapshot contains negative-balance variances.');

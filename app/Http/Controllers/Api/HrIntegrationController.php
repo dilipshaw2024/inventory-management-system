@@ -20,6 +20,7 @@ use App\Services\IntegrationCursorService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
+use Carbon\Carbon;
 
 class HrIntegrationController extends Controller
 {
@@ -114,6 +115,73 @@ class HrIntegrationController extends Controller
         return response()->json(['data' => $runs, 'meta' => ['total' => $runs->count()]]);
     }
 
+    public function statutoryRemittances(Request $request): JsonResponse
+    {
+        $companyId = $this->companyId($request);
+        $data = $request->validate([
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'authority' => ['nullable', 'string', 'max:120'],
+            'mapping_key' => ['nullable', 'string', 'max:80', 'alpha_dash'],
+        ]);
+        $rules = HrPayrollRule::where('company_id', $companyId)->where('is_statutory', true)->get();
+        $mappingMeta = [];
+        foreach ($rules as $rule) {
+            if ($rule->remittance_mapping_key) $mappingMeta[$rule->remittance_mapping_key] = ['authority' => $rule->statutory_authority, 'type' => 'employee_withheld'];
+            if ($rule->employer_mapping_key) $mappingMeta[$rule->employer_mapping_key] = ['authority' => $rule->statutory_authority, 'type' => 'employer_contribution'];
+        }
+        $runs = HrPayRun::with('payslips')
+            ->where('company_id', $companyId)
+            ->whereIn('status', ['approved', 'paid', 'settlement_reversed'])
+            ->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('period_to', '>=', $date))
+            ->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('period_from', '<=', $date))
+            ->orderBy('period_from')->orderBy('id')->get();
+
+        $rows = [];
+        foreach ($runs as $run) {
+            $aggregates = [];
+            foreach ($run->payslips as $payslip) {
+                foreach (($payslip->statutory_deductions ?: []) as $mapping => $amount) {
+                    $aggregates[$mapping]['employee_withheld'] = ($aggregates[$mapping]['employee_withheld'] ?? 0) + (float) $amount;
+                    $aggregates[$mapping]['employees'] = ($aggregates[$mapping]['employees'] ?? 0) + 1;
+                }
+                foreach (($payslip->employer_contributions ?: []) as $mapping => $amount) {
+                    $aggregates[$mapping]['employer_contribution'] = ($aggregates[$mapping]['employer_contribution'] ?? 0) + (float) $amount;
+                    $aggregates[$mapping]['employees'] = max($aggregates[$mapping]['employees'] ?? 0, 1);
+                }
+            }
+            foreach ($aggregates as $mapping => $amounts) {
+                $meta = $mappingMeta[$mapping] ?? ['authority' => null, 'type' => 'unclassified'];
+                $authority = $meta['authority'];
+                if (($data['mapping_key'] ?? null) && $data['mapping_key'] !== $mapping) continue;
+                if (($data['authority'] ?? null) && $data['authority'] !== $authority) continue;
+                $withheld = round((float) ($amounts['employee_withheld'] ?? 0), 6);
+                $employer = round((float) ($amounts['employer_contribution'] ?? 0), 6);
+                $rows[] = [
+                    'pay_run_id' => $run->id,
+                    'run_no' => $run->run_no,
+                    'period_from' => $run->period_from?->toDateString(),
+                    'period_to' => $run->period_to?->toDateString(),
+                    'pay_date' => $run->pay_date?->toDateString(),
+                    'status' => $run->status,
+                    'authority' => $authority,
+                    'mapping_key' => $mapping,
+                    'employee_withheld' => $withheld,
+                    'employer_contribution' => $employer,
+                    'total_remittance' => round($withheld + $employer, 6),
+                    'employee_count' => (int) ($amounts['employees'] ?? 0),
+                ];
+            }
+        }
+
+        return response()->json(['data' => $rows, 'summary' => [
+            'employee_withheld' => round((float) collect($rows)->sum('employee_withheld'), 6),
+            'employer_contribution' => round((float) collect($rows)->sum('employer_contribution'), 6),
+            'total_remittance' => round((float) collect($rows)->sum('total_remittance'), 6),
+            'rows' => count($rows),
+        ], 'meta' => ['from' => $data['from'] ?? null, 'to' => $data['to'] ?? null]]);
+    }
+
     public function payrollRules(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);
@@ -149,7 +217,7 @@ class HrIntegrationController extends Controller
             $existing = HrPayRun::with('payslips.employee')->where('company_id', $companyId)->where('external_reference', $request->input('external_reference'))->first();
             if ($existing) return response()->json(['data' => $existing, 'status' => 'existing']);
         }
-        $data = $request->validate(['run_no' => ['required', 'string', 'max:60', Rule::unique('hr_pay_runs', 'run_no')->where(fn ($query) => $query->where('company_id', $companyId))], 'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('hr_pay_runs', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))], 'frequency' => ['required', 'in:weekly,biweekly,monthly'], 'period_from' => ['required', 'date'], 'period_to' => ['required', 'date', 'after_or_equal:period_from'], 'pay_date' => ['nullable', 'date', 'after_or_equal:period_to'], 'attendance_policy' => ['nullable', 'in:ignore,unpaid_absence'], 'overtime_policy' => ['nullable', 'in:ignore,pay_overtime'], 'overtime_multiplier' => ['nullable', 'numeric', 'min:1', 'max:5']]);
+        $data = $request->validate(['run_no' => ['required', 'string', 'max:60', Rule::unique('hr_pay_runs', 'run_no')->where(fn ($query) => $query->where('company_id', $companyId))], 'external_reference' => ['nullable', 'string', 'max:150', Rule::unique('hr_pay_runs', 'external_reference')->where(fn ($query) => $query->where('company_id', $companyId))], 'frequency' => ['required', 'in:weekly,biweekly,monthly'], 'period_from' => ['required', 'date'], 'period_to' => ['required', 'date', 'after_or_equal:period_from'], 'pay_date' => ['nullable', 'date', 'after_or_equal:period_to'], 'attendance_policy' => ['nullable', 'in:ignore,unpaid_absence'], 'leave_policy' => ['nullable', 'in:ignore,unpaid_leave'], 'overtime_policy' => ['nullable', 'in:ignore,pay_overtime'], 'overtime_multiplier' => ['nullable', 'numeric', 'min:1', 'max:5']]);
         if (HrPayRun::where('company_id', $companyId)->where('frequency', $data['frequency'])->whereIn('status', ['draft', 'approved', 'paid', 'settlement_reversed'])->where('period_from', '<=', $data['period_to'])->where('period_to', '>=', $data['period_from'])->exists()) abort(422, 'The payroll period overlaps an existing non-cancelled run.');
         $run = HrPayRun::create($data + ['company_id' => $companyId, 'status' => 'draft', 'created_by' => $request->user()->id]);
         $run = app(HrPayrollService::class)->generate($run);
@@ -208,11 +276,23 @@ class HrIntegrationController extends Controller
         return response()->json(['data' => $types, 'meta' => ['total' => $types->count()]]);
     }
 
+    public function leaveBalances(Request $request): JsonResponse
+    {
+        $companyId = $this->companyId($request);
+        $data = $request->validate(['year' => ['nullable', 'integer', 'min:2000', 'max:2100'], 'as_of' => ['nullable', 'date'], 'employee_id' => ['nullable', 'integer'], 'leave_type_id' => ['nullable', 'integer']]);
+        if (!empty($data['employee_id'])) HrEmployee::where('company_id', $companyId)->findOrFail($data['employee_id']);
+        if (!empty($data['leave_type_id'])) HrLeaveType::where('company_id', $companyId)->findOrFail($data['leave_type_id']);
+        $year = (int) ($data['year'] ?? now()->year);
+        $asOf = isset($data['as_of']) ? Carbon::parse($data['as_of']) : null;
+        $rows = app(HrLeaveService::class)->balances($companyId, $year, $data['employee_id'] ?? null, $data['leave_type_id'] ?? null, $asOf);
+        return response()->json(['data' => $rows, 'meta' => ['year' => $year, 'as_of' => ($asOf ?: Carbon::today())->toDateString(), 'total' => count($rows)]]);
+    }
+
     public function storeLeaveType(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);
-        $data = $request->validate(['code' => ['required', 'string', 'max:50', 'alpha_dash', Rule::unique('hr_leave_types', 'code')->where(fn ($query) => $query->where('company_id', $companyId))], 'name' => ['required', 'string', 'max:150'], 'annual_entitlement' => ['required', 'numeric', 'min:0'], 'is_paid' => ['nullable', 'boolean']]);
-        $type = HrLeaveType::create($data + ['company_id' => $companyId, 'is_paid' => (bool) ($data['is_paid'] ?? true), 'is_active' => true]);
+        $data = $request->validate(['code' => ['required', 'string', 'max:50', 'alpha_dash', Rule::unique('hr_leave_types', 'code')->where(fn ($query) => $query->where('company_id', $companyId))], 'name' => ['required', 'string', 'max:150'], 'annual_entitlement' => ['required', 'numeric', 'min:0'], 'accrual_frequency' => ['nullable', 'in:annual,monthly,quarterly'], 'accrual_start_month' => ['nullable', 'integer', 'min:1', 'max:12'], 'carry_forward_days' => ['nullable', 'numeric', 'min:0'], 'is_paid' => ['nullable', 'boolean'], 'counts_working_days' => ['nullable', 'boolean']]);
+        $type = HrLeaveType::create($data + ['company_id' => $companyId, 'accrual_frequency' => $data['accrual_frequency'] ?? 'annual', 'accrual_start_month' => $data['accrual_start_month'] ?? 1, 'is_paid' => (bool) ($data['is_paid'] ?? true), 'counts_working_days' => (bool) ($data['counts_working_days'] ?? false), 'is_active' => true]);
         app(AuditService::class)->record('hr_leave_type.created', $type, null, $type->toArray());
         return response()->json(['data' => $type, 'status' => 'created'], 201);
     }

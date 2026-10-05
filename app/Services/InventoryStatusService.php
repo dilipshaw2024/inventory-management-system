@@ -7,6 +7,8 @@ use App\Models\InventoryStatusBalance;
 use App\Models\InventoryStatusTransfer;
 use App\Models\Product;
 use App\Models\InventorySerial;
+use App\Models\InventoryCostLayer;
+use App\Models\StockReservation;
 use Illuminate\Support\Facades\DB;
 
 class InventoryStatusService
@@ -27,6 +29,18 @@ class InventoryStatusService
             if ($serial && abs($quantity - 1) > 0.000001) throw new \RuntimeException('A serialized disposition must contain exactly one unit.');
             if ($serial && $transfer->from_status === 'available' && !in_array($serial->status, ['available', 'returned'], true)) throw new \RuntimeException('The selected serial is not available for disposition.');
             if ($serial && $transfer->from_status !== 'available' && $serial->status !== $transfer->from_status) throw new \RuntimeException('The selected serial is not in the requested source disposition.');
+            if ($serial && $transfer->location_id && $serial->location_id && (int) $serial->location_id !== (int) $transfer->location_id) throw new \RuntimeException('The selected serial is not held at the selected location.');
+            if ($transfer->from_status === 'available' && $batch && !$serial) {
+                $batchAvailable = (float) InventoryCostLayer::where('product_id', $product->id)
+                    ->where('batch_id', $batch->id)->where('remaining_quantity', '>', 0)
+                    ->when($transfer->location_id !== null, fn ($query) => $query->where('location_id', $transfer->location_id))
+                    ->lockForUpdate()->sum('remaining_quantity');
+                $batchReserved = (float) StockReservation::where('product_id', $product->id)->where('batch_id', $batch->id)
+                    ->where('status', 'active')->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))
+                    ->when($transfer->location_id !== null, fn ($query) => $query->where(function ($nested) use ($transfer): void { $nested->whereNull('location_id')->orWhere('location_id', $transfer->location_id); }))
+                    ->sum(DB::raw('quantity - released_quantity'));
+                if ($batchAvailable - $batchReserved + 0.000001 < $quantity) throw new \RuntimeException('Insufficient available stock in the selected batch for '.$product->name.'.');
+            }
             if ($transfer->from_status === 'available') {
                 if (app(InventoryAvailabilityService::class)->available($product, true, $transfer->location_id, $transfer->company_id) < $quantity) throw new \RuntimeException('Insufficient available stock at the selected location for '.$product->name.'.');
             } else {

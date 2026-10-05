@@ -14,6 +14,7 @@ use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\User;
 use App\Notifications\InventoryExpiryNotification;
+use App\Notifications\InventoryExceptionNotification;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
 use Tests\TestCase;
@@ -43,5 +44,26 @@ class ExpiryAlertTest extends TestCase
         $notification = $user->notifications()->where('type', InventoryExpiryNotification::class)->firstOrFail();
         $this->assertSame(5.0, (float) $notification->data['balance']);
         $this->assertSame(210.0, (float) $notification->data['value_at_risk']);
+    }
+    public function test_exception_alerts_cover_excess_stock_and_are_repeat_safe(): void
+    {
+        $company = Company::create(['name' => 'Exception Alert Co', 'code' => 'EXCEPTION-ALERT']);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Exception Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Exception Each', 'code' => 'EXCEPTION-EA', 'dimension' => 'count', 'status' => 1, 'is_base' => true]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Exception Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Excess Item', 'purchase_price' => 25, 'quantity' => 5, 'max_stock' => 2, 'status' => 1, 'is_stock_item' => true]);
+        $permission = Permission::create(['code' => 'inventory.view', 'name' => 'View inventory', 'module' => 'inventory']);
+        $role = Role::create(['code' => 'exception-alert-reader', 'name' => 'Exception alert reader', 'is_active' => true]);
+        $role->permissions()->attach($permission);
+        $user = User::factory()->create(['company_id' => $company->id, 'is_active' => true]);
+        $user->roles()->attach($role);
+
+        $this->assertSame(0, Artisan::call('erp:inventory:exception-alerts', ['type' => 'excess', '--company' => $company->id]));
+        $this->assertSame(0, Artisan::call('erp:inventory:exception-alerts', ['type' => 'excess', '--company' => $company->id]));
+
+        $notification = $user->notifications()->where('type', InventoryExceptionNotification::class)->firstOrFail();
+        $this->assertSame('excess', $notification->data['exception_type']);
+        $this->assertSame(3.0, (float) $notification->data['excess_quantity']);
+        $this->assertSame(1, $user->notifications()->where('type', InventoryExceptionNotification::class)->count());
     }
 }

@@ -16,6 +16,8 @@ use App\Models\Supplier;
 use App\Models\Branch;
 use App\Models\InventoryBatch;
 use App\Models\InventoryStatusTransfer;
+use App\Models\QualityInspection;
+use App\Models\QualityInspectionPlan;
 use App\Services\AuditService;
 use App\Services\AutomaticAccountingService;
 use App\Services\InventoryAvailabilityService;
@@ -43,6 +45,7 @@ class ReturnIntegrationController extends Controller
             'source_delivery_id' => ['nullable', 'integer', Rule::exists('deliveries', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'date' => ['required', 'date'], 'reason_code' => ['required', 'string', 'max:100'], 'inspection_required' => ['nullable', 'boolean'], 'disposition_status' => ['nullable', 'in:available,quarantine,damaged'], 'description' => ['nullable', 'string', 'max:2000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', Rule::exists('products', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'lines.*.quality_plan_id' => ['nullable', 'integer'],
             'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_cost' => ['nullable', 'numeric', 'min:0'],
             'lines.*.batch_id' => ['nullable', 'integer'],
             'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'], 'lines.*.tax_rate' => ['nullable', 'numeric', 'min:0', 'max:100'],
@@ -59,7 +62,7 @@ class ReturnIntegrationController extends Controller
         if ($data['return_type'] === 'sales' && !empty($data['source_delivery_id']) && !empty($data['source_invoice_id'])) abort(422, 'Sales returns cannot reference both a delivery and an invoice.');
         if (!empty($data['external_reference'])) {
             $existing = InventoryReturn::where('external_reference', $data['external_reference'])->first();
-            if ($existing) return response()->json(['data' => $existing->load('customer', 'supplier', 'lines.product', 'lines.batch'), 'status' => 'duplicate_ignored']);
+            if ($existing) return response()->json(['data' => $existing->load('customer', 'supplier', 'lines.product', 'lines.batch', 'lines.qualityInspection.plan'), 'status' => 'duplicate_ignored']);
         }
         $party = $data['return_type'] === 'sales' ? Customer::findOrFail($data['customer_id']) : Supplier::findOrFail($data['supplier_id']);
         $return = DB::transaction(function () use ($data, $companyId, $party, $request): InventoryReturn {
@@ -76,12 +79,46 @@ class ReturnIntegrationController extends Controller
                 $expanded = $data['return_type'] === 'sales' && ($product->product_type ?: 'stock') === 'bundle'
                     ? app(\App\Services\BundleFulfillmentService::class)->expandReturnLine($product, (float) $line['quantity'], (float) ($line['unit_cost'] ?? 0), isset($line['unit_price']) ? (float) $line['unit_price'] : null, isset($line['tax_rate']) ? (float) $line['tax_rate'] : null, $line['component_serial_numbers'] ?? [])
                     : [['product_id' => $product->id, 'quantity' => $line['quantity'], 'unit_cost' => $line['unit_cost'] ?? 0, 'unit_price' => $line['unit_price'] ?? null, 'tax_rate' => $line['tax_rate'] ?? null, 'serial_numbers' => $line['serial_numbers'] ?? null]];
-                foreach ($expanded as $expandedLine) InventoryReturnLine::create(['return_id' => $return->id, 'product_id' => $expandedLine['product_id'], 'batch_id' => count($expanded) === 1 ? ($line['batch_id'] ?? null) : null, 'quantity' => $expandedLine['quantity'], 'unit_cost' => $expandedLine['unit_cost'], 'unit_price' => $expandedLine['unit_price'], 'tax_rate' => $expandedLine['tax_rate'], 'serial_numbers' => $expandedLine['serial_numbers'] ?? null]);
+                foreach ($expanded as $expandedLine) {
+                    $returnLine = InventoryReturnLine::create(['return_id' => $return->id, 'product_id' => $expandedLine['product_id'], 'batch_id' => count($expanded) === 1 ? ($line['batch_id'] ?? null) : null, 'quantity' => $expandedLine['quantity'], 'unit_cost' => $expandedLine['unit_cost'], 'unit_price' => $expandedLine['unit_price'], 'tax_rate' => $expandedLine['tax_rate'], 'serial_numbers' => $expandedLine['serial_numbers'] ?? null]);
+                    if (!empty($data['inspection_required'])) {
+                        $planQuery = QualityInspectionPlan::withoutGlobalScopes()
+                            ->where('company_id', $companyId)
+                            ->where('is_active', true)
+                            ->where('inspection_type', 'return')
+                            ->where(fn ($query) => $query->where('product_id', $returnLine->product_id)->orWhereNull('product_id'));
+                        if (!empty($line['quality_plan_id'])) {
+                            $planQuery->whereKey((int) $line['quality_plan_id']);
+                        } else {
+                            $planQuery->orderByRaw('product_id IS NULL')->orderBy('id');
+                        }
+                        $plan = $planQuery->with('lines')->first();
+                        if (!empty($line['quality_plan_id']) && !$plan) abort(422, 'The selected return quality plan is not valid for this product and company.');
+                        if ($plan) {
+                            $inspection = QualityInspection::create([
+                                'company_id' => $companyId,
+                                'plan_id' => $plan->id,
+                                'product_id' => $returnLine->product_id,
+                                'batch_id' => $returnLine->batch_id,
+                                'location_id' => $return->location_id,
+                                'inspection_no' => $return->return_no.'-QI-'.$returnLine->id,
+                                'external_reference' => $return->return_no.'-LINE-'.$returnLine->id,
+                                'source_type' => 'inventory_return_line',
+                                'source_id' => $returnLine->id,
+                                'quantity' => $returnLine->quantity,
+                                'sample_quantity' => min((float) $returnLine->quantity, max(1.0, ceil((float) $returnLine->quantity * (float) ($plan->sampling_percent ?: 100) / 100))),
+                                'status' => 'pending',
+                                'notes' => 'Return quality inspection for '.$return->return_no,
+                            ]);
+                            $returnLine->update(['quality_inspection_id' => $inspection->id]);
+                        }
+                    }
+                }
             }
             app(AuditService::class)->record('inventory_return.created', $return, null, $return->toArray());
             return $return;
         });
-        return response()->json(['data' => $return->load('customer', 'supplier', 'lines.product', 'lines.batch'), 'status' => 'pending_approval'], 201);
+        return response()->json(['data' => $return->load('customer', 'supplier', 'lines.product', 'lines.batch', 'lines.qualityInspection.plan'), 'status' => 'pending_approval'], 201);
     }
 
     public function approve(Request $request, int $id): JsonResponse
@@ -163,7 +200,7 @@ class ReturnIntegrationController extends Controller
             app(AuditService::class)->record('inventory_return.approved', $return, ['status' => 'pending'], ['status' => 'approved']);
             return $return->fresh();
         });
-        return response()->json(['data' => $return->load('customer', 'supplier', 'lines.product', 'lines.batch'), 'status' => $return->status]);
+        return response()->json(['data' => $return->load('customer', 'supplier', 'lines.product', 'lines.batch', 'lines.qualityInspection.plan'), 'status' => $return->status]);
     }
 
     public function reject(Request $request, int $id): JsonResponse
@@ -188,6 +225,7 @@ class ReturnIntegrationController extends Controller
             $return = DB::transaction(function () use ($data, $id, $request): InventoryReturn {
                 $return = InventoryReturn::lockForUpdate()->findOrFail($id);
                 if ($return->status !== 'pending' || !$return->inspection_required || $return->inspection_status !== 'pending') throw new \RuntimeException('Only pending returns awaiting inspection can be inspected.');
+                if ($return->lines()->whereNotNull('quality_inspection_id')->exists()) throw new \RuntimeException('This return uses linked quality inspections; complete those inspections instead.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($return);
                 $before = $return->only(['inspection_status', 'inspection_notes', 'inspected_by', 'inspected_at']);
                 $return->update(['inspection_status' => $data['inspection_status'], 'inspection_notes' => $data['inspection_notes'], 'inspected_by' => $request->user()?->id, 'inspected_at' => now()]);

@@ -19,12 +19,16 @@ class Kernel extends ConsoleKernel
         $schedule->command('erp:sessions:prune')->dailyAt('03:00')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:inventory:expiry-alerts')->dailyAt('06:00')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:inventory:low-stock-alerts')->dailyAt('06:15')->withoutOverlapping(60)->onOneServer();
+        $schedule->command('erp:inventory:exception-alerts excess')->dailyAt('06:20')->withoutOverlapping(60)->onOneServer();
+        $schedule->command('erp:inventory:exception-alerts slow')->dailyAt('06:25')->withoutOverlapping(60)->onOneServer();
+        $schedule->command('erp:inventory:exception-alerts dead')->dailyAt('06:28')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:receivables:overdue-alerts')->dailyAt('06:30')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:payables:overdue-alerts')->dailyAt('06:45')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:service:generate-due')->dailyAt('05:00')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:service:expire-contracts')->dailyAt('04:45')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:service:sla-alerts')->dailyAt('06:35')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:sales:delivery-sla-alerts')->dailyAt('06:40')->withoutOverlapping(60)->onOneServer();
+        $schedule->command('erp:logistics:sync-carrier-tracking')->hourly()->withoutOverlapping(55)->onOneServer();
         $schedule->command('erp:service:generate-spare-part-purchase-orders')->dailyAt('02:45')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:sales:expire-quotations')->dailyAt('00:45')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:procurement:close-overdue-rfqs')->dailyAt('00:50')->withoutOverlapping(60)->onOneServer();

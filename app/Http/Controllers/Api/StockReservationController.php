@@ -28,16 +28,41 @@ class StockReservationController extends Controller
 
     public function index(Request $request): JsonResponse
     {
-        $data = $request->validate(['status' => ['nullable', 'in:active,released'], 'product_id' => ['nullable', 'integer'], 'batch_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['status' => ['nullable', 'in:active,released'], 'product_id' => ['nullable', 'integer'], 'batch_id' => ['nullable', 'integer'], 'serial_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         abort_unless($request->user()?->company_id, 403, 'A company is required for reservations.');
-        $reservations = StockReservation::with(['product', 'batch', 'location', 'salesOrderLine.salesOrder'])
+        $reservations = StockReservation::with(['product', 'batch', 'serial', 'location', 'salesOrderLine.salesOrder'])
             ->when($data['status'] ?? null, fn ($q, $status) => $q->where('status', $status))
             ->when($data['product_id'] ?? null, fn ($q, $id) => $q->where('product_id', $id))
             ->when($data['batch_id'] ?? null, fn ($q, $id) => $q->where('batch_id', $id))
+            ->when($data['serial_id'] ?? null, fn ($q, $id) => $q->where('serial_id', $id))
             ->when($data['location_id'] ?? null, fn ($q, $id) => $q->where('location_id', $id))
             ->when($data['updated_since'] ?? null, fn ($q, $date) => $q->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($reservations, $request, 'inventory.reservations', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function assignSerials(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate(['serial_ids' => ['required', 'array', 'min:1'], 'serial_ids.*' => ['required', 'integer']]);
+        $reservation = StockReservation::findOrFail($id);
+        abort_unless((int) $reservation->company_id === (int) $companyId, 404, 'Reservation not found.');
+        try { $assigned = app(StockReservationService::class)->assignSerials($reservation, $data['serial_ids']); }
+        catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+        app(AuditService::class)->record('stock_reservation.serials_assigned', $reservation, null, ['serial_ids' => collect($assigned)->map(fn ($row): ?int => $row->serial_id)->filter()->values()->all()]);
+        return response()->json(['data' => $assigned, 'status' => 'active']);
+    }
+
+    public function assignBatch(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate(['batch_id' => ['required', 'integer']]);
+        $reservation = StockReservation::findOrFail($id);
+        abort_unless((int) $reservation->company_id === (int) $companyId, 404, 'Reservation not found.');
+        try { $reservation = app(StockReservationService::class)->assignBatch($reservation, (int) $data['batch_id']); }
+        catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+        app(AuditService::class)->record('stock_reservation.batch_assigned', $reservation, null, ['batch_id' => $reservation->batch_id]);
+        return response()->json(['data' => $reservation, 'status' => 'active']);
     }
 
     public function reassign(Request $request, int $id): JsonResponse

@@ -111,4 +111,29 @@ class SerialStockIntegrationTest extends TestCase
         $custody->assertOk()->assertJsonPath('data.0.event_type', 'inventory_movement')->assertJsonPath('data.0.source_context.party_type', 'customer')->assertJsonPath('data.0.source_context.party_name', 'Serial Trace Customer')->assertJsonPath('data.1.event_type', 'service_handoff')->assertJsonPath('data.1.action', 'installed');
         $this->assertSame(2, $custody->json('meta.total'));
     }
+    public function test_unified_traceability_feed_filters_company_scoped_movement_history(): void
+    {
+        $company = Company::create(['name' => 'Unified Trace Tenant', 'code' => 'UNIFIED-TRACE']);
+        $otherCompany = Company::create(['name' => 'Unified Other Tenant', 'code' => 'UNIFIED-OTHER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $unit = Unit::create(['name' => 'Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Unified Goods', 'status' => 1]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Unified Supplier', 'is_active' => true]);
+        $otherSupplier = Supplier::create(['company_id' => $otherCompany->id, 'name' => 'Other Unified Supplier', 'is_active' => true]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Unified trace item', 'sku' => 'UNIFIED-001', 'tracking_type' => 'batch', 'quantity' => 4, 'status' => 1]);
+        $otherProduct = Product::create(['company_id' => $otherCompany->id, 'supplier_id' => $otherSupplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Other trace item', 'sku' => 'UNIFIED-002', 'tracking_type' => 'batch', 'quantity' => 9, 'status' => 1]);
+        $batch = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'UNIFIED-LOT']);
+        $otherBatch = InventoryBatch::create(['product_id' => $otherProduct->id, 'batch_no' => 'OTHER-LOT']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 4, 'unit_cost' => 5, 'batch_id' => $batch->id, 'reason' => 'Unified inbound']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 1, 'unit_cost' => 5, 'batch_id' => $batch->id, 'reason' => 'Unified outbound']);
+        InventoryMovement::create(['company_id' => $otherCompany->id, 'product_id' => $otherProduct->id, 'movement_type' => 'receipt', 'quantity' => 9, 'unit_cost' => 7, 'batch_id' => $otherBatch->id, 'reason' => 'Other tenant']);
+        $token = $user->createToken('unified-trace-read-test', ['inventory:read'])->plainTextToken;
+
+        $response = $this->withToken($token)->getJson('/api/inventory/traceability?product_id='.$product->id.'&direction=outbound&per_page=1');
+
+        $response->assertOk()->assertJsonPath('data.0.product_id', $product->id)->assertJsonPath('data.0.batch_id', $batch->id)->assertJsonPath('data.0.movement_type', 'issue');
+        $this->assertSame(1, $response->json('total'));
+        $this->assertNotSame($otherProduct->id, $response->json('data.0.product_id'));
+    }
+
 }

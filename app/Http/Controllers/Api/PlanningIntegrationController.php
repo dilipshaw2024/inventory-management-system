@@ -368,6 +368,96 @@ class PlanningIntegrationController extends Controller
         return response()->json(['data' => $results, 'status' => $status, 'summary' => ['requested' => count($data['items']), 'created' => $created, 'duplicates' => collect($results)->where('status', 'duplicate_ignored')->count(), 'failed' => $failed]], $httpStatus);
     }
 
+    public function autoPurchaseOrders(Request $request, ReplenishmentPlanningService $planning, ReplenishmentPurchaseOrderService $purchaseOrders): JsonResponse
+    {
+        $data = $request->validate([
+            'product_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'forecast_horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'],
+            'max_items' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'external_reference' => ['nullable', 'string', 'max:100'],
+            'dry_run' => ['sometimes', 'boolean'],
+        ]);
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for automatic replenishment.');
+        if (!empty($data['product_id'])) $this->assertOwnedProduct((int) $data['product_id'], $companyId);
+        if (!empty($data['location_id'])) $this->assertOwnedLocation((int) $data['location_id'], $companyId);
+
+        $proposals = $planning->proposalsForCompany(
+            $companyId,
+            $data['product_id'] ?? null,
+            $data['location_id'] ?? null,
+            $data['forecast_horizon_days'] ?? null,
+            true
+        )->take((int) ($data['max_items'] ?? 100))->values();
+
+        if (($data['dry_run'] ?? false) === true) {
+            return response()->json([
+                'data' => $proposals->map(fn (array $proposal): array => collect($proposal)->except('product')->all()),
+                'status' => 'dry_run',
+                'summary' => ['proposals' => $proposals->count(), 'created' => 0, 'duplicates' => 0, 'failed' => 0],
+                'meta' => ['mutated' => false, 'approval_required' => true],
+            ]);
+        }
+
+        $prefix = $data['external_reference'] ?? 'AUTO-REPLENISH-'.now()->format('Ymd');
+        if ($proposals->isEmpty() && !empty($data['external_reference'])) {
+            $duplicates = \App\Models\PurchaseOrder::where('company_id', $companyId)
+                ->where('external_reference', 'like', $prefix.'-%')
+                ->get();
+            if ($duplicates->isNotEmpty()) {
+                $results = $duplicates->map(fn (\App\Models\PurchaseOrder $order): array => [
+                    'external_reference' => $order->external_reference,
+                    'status' => 'duplicate_ignored',
+                    'data' => $order->load(['supplier', 'lines.product']),
+                ])->values()->all();
+                return response()->json([
+                    'data' => $results,
+                    'status' => 'duplicate_ignored',
+                    'summary' => ['proposals' => 0, 'created' => 0, 'duplicates' => count($results), 'failed' => 0],
+                    'meta' => ['mutated' => false, 'approval_required' => true, 'external_reference_prefix' => $prefix],
+                ]);
+            }
+        }
+        $results = [];
+        foreach ($proposals as $proposal) {
+            $reference = substr($prefix.'-'.(int) $proposal['product_id'].'-'.((int) ($proposal['location_id'] ?? 0)), 0, 150);
+            try {
+                $result = $purchaseOrders->createDraft(
+                    $companyId,
+                    (int) $proposal['product_id'],
+                    $proposal['location_id'] === null ? null : (int) $proposal['location_id'],
+                    (float) $proposal['quantity'],
+                    $reference,
+                    $request->user()?->id,
+                    'Automatically generated from replenishment policy; approval required.'
+                );
+                $results[] = [
+                    'product_id' => (int) $proposal['product_id'],
+                    'location_id' => $proposal['location_id'],
+                    'external_reference' => $reference,
+                    'status' => $result['duplicate'] ? 'duplicate_ignored' : 'pending_approval',
+                    'data' => $result['order'],
+                ];
+            } catch (\RuntimeException $exception) {
+                $results[] = ['product_id' => (int) $proposal['product_id'], 'location_id' => $proposal['location_id'], 'external_reference' => $reference, 'status' => 'failed', 'message' => $exception->getMessage()];
+            }
+        }
+
+        $failed = collect($results)->where('status', 'failed')->count();
+        $created = collect($results)->where('status', 'pending_approval')->count();
+        $duplicates = collect($results)->where('status', 'duplicate_ignored')->count();
+        $status = $failed > 0 ? ($created > 0 || $duplicates > 0 ? 'partial' : 'failed') : ($created > 0 ? 'completed' : ($duplicates > 0 ? 'duplicate_ignored' : 'no_proposals'));
+        $httpStatus = $failed > 0 && ($created > 0 || $duplicates > 0) ? 207 : ($failed > 0 ? 422 : ($created > 0 ? 201 : 200));
+
+        return response()->json([
+            'data' => $results,
+            'status' => $status,
+            'summary' => ['proposals' => $proposals->count(), 'created' => $created, 'duplicates' => $duplicates, 'failed' => $failed],
+            'meta' => ['mutated' => true, 'approval_required' => true, 'external_reference_prefix' => $prefix],
+        ], $httpStatus);
+    }
+
     public function createPurchaseOrderFromSuggestion(Request $request, ReplenishmentPurchaseOrderService $purchaseOrders): JsonResponse
     {
         $data = $request->validate([

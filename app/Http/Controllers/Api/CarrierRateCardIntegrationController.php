@@ -117,6 +117,73 @@ class CarrierRateCardIntegrationController extends Controller
         return response()->json(['data' => $this->deliveryQuotePayload($delivery), 'status' => 'selected']);
     }
 
+    public function autoSelectForDelivery(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'carrier' => ['nullable', 'string', 'max:255'],
+            'origin_zone' => ['nullable', 'string', 'max:80'],
+            'destination_zone' => ['nullable', 'string', 'max:80'],
+            'as_of' => ['nullable', 'date'],
+            'selection_strategy' => ['nullable', 'in:cheapest,fastest'],
+            'external_reference' => ['nullable', 'string', 'max:150'],
+        ]);
+        $storeId = (int) ($request->user()?->store_id ?? 0);
+        $deliveryQuery = Delivery::query()->where('company_id', $companyId)
+            ->when($storeId > 0, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', $storeId)));
+        if (!empty($data['external_reference'])) {
+            $existing = Delivery::where('company_id', $companyId)->where('carrier_quote_external_reference', $data['external_reference'])->first();
+            if ($existing && (int) $existing->id !== $id) abort(422, 'The carrier quote external reference is already used by another delivery.');
+            if ($existing && (int) $existing->id === $id) {
+                return response()->json(['data' => $this->deliveryQuotePayload($existing->load('carrierRateCard')), 'status' => 'duplicate_ignored']);
+            }
+        }
+
+        $asOf = $data['as_of'] ?? now()->toDateString();
+        $strategy = $data['selection_strategy'] ?? 'cheapest';
+        $delivery = DB::transaction(function () use ($data, $companyId, $id, $asOf, $strategy, $deliveryQuery, $request): Delivery {
+            $delivery = $deliveryQuery->with('packages')->lockForUpdate()->findOrFail($id);
+            if ($delivery->status !== 'approved' || in_array($delivery->fulfillment_status, ['delivered', 'cancelled'], true)) {
+                abort(422, 'Only an approved, not-yet-completed delivery can receive a carrier quote.');
+            }
+            $weight = $this->deliveryWeightKg($delivery);
+            if ($weight === null || $weight <= 0) abort(422, 'A delivery must have a positive total or package weight before a carrier quote can be selected.');
+            $carrier = $data['carrier'] ?? $delivery->carrier;
+            $cards = CarrierRateCard::where('company_id', $companyId)->where('is_active', true)
+                ->when($carrier, fn ($q, $value) => $q->where('carrier', $value))
+                ->where(fn ($q) => $q->whereNull('origin_zone')->orWhere('origin_zone', $data['origin_zone'] ?? null))
+                ->where(fn ($q) => $q->whereNull('destination_zone')->orWhere('destination_zone', $data['destination_zone'] ?? null))
+                ->where(fn ($q) => $q->whereNull('min_weight_kg')->orWhere('min_weight_kg', '<=', $weight))
+                ->where(fn ($q) => $q->whereNull('max_weight_kg')->orWhere('max_weight_kg', '>=', $weight))
+                ->where(fn ($q) => $q->whereNull('valid_from')->orWhereDate('valid_from', '<=', $asOf))
+                ->where(fn ($q) => $q->whereNull('valid_until')->orWhereDate('valid_until', '>=', $asOf));
+            if ($strategy === 'fastest') {
+                $cards->orderByRaw('transit_days IS NULL')->orderBy('transit_days')->orderBy('base_amount')->orderBy('per_kg_amount')->orderBy('id');
+            } else {
+                $cards->orderByRaw('(base_amount + (per_kg_amount * ?))', [$weight])->orderBy('transit_days')->orderBy('id');
+            }
+            $card = $cards->first();
+            if (!$card) abort(422, 'No active carrier rate card matches this delivery weight, zone, carrier, and date.');
+            $amount = round((float) $card->base_amount + ((float) $card->per_kg_amount * $weight), 6);
+            $before = $delivery->only(['carrier', 'carrier_rate_card_id', 'carrier_service_code', 'carrier_quote_amount', 'carrier_quote_currency', 'carrier_quote_weight_kg', 'carrier_quote_origin_zone', 'carrier_quote_destination_zone', 'carrier_quote_at', 'carrier_quote_external_reference']);
+            $delivery->update([
+                'carrier' => $card->carrier,
+                'carrier_rate_card_id' => $card->id,
+                'carrier_service_code' => $card->service_code,
+                'carrier_quote_amount' => $amount,
+                'carrier_quote_currency' => $card->currency_code,
+                'carrier_quote_weight_kg' => $weight,
+                'carrier_quote_origin_zone' => $data['origin_zone'] ?? null,
+                'carrier_quote_destination_zone' => $data['destination_zone'] ?? null,
+                'carrier_quote_at' => now(),
+                'carrier_quote_external_reference' => $data['external_reference'] ?? null,
+            ]);
+            app(AuditService::class)->record('delivery.carrier_quote_auto_selected', $delivery, $before, $delivery->fresh()->only(array_keys($before)) + ['rate_card_id' => $card->id, 'selection_strategy' => $strategy, 'selected_by' => $request->user()?->id]);
+            return $delivery->fresh('carrierRateCard');
+        });
+        return response()->json(['data' => $this->deliveryQuotePayload($delivery), 'status' => 'auto_selected', 'selection_strategy' => $strategy]);
+    }
+
     public function quote(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;

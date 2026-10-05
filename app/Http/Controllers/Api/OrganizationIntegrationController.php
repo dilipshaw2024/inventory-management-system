@@ -30,13 +30,17 @@ class OrganizationIntegrationController extends Controller
         if (!$companyId) abort(403, 'A company is required for this operation.');
         $data = $request->validate([
             'name' => ['sometimes', 'required', 'string', 'max:255'], 'code' => ['sometimes', 'required', 'string', 'max:100', Rule::unique('companies', 'code')->ignore($companyId)],
-            'tax_number' => ['sometimes', 'nullable', 'string', 'max:100'], 'email' => ['sometimes', 'nullable', 'email', 'max:255'],
+            'tax_number' => ['sometimes', 'nullable', 'string', 'max:100'], 'tax_registration_scheme' => ['sometimes', 'nullable', 'string', 'max:40'], 'tax_registration_number' => ['sometimes', 'nullable', 'string', 'max:100'],
+            'country_code' => ['sometimes', 'nullable', 'string', 'size:2', 'regex:/^[A-Za-z]{2}$/'], 'locale' => ['sometimes', 'nullable', 'string', 'max:35', 'regex:/^[A-Za-z]{2,3}(?:[_-][A-Za-z]{2,4})?(?:@[A-Za-z0-9_-]+)?$/'],
+            'timezone' => ['sometimes', 'nullable', 'timezone'], 'date_format' => ['sometimes', 'nullable', 'string', 'max:32'], 'decimal_separator' => ['sometimes', 'nullable', 'string', 'size:1'], 'thousands_separator' => ['sometimes', 'nullable', 'string', 'size:1'],
+            'email' => ['sometimes', 'nullable', 'email', 'max:255'],
             'phone' => ['sometimes', 'nullable', 'string', 'max:50'], 'address' => ['sometimes', 'nullable', 'string', 'max:2000'],
             'base_currency' => ['sometimes', 'required', 'string', 'size:3'], 'consolidation_currency' => ['sometimes', 'nullable', 'string', 'size:3'],
             'parent_company_id' => ['sometimes', 'nullable', 'integer', Rule::exists('companies', 'id')], 'is_active' => ['sometimes', 'boolean'],
         ]);
         if (array_key_exists('base_currency', $data)) $data['base_currency'] = strtoupper($data['base_currency']);
         if (array_key_exists('consolidation_currency', $data) && $data['consolidation_currency'] !== null) $data['consolidation_currency'] = strtoupper($data['consolidation_currency']);
+        if (array_key_exists('country_code', $data) && $data['country_code'] !== null) $data['country_code'] = strtoupper($data['country_code']);
         $company = Company::whereKey($companyId)->firstOrFail();
         if (array_key_exists('parent_company_id', $data)) {
             $parentId = $data['parent_company_id'];

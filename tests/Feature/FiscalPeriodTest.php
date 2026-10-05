@@ -97,6 +97,37 @@ class FiscalPeriodTest extends TestCase
             ->assertJsonPath('message', 'Close checklist failed: 1 inventory cost revaluation run(s) remain pending through 2026-01-31.');
     }
 
+    public function test_period_close_rejects_unposted_standard_cost_variances(): void
+    {
+        $company = Company::create(['name' => 'Standard Variance Close Co', 'code' => 'STD-VAR-CLOSE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY 2026', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
+        $period = FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => '2026-01', 'starts_on' => '2026-01-01', 'ends_on' => '2026-01-31', 'status' => 'open']);
+        $supplier = \App\Models\Supplier::create(['company_id' => $company->id, 'name' => 'Variance Supplier', 'is_active' => true]);
+        $unit = \App\Models\Unit::create(['name' => 'Variance Each', 'status' => 1]);
+        $category = \App\Models\Category::create(['name' => 'Variance Category', 'status' => 1]);
+        $product = \App\Models\Product::create([
+            'company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id,
+            'name' => 'Variance close item', 'sku' => 'STD-CLOSE-ITEM', 'status' => 1,
+            'costing_method' => 'standard', 'standard_cost' => 10,
+        ]);
+        \App\Models\InventoryMovement::create([
+            'company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt',
+            'quantity' => 2, 'unit_cost' => 12, 'posted_at' => '2026-01-15',
+        ]);
+        Sanctum::actingAs($user, ['integration:write', 'accounting:write', 'accounting:read']);
+
+        $this->getJson('/api/accounting/fiscal-periods/'.$period->id.'/close-checklist')
+            ->assertOk()
+            ->assertJsonPath('status', 'blocked')
+            ->assertJsonPath('data.checks.4.key', 'standard_cost_variances')
+            ->assertJsonPath('data.checks.4.count', 1);
+
+        $this->postJson('/api/accounting/fiscal-periods/'.$period->id.'/close', ['close_reason' => 'Attempt close with unposted standard-cost variance.'])
+            ->assertStatus(422)
+            ->assertJsonPath('message', 'Close checklist failed: 1 standard-cost variance journal(s) remain unposted through 2026-01-31.');
+    }
+
     public function test_period_close_checklist_previews_blockers_without_mutating_period(): void
     {
         $company = Company::create(['name' => 'Checklist Co', 'code' => 'CHECKLIST-CO']);

@@ -67,6 +67,23 @@ class CarrierRateCardTest extends TestCase
         ])->assertOk()->assertJsonPath('meta.delivery_id', $delivery->id)->assertJsonPath('meta.weight_kg', 5)
             ->assertJsonPath('data.0.service_code', 'ECONOMY');
 
+        $auto = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/carrier-quote/auto', [
+            'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S', 'as_of' => '2026-09-29',
+            'selection_strategy' => 'cheapest', 'external_reference' => 'DELIVERY-AUTO-RATE-1',
+        ]);
+        $auto->assertOk()->assertJsonPath('status', 'auto_selected')->assertJsonPath('selection_strategy', 'cheapest')
+            ->assertJsonPath('data.service_code', 'ECONOMY')->assertJsonPath('data.amount', 75);
+        $this->postJson('/api/integration/deliveries/'.$delivery->id.'/carrier-quote/auto', [
+            'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S', 'external_reference' => 'DELIVERY-AUTO-RATE-1',
+        ])->assertOk()->assertJsonPath('status', 'duplicate_ignored');
+
+        $fastest = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/carrier-quote/auto', [
+            'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S', 'selection_strategy' => 'fastest',
+            'external_reference' => 'DELIVERY-AUTO-FAST-1',
+        ]);
+        $fastest->assertOk()->assertJsonPath('status', 'auto_selected')->assertJsonPath('selection_strategy', 'fastest')
+            ->assertJsonPath('data.service_code', 'EXPRESS')->assertJsonPath('data.amount', 200);
+
         $selected = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/carrier-quote', [
             'rate_card_id' => $created->json('data.id'), 'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S',
             'as_of' => '2026-09-29', 'external_reference' => 'DELIVERY-RATE-1',
@@ -77,6 +94,8 @@ class CarrierRateCardTest extends TestCase
             'rate_card_id' => $created->json('data.id'), 'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S',
             'external_reference' => 'DELIVERY-RATE-1',
         ])->assertOk()->assertJsonPath('status', 'duplicate_ignored');
+
+        $this->assertDatabaseHas('audit_logs', ['action' => 'delivery.carrier_quote_auto_selected']);
 
         $this->getJson('/api/integration/logistics/rate-cards?carrier=Universal%20Carrier')
             ->assertOk()->assertJsonPath('meta.total', 2);

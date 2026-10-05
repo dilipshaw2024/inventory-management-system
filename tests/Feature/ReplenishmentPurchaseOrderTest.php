@@ -80,6 +80,48 @@ class ReplenishmentPurchaseOrderTest extends TestCase
         $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());
     }
 
+    public function test_automatic_replenishment_executes_current_proposals_and_replays(): void
+    {
+        $company = Company::create(['name' => 'Automatic Replenishment Co', 'code' => 'AUTO-REPLENISH']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Automatic Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Automatic Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Automatic Category', 'status' => 1]);
+        $product = Product::create([
+            'company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id,
+            'category_id' => $category->id, 'name' => 'Automatic item', 'status' => 1,
+            'is_stock_item' => true, 'reorder_level' => 10, 'purchase_price' => 5,
+        ]);
+        InventoryMovement::create([
+            'company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt',
+            'quantity' => 2, 'unit_cost' => 5, 'posted_at' => now(),
+        ]);
+
+        Sanctum::actingAs($user, ['inventory:write']);
+        $dryRun = $this->postJson('/api/inventory/replenishment/auto-purchase-orders', ['external_reference' => 'AUTO-REPLENISH-REF', 'dry_run' => true])
+            ->assertOk()
+            ->assertJsonPath('status', 'dry_run')
+            ->assertJsonPath('meta.mutated', false)
+            ->assertJsonPath('summary.proposals', 1);
+        $this->assertSame(0, PurchaseOrder::where('company_id', $company->id)->count());
+
+        $created = $this->postJson('/api/inventory/replenishment/auto-purchase-orders', ['external_reference' => 'AUTO-REPLENISH-REF'])
+            ->assertCreated()
+            ->assertJsonPath('status', 'completed')
+            ->assertJsonPath('summary.created', 1)
+            ->assertJsonPath('data.0.status', 'pending_approval')
+            ->assertJsonPath('data.0.external_reference', 'AUTO-REPLENISH-REF-'.$product->id.'-0');
+        $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());
+        $this->assertSame(8.0, (float) $created->json('data.0.data.lines.0.ordered_qty'));
+
+        $this->postJson('/api/inventory/replenishment/auto-purchase-orders', ['external_reference' => 'AUTO-REPLENISH-REF'])
+            ->assertOk()
+            ->assertJsonPath('status', 'duplicate_ignored')
+            ->assertJsonPath('summary.duplicates', 1)
+            ->assertJsonPath('summary.created', 0);
+        $this->assertSame(1, PurchaseOrder::where('company_id', $company->id)->count());
+    }
+
     public function test_replenishment_purchase_order_preserves_target_location(): void
     {
         $company = Company::create(['name' => 'Located Replenishment Co', 'code' => 'LOCATED-REPLENISH']);

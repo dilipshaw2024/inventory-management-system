@@ -11,13 +11,13 @@ class DemandForecastService
      * The selector deliberately prefers the simpler average model unless the
      * weekly model improves mean absolute error by at least five percent.
      *
-     * @return array{model: string, naive_error: float, weekly_error: float, exponential_error: float}
+     * @return array{model: string, naive_error: float, weekly_error: float, exponential_error: float, croston_error: float}
      */
     public function selectModel(Collection $dailySeries, \Carbon\CarbonInterface $historyStart, int $horizonDays, float $fallbackDailyRate): array
     {
         $values = $dailySeries->map(fn ($value): float => max(0.0, (float) $value))->values();
         $holdout = min(14, max(0, intdiv($values->count(), 4)));
-        if ($holdout < 7 || $values->count() - $holdout < 14) return ['model' => 'naive', 'naive_error' => 0.0, 'weekly_error' => 0.0, 'exponential_error' => 0.0, 'metrics' => []];
+        if ($holdout < 7 || $values->count() - $holdout < 14) return ['model' => 'naive', 'naive_error' => 0.0, 'weekly_error' => 0.0, 'exponential_error' => 0.0, 'croston_error' => 0.0, 'metrics' => []];
 
         $train = $values->slice(0, $values->count() - $holdout)->values();
         $actual = $values->slice($train->count(), $holdout)->values();
@@ -32,11 +32,14 @@ class DemandForecastService
         $exponentialLevel = $this->exponentialLevel($train, $naive);
         $exponentialMetrics = $this->errorMetrics($actual, array_fill(0, $actual->count(), $exponentialLevel));
         $exponentialError = $exponentialMetrics['mae'];
-        $candidates = ['naive' => $naiveError, 'weekly' => $weeklyError, 'exponential' => $exponentialError];
+        $crostonRate = $this->crostonRate($train, $naive);
+        $crostonMetrics = $this->errorMetrics($actual, array_fill(0, $actual->count(), $crostonRate));
+        $crostonError = $crostonMetrics['mae'];
+        $candidates = ['naive' => $naiveError, 'weekly' => $weeklyError, 'exponential' => $exponentialError, 'croston' => $crostonError];
         asort($candidates);
         $bestModel = array_key_first($candidates) ?: 'naive';
         if ($bestModel !== 'naive' && ($naiveError <= 0 || $candidates[$bestModel] >= ($naiveError * 0.95))) $bestModel = 'naive';
-        return ['model' => $bestModel, 'naive_error' => $naiveError, 'weekly_error' => $weeklyError, 'exponential_error' => $exponentialError, 'metrics' => ['naive' => $naiveMetrics, 'weekly' => $weeklyMetrics, 'exponential' => $exponentialMetrics]];
+        return ['model' => $bestModel, 'naive_error' => $naiveError, 'weekly_error' => $weeklyError, 'exponential_error' => $exponentialError, 'croston_error' => $crostonError, 'metrics' => ['naive' => $naiveMetrics, 'weekly' => $weeklyMetrics, 'exponential' => $exponentialMetrics, 'croston' => $crostonMetrics]];
     }
 
     public function seasonalForecast(Collection $dailySeries, \Carbon\CarbonInterface $historyStart, \Carbon\CarbonInterface $forecastStart, int $horizonDays, float $fallbackDailyRate): float
@@ -68,6 +71,11 @@ class DemandForecastService
         return max(0.0, $this->exponentialLevel($dailySeries, $fallbackDailyRate, $alpha)) * max(0, $horizonDays);
     }
 
+    public function crostonForecast(Collection $dailySeries, int $horizonDays, float $fallbackDailyRate, float $alpha = 0.1): float
+    {
+        return max(0.0, $this->crostonRate($dailySeries, $fallbackDailyRate, $alpha)) * max(0, $horizonDays);
+    }
+
     /** @return array<int, float> */
     private function dailySeasonalPredictions(Collection $dailySeries, \Carbon\CarbonInterface $historyStart, \Carbon\CarbonInterface $forecastStart, int $horizonDays, float $fallbackDailyRate): array
     {
@@ -86,6 +94,26 @@ class DemandForecastService
         $level = $values->first() ?? max(0.0, $fallbackDailyRate);
         foreach ($values->skip(1) as $value) $level = $alpha * (float) $value + (1 - $alpha) * $level;
         return max(0.0, (float) $level);
+    }
+
+    private function crostonRate(Collection $dailySeries, float $fallbackDailyRate, float $alpha = 0.1): float
+    {
+        $alpha = min(1.0, max(0.01, $alpha));
+        $values = $dailySeries->map(fn ($value): float => max(0.0, (float) $value))->values();
+        $size = null; $interval = null; $lastOccurrence = null;
+        foreach ($values as $index => $value) {
+            if ($value <= 0.000001) continue;
+            if ($size === null) {
+                $size = $value;
+                $interval = max(1, (int) $index + 1);
+            } else {
+                $gap = max(1, (int) $index - (int) $lastOccurrence);
+                $size = $alpha * $value + (1 - $alpha) * $size;
+                $interval = $alpha * $gap + (1 - $alpha) * $interval;
+            }
+            $lastOccurrence = (int) $index;
+        }
+        return $size === null || $interval === null ? max(0.0, $fallbackDailyRate) : max(0.0, (float) $size / max(0.000001, (float) $interval));
     }
 
     /** @param array<int, float> $predictions @return array{mae: float, rmse: float, mape: ?float, wape: ?float, bias: float} */

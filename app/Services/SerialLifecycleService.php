@@ -35,11 +35,11 @@ class SerialLifecycleService
         return $serials;
     }
 
-    public function issueSpecific(Product $product, array $serialNumbers, ?int $locationId = null, ?int $batchId = null): Collection
+    public function issueSpecific(Product $product, array $serialNumbers, ?int $locationId = null, ?int $batchId = null, bool $allowReserved = false): Collection
     {
         if ($product->tracking_type !== 'serial') return collect();
         $serialNumbers = array_values(array_unique(array_filter(array_map('trim', $serialNumbers))));
-        $serials = InventorySerial::where('product_id', $product->id)->whereIn('serial_no', $serialNumbers)->whereIn('status', ['available', 'returned'])->when($batchId !== null, fn ($query) => $query->where('batch_id', $batchId))->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))->lockForUpdate()->get();
+        $serials = InventorySerial::where('product_id', $product->id)->whereIn('serial_no', $serialNumbers)->whereIn('status', $allowReserved ? ['available', 'returned', 'reserved'] : ['available', 'returned'])->when($batchId !== null, fn ($query) => $query->where('batch_id', $batchId))->when($locationId !== null, fn ($query) => $query->where(function ($nested) use ($locationId): void { $nested->whereNull('location_id')->orWhere('location_id', $locationId); }))->lockForUpdate()->get();
         if ($serials->count() !== count($serialNumbers)) throw new \RuntimeException('One or more selected serial numbers are unavailable for '.$product->name.'.');
         $serials->each(fn (InventorySerial $serial): bool => (bool) $serial->update(['status' => 'issued', 'location_id' => $locationId ?: $serial->location_id]));
         return $serials;

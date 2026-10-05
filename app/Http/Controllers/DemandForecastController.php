@@ -13,7 +13,7 @@ class DemandForecastController extends Controller
     public function index(Request $request)
     {
         $companyId = (int) auth()->user()?->company_id;
-        $data = $request->validate(['history_days' => ['nullable', 'integer', 'min:7', 'max:730'], 'horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'], 'location_id' => ['nullable', 'integer'], 'seasonality' => ['nullable', 'in:none,weekly,exponential,auto']]);
+        $data = $request->validate(['history_days' => ['nullable', 'integer', 'min:7', 'max:730'], 'horizon_days' => ['nullable', 'integer', 'min:1', 'max:365'], 'location_id' => ['nullable', 'integer'], 'seasonality' => ['nullable', 'in:none,weekly,exponential,croston,auto']]);
         $locationId = $data['location_id'] ?? null;
         if ($locationId !== null) InventoryLocation::whereKey($locationId)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->firstOrFail();
         $locations = InventoryLocation::with('warehouse')->where('is_active', true)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->orderBy('code')->get();

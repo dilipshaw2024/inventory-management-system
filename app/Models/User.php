@@ -24,6 +24,7 @@ class User extends Authenticatable implements MustVerifyEmail
         'password',
         'company_id',
         'branch_id',
+        'warehouse_id',
         'store_id',
         'department_id',
         'is_active',
@@ -56,6 +57,7 @@ class User extends Authenticatable implements MustVerifyEmail
     public function roles() { return $this->belongsToMany(Role::class); }
     public function company() { return $this->belongsTo(Company::class); }
     public function branch() { return $this->belongsTo(Branch::class); }
+    public function warehouse() { return $this->belongsTo(Warehouse::class); }
     public function store() { return $this->belongsTo(Store::class); }
     public function department() { return $this->belongsTo(Department::class); }
     public function serviceTechnician() { return $this->hasOne(ServiceTechnician::class); }

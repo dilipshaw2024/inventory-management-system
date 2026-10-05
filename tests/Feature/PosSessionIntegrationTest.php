@@ -192,8 +192,9 @@ class PosSessionIntegrationTest extends TestCase
         $branch = Branch::create(['company_id' => $company->id, 'name' => 'Main', 'code' => 'POS-ACC-BRANCH']);
         $store = Store::create(['branch_id' => $branch->id, 'name' => 'Downtown', 'code' => 'POS-ACC-STORE', 'is_active' => true]);
         $user = User::factory()->create(['company_id' => $company->id]);
-        $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY 2026', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
-        FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => '2026-09', 'starts_on' => '2026-09-01', 'ends_on' => '2026-09-30', 'status' => 'open']);
+        $periodDate = now();
+        $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY '.$periodDate->year, 'starts_on' => $periodDate->copy()->startOfYear()->toDateString(), 'ends_on' => $periodDate->copy()->endOfYear()->toDateString(), 'status' => 'open']);
+        FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => $periodDate->format('Y-m'), 'starts_on' => $periodDate->copy()->startOfMonth()->toDateString(), 'ends_on' => $periodDate->copy()->endOfMonth()->toDateString(), 'status' => 'open']);
         $cash = ChartOfAccount::create(['company_id' => $company->id, 'code' => '1010', 'name' => 'POS Cash', 'account_type' => 'asset', 'is_active' => true]);
         $variance = ChartOfAccount::create(['company_id' => $company->id, 'code' => '4890', 'name' => 'Cash Over Short', 'account_type' => 'expense', 'is_active' => true]);
         AccountMapping::create(['company_id' => $company->id, 'mapping_key' => 'cash', 'account_id' => $cash->id]);

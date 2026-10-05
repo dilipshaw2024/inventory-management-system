@@ -20,6 +20,25 @@ class EInvoiceIntegrationTest extends TestCase
 {
     use RefreshDatabase;
 
+    public function test_capability_manifest_is_versioned_and_reflects_token_abilities(): void
+    {
+        $company = Company::create(['name' => 'Capability Co', 'code' => 'CAPABILITY-API']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $token = $user->createToken('capability-test', ['integration:read', 'inventory:read', 'sales:write'])->plainTextToken;
+
+        $response = $this->withToken($token)->getJson('/api/integration/capabilities');
+
+        $response->assertOk()
+            ->assertJsonPath('data.contract', 'erp.integration.v1')
+            ->assertJsonPath('data.api_version', 'v1')
+            ->assertJsonPath('data.modules.inventory.read_ability', 'inventory:read')
+            ->assertJsonPath('data.modules.inventory.conventions.idempotency', 'external_reference')
+            ->assertJsonPath('meta.company_id', $company->id);
+        $this->assertContains('inventory:read', $response->json('data.abilities'));
+        $this->assertContains('sales:write', $response->json('data.abilities'));
+        $this->assertNotContains('accounting:write', $response->json('data.abilities'));
+    }
+
     public function test_approved_invoice_creates_idempotent_hashed_e_invoice_envelope(): void
     {
         $company = Company::create(['name' => 'E-Invoice Co', 'code' => 'EINV-API']);

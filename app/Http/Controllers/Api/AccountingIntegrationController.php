@@ -360,13 +360,16 @@ class AccountingIntegrationController extends Controller
         $scope = fn ($query) => $query->where(fn ($company) => $company->where('company_id', $companyId)->orWhereNull('company_id'));
         $entries = collect();
         Invoice::where($scope)->where('customer_id', $customer->id)->where('status', 1)->where(function ($query) use ($to): void { $query->whereDate('date', '<=', $to->toDateString())->orWhere(function ($fallback) use ($to): void { $fallback->whereNull('date')->whereDate('created_at', '<=', $to->toDateString()); }); })->get()->each(function (Invoice $invoice) use ($entries): void {
-            $entries->push(['occurred_at' => ($invoice->date ?: $invoice->created_at)->toDateString(), 'type' => 'invoice', 'reference' => $invoice->invoice_no ?: 'INV-'.$invoice->id, 'source_id' => $invoice->id, 'debit' => (float) $invoice->total_amount, 'credit' => 0.0, 'currency_code' => $invoice->currency_code]);
+            $entries->push(['occurred_at' => ($invoice->date ?: $invoice->created_at)->toDateString(), 'type' => 'invoice', 'source_type' => 'invoice', 'reference' => $invoice->invoice_no ?: 'INV-'.$invoice->id, 'source_id' => $invoice->id, 'debit' => (float) $invoice->total_amount, 'credit' => 0.0, 'currency_code' => $invoice->currency_code]);
         });
         CustomerCreditNote::where($scope)->where('customer_id', $customer->id)->where('status', 'approved')->whereDate('credit_date', '<=', $to->toDateString())->get()->each(function (CustomerCreditNote $note) use ($entries): void {
-            $entries->push(['occurred_at' => $note->credit_date->toDateString(), 'type' => 'customer_credit_note', 'reference' => $note->credit_no, 'source_id' => $note->id, 'invoice_id' => $note->invoice_id, 'debit' => 0.0, 'credit' => (float) $note->total_amount, 'currency_code' => $note->invoice?->currency_code]);
+            $entries->push(['occurred_at' => $note->credit_date->toDateString(), 'type' => 'customer_credit_note', 'source_type' => 'customer_credit_note', 'reference' => $note->credit_no, 'source_id' => $note->id, 'invoice_id' => $note->invoice_id, 'debit' => 0.0, 'credit' => (float) $note->total_amount, 'currency_code' => $note->invoice?->currency_code]);
+        });
+        CustomerRefund::where($scope)->where('customer_id', $customer->id)->where('status', 'approved')->whereDate('approved_at', '<=', $to->toDateString())->get()->each(function (CustomerRefund $refund) use ($entries): void {
+            $entries->push(['occurred_at' => optional($refund->approved_at)->toDateString() ?: $refund->created_at->toDateString(), 'type' => 'customer_refund', 'source_type' => 'customer_refund', 'reference' => $refund->refund_no ?: 'REFUND-'.$refund->id, 'source_id' => $refund->id, 'debit' => (float) $refund->amount, 'credit' => 0.0, 'currency_code' => $refund->currency_code, 'settlement_status' => $refund->settlement_status]);
         });
         Payment::where($scope)->where('customer_id', $customer->id)->where('approval_status', 'approved')->where(function ($query): void { $query->where('is_reversed', false)->orWhereNull('is_reversed'); })->where(fn ($query) => $query->whereDate('payment_date', '<=', $to->toDateString())->orWhere(fn ($legacy) => $legacy->whereNull('payment_date')->whereDate('created_at', '<=', $to->toDateString())))->with(['allocations' => fn ($query) => $query->whereDate('allocated_at', '<=', $to->toDateString())])->get()->each(function (Payment $payment) use ($entries): void {
-            $entries->push(['occurred_at' => ($payment->payment_date ?: $payment->created_at)->toDateString(), 'type' => 'payment', 'reference' => $payment->reference ?: 'PAY-'.$payment->id, 'source_id' => $payment->id, 'debit' => 0.0, 'credit' => (float) $payment->paid_amount, 'currency_code' => $payment->currency_code, 'allocated_amount' => (float) $payment->allocations->sum('amount'), 'allocated_invoice_amount' => (float) $payment->allocations->sum('amount'), 'allocated_payment_amount' => (float) $payment->allocations->sum(fn ($allocation): float => (float) ($allocation->payment_amount ?? $allocation->amount)), 'allocation_count' => $payment->allocations->count()]);
+            $entries->push(['occurred_at' => ($payment->payment_date ?: $payment->created_at)->toDateString(), 'type' => 'payment', 'source_type' => 'payment', 'reference' => $payment->reference ?: 'PAY-'.$payment->id, 'source_id' => $payment->id, 'debit' => 0.0, 'credit' => (float) $payment->paid_amount, 'currency_code' => $payment->currency_code, 'allocation_status' => $payment->allocation_status, 'allocated_amount' => (float) $payment->allocations->sum('amount'), 'allocated_invoice_amount' => (float) $payment->allocations->sum('amount'), 'allocated_payment_amount' => (float) $payment->allocations->sum(fn ($allocation): float => (float) ($allocation->payment_amount ?? $allocation->amount)), 'allocation_count' => $payment->allocations->count()]);
         });
         $entries = $entries->sortBy(function (array $entry): string {
             $priority = match ($entry['type']) {
@@ -387,6 +390,24 @@ class AccountingIntegrationController extends Controller
         return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'summary' => ['opening_balance' => round($opening, 6), 'period_debits' => round((float) $rows->sum('debit'), 6), 'period_credits' => round((float) $rows->sum('credit'), 6), 'closing_balance' => round($running, 6)], 'meta' => ['customer' => $customer, 'from' => $from->toDateString(), 'to' => $to->toDateString(), 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
     }
 
+    public function customerReceivablesLedger(Request $request, int $customerId): JsonResponse
+    {
+        $response = $this->customerStatement($request, $customerId);
+        $payload = json_decode($response->getContent(), true, 512, JSON_THROW_ON_ERROR);
+        $payload['meta']['ledger_type'] = 'receivables';
+        $payload['meta']['read_only'] = true;
+        return response()->json($payload, $response->getStatusCode());
+    }
+
+    public function supplierPayablesLedger(Request $request, int $supplierId): JsonResponse
+    {
+        $response = $this->supplierStatement($request, $supplierId);
+        $payload = json_decode($response->getContent(), true, 512, JSON_THROW_ON_ERROR);
+        $payload['meta']['ledger_type'] = 'payables';
+        $payload['meta']['read_only'] = true;
+        return response()->json($payload, $response->getStatusCode());
+    }
+
     public function supplierStatement(Request $request, int $supplierId): JsonResponse
     {
         $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
@@ -398,16 +419,16 @@ class AccountingIntegrationController extends Controller
         $scope = fn ($query) => $query->where(fn ($company) => $company->where('company_id', $companyId)->orWhereNull('company_id'));
         $entries = collect();
         PurchaseInvoice::where($scope)->where('supplier_id', $supplier->id)->where('status', 'approved')->whereDate('invoice_date', '<=', $to->toDateString())->get()->each(function (PurchaseInvoice $invoice) use ($entries): void {
-            $entries->push(['occurred_at' => ($invoice->invoice_date ?: $invoice->created_at)->toDateString(), 'type' => 'purchase_invoice', 'reference' => $invoice->invoice_no ?: 'PINV-'.$invoice->id, 'source_id' => $invoice->id, 'debit' => 0.0, 'credit' => (float) $invoice->total_amount, 'currency_code' => $invoice->currency_code]);
+            $entries->push(['occurred_at' => ($invoice->invoice_date ?: $invoice->created_at)->toDateString(), 'type' => 'purchase_invoice', 'source_type' => 'purchase_invoice', 'reference' => $invoice->invoice_no ?: 'PINV-'.$invoice->id, 'source_id' => $invoice->id, 'debit' => 0.0, 'credit' => (float) $invoice->total_amount, 'currency_code' => $invoice->currency_code]);
         });
         SupplierPayment::where($scope)->where('supplier_id', $supplier->id)->where('status', 'approved')->where(function ($query): void { $query->where('is_reversed', false)->orWhereNull('is_reversed'); })->whereDate('payment_date', '<=', $to->toDateString())->with(['allocations' => fn ($query) => $query->whereDate('allocated_at', '<=', $to->toDateString())])->get()->each(function (SupplierPayment $payment) use ($entries): void {
-            $entries->push(['occurred_at' => $payment->payment_date->toDateString(), 'type' => 'supplier_payment', 'reference' => $payment->payment_no ?: 'PAY-'.$payment->id, 'source_id' => $payment->id, 'debit' => (float) $payment->amount, 'credit' => 0.0, 'currency_code' => $payment->currency_code, 'allocated_amount' => (float) $payment->allocations->sum('amount'), 'allocated_invoice_amount' => (float) $payment->allocations->sum('amount'), 'allocated_payment_amount' => (float) $payment->allocations->sum(fn ($allocation): float => (float) ($allocation->payment_amount ?? $allocation->amount)), 'allocation_count' => $payment->allocations->count()]);
+            $entries->push(['occurred_at' => $payment->payment_date->toDateString(), 'type' => 'supplier_payment', 'source_type' => 'supplier_payment', 'reference' => $payment->payment_no ?: 'PAY-'.$payment->id, 'source_id' => $payment->id, 'debit' => (float) $payment->amount, 'credit' => 0.0, 'currency_code' => $payment->currency_code, 'allocation_status' => $payment->allocation_status, 'allocated_amount' => (float) $payment->allocations->sum('amount'), 'allocated_invoice_amount' => (float) $payment->allocations->sum('amount'), 'allocated_payment_amount' => (float) $payment->allocations->sum(fn ($allocation): float => (float) ($allocation->payment_amount ?? $allocation->amount)), 'allocation_count' => $payment->allocations->count()]);
         });
         \App\Models\SupplierClaim::where($scope)->where('supplier_id', $supplier->id)->whereIn('status', ['partially_settled', 'settled'])->where('settled_amount', '>', 0)->whereDate('settled_at', '<=', $to->toDateString())->get()->each(function (\App\Models\SupplierClaim $claim) use ($entries): void {
-            $entries->push(['occurred_at' => optional($claim->settled_at)->toDateString() ?: $claim->claim_date->toDateString(), 'type' => 'supplier_claim_settlement', 'reference' => $claim->settlement_reference ?: $claim->claim_no, 'source_id' => $claim->id, 'purchase_invoice_id' => $claim->purchase_invoice_id, 'debit' => (float) $claim->settled_amount, 'credit' => 0.0, 'currency_code' => null]);
+            $entries->push(['occurred_at' => optional($claim->settled_at)->toDateString() ?: $claim->claim_date->toDateString(), 'type' => 'supplier_claim_settlement', 'source_type' => 'supplier_claim', 'reference' => $claim->settlement_reference ?: $claim->claim_no, 'source_id' => $claim->id, 'purchase_invoice_id' => $claim->purchase_invoice_id, 'debit' => (float) $claim->settled_amount, 'credit' => 0.0, 'currency_code' => null]);
         });
         \App\Models\SupplierCreditNote::where($scope)->where('supplier_id', $supplier->id)->whereNull('supplier_claim_id')->where('status', 'approved')->where('total_amount', '>', 0)->whereDate('approved_at', '<=', $to->toDateString())->get()->each(function (\App\Models\SupplierCreditNote $note) use ($entries): void {
-            $entries->push(['occurred_at' => optional($note->approved_at)->toDateString() ?: $note->credit_date->toDateString(), 'type' => 'supplier_credit_note', 'reference' => $note->credit_no, 'source_id' => $note->id, 'purchase_invoice_id' => $note->purchase_invoice_id, 'debit' => (float) $note->total_amount, 'credit' => 0.0, 'currency_code' => null]);
+            $entries->push(['occurred_at' => optional($note->approved_at)->toDateString() ?: $note->credit_date->toDateString(), 'type' => 'supplier_credit_note', 'source_type' => 'supplier_credit_note', 'reference' => $note->credit_no, 'source_id' => $note->id, 'purchase_invoice_id' => $note->purchase_invoice_id, 'debit' => (float) $note->total_amount, 'credit' => 0.0, 'currency_code' => null]);
         });
         $entries = $entries->sortBy(function (array $entry): string {
             $priority = match ($entry['type']) {

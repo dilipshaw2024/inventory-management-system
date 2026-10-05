@@ -138,7 +138,7 @@ class InventoryRevaluationPreviewTest extends TestCase
             ->assertJsonPath('status', 'posted')
             ->assertJsonPath('meta.idempotent', true);
         $journalId = $first->json('data.id');
-        $first->assertJsonPath('data.lines.0.debit', 4);
+        $this->assertEquals(4.0, (float) $first->json('data.lines.0.debit'));
         $this->assertDatabaseHas('journal_entries', ['id' => $journalId, 'external_reference' => 'STD-VARIANCE-MOVEMENT-'.$movement->id]);
         $this->assertSame(1, \App\Models\JournalEntry::where('company_id', $company->id)->where('external_reference', 'STD-VARIANCE-MOVEMENT-'.$movement->id)->count());
 
@@ -191,7 +191,7 @@ class InventoryRevaluationPreviewTest extends TestCase
         $movement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 4, 'unit_cost' => 12, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'posted_at' => now()->subDay()]);
         $layer = InventoryCostLayer::create(['product_id' => $product->id, 'department_id' => $department->id, 'cost_center_id' => $costCenter->id, 'original_quantity' => 4, 'remaining_quantity' => 4, 'unit_cost' => 12, 'received_at' => now()->subDay(), 'source_type' => $movement->getMorphClass(), 'source_id' => $movement->id]);
         $year = FiscalYear::create(['company_id' => $company->id, 'name' => 'FY VAL DIM', 'starts_on' => '2026-01-01', 'ends_on' => '2026-12-31', 'status' => 'open']);
-        $period = FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => '2026-09', 'starts_on' => '2026-09-01', 'ends_on' => '2026-09-30', 'status' => 'open']);
+        $period = FiscalPeriod::create(['company_id' => $company->id, 'fiscal_year_id' => $year->id, 'name' => now()->format('Y-m'), 'starts_on' => now()->startOfMonth()->toDateString(), 'ends_on' => now()->endOfMonth()->toDateString(), 'status' => 'open']);
 
         Sanctum::actingAs($user, ['inventory:read']);
         $response = $this->getJson('/api/inventory/valuation?department_id='.$department->id.'&cost_center_id='.$costCenter->id);

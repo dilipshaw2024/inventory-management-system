@@ -42,6 +42,20 @@ class HrEmployeeTest extends TestCase
         $this->getJson('/api/hr/leave-requests?cursor_mode=1')->assertOk()->assertJsonPath('meta.feed', 'hr.leave-requests')->assertJsonCount(1, 'data');
         $this->postJson('/api/hr/leave-requests/'.$leave->json('data.id').'/approve')->assertOk()->assertJsonPath('data.status', 'approved');
         $this->postJson('/api/hr/leave-requests', ['employee_id' => $active->json('data.id'), 'leave_type_id' => $leaveType->json('data.id'), 'starts_on' => '2026-09-12', 'ends_on' => '2026-09-13'])->assertStatus(422);
+        app(\App\Services\ErpSettingService::class)->put('planning_calendar', ['weekend_days' => [0, 6], 'holidays' => ['2026-09-21']], 'json', $company->id);
+        $workingLeaveType = $this->postJson('/api/hr/leave-types', ['code' => 'WORKING', 'name' => 'Working-day leave', 'annual_entitlement' => 5, 'counts_working_days' => true])->assertCreated()->assertJsonPath('data.counts_working_days', true);
+        $this->postJson('/api/hr/leave-requests', ['employee_id' => $active->json('data.id'), 'leave_type_id' => $workingLeaveType->json('data.id'), 'starts_on' => '2026-09-19', 'ends_on' => '2026-09-22'])->assertCreated()->assertJsonPath('data.days', '1.000');
+        $carryLeaveType = $this->postJson('/api/hr/leave-types', ['code' => 'CARRY', 'name' => 'Carry-forward leave', 'annual_entitlement' => 5, 'carry_forward_days' => 2])->assertCreated()->assertJsonPath('data.carry_forward_days', '2.000');
+        $priorLeave = $this->postJson('/api/hr/leave-requests', ['employee_id' => $active->json('data.id'), 'leave_type_id' => $carryLeaveType->json('data.id'), 'starts_on' => '2025-12-29', 'ends_on' => '2025-12-31'])->assertCreated();
+        $this->postJson('/api/hr/leave-requests/'.$priorLeave->json('data.id').'/approve')->assertOk();
+        $this->postJson('/api/hr/leave-requests', ['employee_id' => $active->json('data.id'), 'leave_type_id' => $carryLeaveType->json('data.id'), 'starts_on' => '2026-10-01', 'ends_on' => '2026-10-07'])->assertCreated()->assertJsonPath('data.days', '7.000');
+        $this->getJson('/api/hr/leave-balances?year=2026&employee_id='.$active->json('data.id').'&leave_type_id='.$carryLeaveType->json('data.id'))
+            ->assertOk()->assertJsonPath('data.0.entitlement', 7)->assertJsonPath('data.0.pending_days', 7)->assertJsonPath('data.0.available_days', 0);
+        $this->postJson('/api/hr/leave-requests', ['employee_id' => $active->json('data.id'), 'leave_type_id' => $carryLeaveType->json('data.id'), 'starts_on' => '2026-11-01', 'ends_on' => '2026-11-01'])->assertStatus(422);
+        $accrualLeaveType = $this->postJson('/api/hr/leave-types', ['code' => 'MONTHLY', 'name' => 'Monthly accrual leave', 'annual_entitlement' => 12, 'accrual_frequency' => 'monthly'])->assertCreated()->assertJsonPath('data.accrual_frequency', 'monthly');
+        $this->getJson('/api/hr/leave-balances?year=2026&as_of=2026-06-15&employee_id='.$active->json('data.id').'&leave_type_id='.$accrualLeaveType->json('data.id'))
+            ->assertOk()->assertJsonPath('data.0.earned_entitlement', 6)->assertJsonPath('data.0.entitlement', 6)->assertJsonPath('data.0.accrual_periods_elapsed', 6);
+        $this->postJson('/api/hr/leave-requests', ['employee_id' => $active->json('data.id'), 'leave_type_id' => $accrualLeaveType->json('data.id'), 'starts_on' => '2026-06-20', 'ends_on' => '2026-06-26'])->assertStatus(422);
         $weekly = $this->postJson('/api/hr/employees', ['employee_no' => 'EMP-W1', 'first_name' => 'Maya', 'employment_type' => 'full_time', 'pay_frequency' => 'weekly', 'basic_salary' => 700])->assertCreated();
         $this->postJson('/api/hr/attendance', ['employee_id' => $weekly->json('data.id'), 'attendance_date' => '2026-09-14', 'status' => 'absent'])->assertOk();
         $this->postJson('/api/hr/attendance', ['employee_id' => $weekly->json('data.id'), 'attendance_date' => '2026-09-15', 'status' => 'present', 'check_in' => '09:00', 'check_out' => '18:00', 'scheduled_minutes' => 480])->assertOk()->assertJsonPath('data.overtime_minutes', 60);
@@ -71,6 +85,12 @@ class HrEmployeeTest extends TestCase
         $this->postJson('/api/hr/pay-runs', $runPayload)->assertOk()->assertJsonPath('status', 'existing');
         $approvedRun = $this->postJson('/api/hr/pay-runs/'.$run->json('data.id').'/approve')->assertOk()->assertJsonPath('data.status', 'approved');
         $this->assertNotNull($approvedRun->json('data.journal_entry_id'));
+        $this->getJson('/api/hr/statutory-remittances?from=2026-09-01&to=2026-09-30&authority=GST%20Authority')
+            ->assertOk()
+            ->assertJsonPath('data.0.mapping_key', 'statutory_tax_payable')
+            ->assertJsonPath('data.0.employee_withheld', 2625)
+            ->assertJsonPath('data.0.total_remittance', 2625)
+            ->assertJsonPath('summary.total_remittance', 3937.5);
         $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $approvedRun->json('data.journal_entry_id'), 'account_id' => $statutory->id, 'credit' => 2625]);
         $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $approvedRun->json('data.journal_entry_id'), 'account_id' => $employerStatutory->id, 'credit' => 1312.5]);
         $paid = $this->postJson('/api/hr/pay-runs/'.$run->json('data.id').'/pay', ['paid_at' => '2026-10-01', 'payment_reference' => 'BANK-1'])
@@ -82,11 +102,16 @@ class HrEmployeeTest extends TestCase
             ->assertOk()->assertJsonPath('data.status', 'settlement_reversed')->assertJsonPath('status', 'settlement_reversed');
         $this->assertNotNull($reversed->json('data.settlement_reversal_journal_entry_id'));
         $this->postJson('/api/hr/pay-runs/'.$run->json('data.id').'/reverse-payment', ['reason' => 'Duplicate'])->assertStatus(422);
-        $weeklyRun = $this->postJson('/api/hr/pay-runs', ['run_no' => 'PAY-W-2026-09', 'frequency' => 'weekly', 'period_from' => '2026-09-14', 'period_to' => '2026-09-20', 'attendance_policy' => 'unpaid_absence', 'overtime_policy' => 'pay_overtime', 'overtime_multiplier' => 1.5])->assertCreated();
+        $unpaidType = $this->postJson('/api/hr/leave-types', ['code' => 'UNPAID', 'name' => 'Unpaid leave', 'annual_entitlement' => 30, 'is_paid' => false])->assertCreated()->assertJsonPath('data.is_paid', false);
+        $unpaidLeave = $this->postJson('/api/hr/leave-requests', ['employee_id' => $weekly->json('data.id'), 'leave_type_id' => $unpaidType->json('data.id'), 'starts_on' => '2026-09-16', 'ends_on' => '2026-09-16'])->assertCreated();
+        $this->postJson('/api/hr/leave-requests/'.$unpaidLeave->json('data.id').'/approve')->assertOk();
+        $weeklyRun = $this->postJson('/api/hr/pay-runs', ['run_no' => 'PAY-W-2026-09', 'frequency' => 'weekly', 'period_from' => '2026-09-14', 'period_to' => '2026-09-20', 'attendance_policy' => 'unpaid_absence', 'leave_policy' => 'unpaid_leave', 'overtime_policy' => 'pay_overtime', 'overtime_multiplier' => 1.5])->assertCreated();
         $weeklyPayslip = HrPayslip::where('pay_run_id', $weeklyRun->json('data.id'))->where('employee_id', $weekly->json('data.id'))->firstOrFail();
         $this->assertEqualsWithDelta(806.026786, (float) $weeklyPayslip->gross_amount, 0.000001);
-        $this->assertEqualsWithDelta(205.642857, (float) $weeklyPayslip->deduction_amount, 0.000001);
-        $this->assertEqualsWithDelta(600.383929, (float) $weeklyPayslip->net_amount, 0.000001);
+        $this->assertEqualsWithDelta(317.785714, (float) $weeklyPayslip->deduction_amount, 0.000001);
+        $this->assertEqualsWithDelta(1.0, (float) $weeklyPayslip->leave_days, 0.000001);
+        $this->assertEqualsWithDelta(112.142857, (float) $weeklyPayslip->leave_deduction, 0.000001);
+        $this->assertEqualsWithDelta(488.241072, (float) $weeklyPayslip->net_amount, 0.000001);
         $this->assertArrayHasKey('benefit_'.$meal->json('data.id'), $weeklyPayslip->deductions);
         $this->assertArrayHasKey('benefit_'.$insurance->json('data.id'), $weeklyPayslip->deductions);
         $this->postJson('/api/hr/employees/'.$weekly->json('data.id').'/benefits/'.$insurance->json('data.id').'/deactivate')->assertOk()->assertJsonPath('data.is_active', false);

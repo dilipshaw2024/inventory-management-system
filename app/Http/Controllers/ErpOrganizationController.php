@@ -57,6 +57,14 @@ class ErpOrganizationController extends Controller
             'code' => ['required', 'string', 'max:30', 'alpha_dash', 'unique:companies,code'],
             'base_currency' => ['required', 'string', 'size:3'],
             'tax_number' => ['nullable', 'string', 'max:100'],
+            'tax_registration_scheme' => ['nullable', 'string', 'max:40'],
+            'tax_registration_number' => ['nullable', 'string', 'max:100'],
+            'country_code' => ['nullable', 'string', 'size:2', 'regex:/^[A-Za-z]{2}$/'],
+            'locale' => ['nullable', 'string', 'max:35', 'regex:/^[A-Za-z]{2,3}(?:[_-][A-Za-z]{2,4})?(?:@[A-Za-z0-9_-]+)?$/'],
+            'timezone' => ['nullable', 'timezone'],
+            'date_format' => ['nullable', 'string', 'max:32'],
+            'decimal_separator' => ['nullable', 'string', 'size:1'],
+            'thousands_separator' => ['nullable', 'string', 'size:1'],
             'email' => ['nullable', 'email', 'max:255'],
             'phone' => ['nullable', 'string', 'max:30'],
             'address' => ['nullable', 'string', 'max:2000'],
@@ -76,6 +84,14 @@ class ErpOrganizationController extends Controller
             'code' => ['required', 'string', 'max:30', 'alpha_dash'],
             'base_currency' => ['required', 'string', 'size:3'],
             'tax_number' => ['nullable', 'string', 'max:100'],
+            'tax_registration_scheme' => ['nullable', 'string', 'max:40'],
+            'tax_registration_number' => ['nullable', 'string', 'max:100'],
+            'country_code' => ['nullable', 'string', 'size:2', 'regex:/^[A-Za-z]{2}$/'],
+            'locale' => ['nullable', 'string', 'max:35', 'regex:/^[A-Za-z]{2,3}(?:[_-][A-Za-z]{2,4})?(?:@[A-Za-z0-9_-]+)?$/'],
+            'timezone' => ['nullable', 'timezone'],
+            'date_format' => ['nullable', 'string', 'max:32'],
+            'decimal_separator' => ['nullable', 'string', 'size:1'],
+            'thousands_separator' => ['nullable', 'string', 'size:1'],
             'email' => ['nullable', 'email', 'max:255'],
             'phone' => ['nullable', 'string', 'max:30'],
             'address' => ['nullable', 'string', 'max:2000'],
@@ -89,6 +105,7 @@ class ErpOrganizationController extends Controller
             return back()->withErrors(['company' => 'Deactivate active branches and departments before deactivating this company.'])->withInput();
         }
         $data['base_currency'] = strtoupper($data['base_currency']);
+        if (array_key_exists('country_code', $data) && $data['country_code'] !== null) $data['country_code'] = strtoupper($data['country_code']);
         $before = $company->toArray();
         $company->update($data + ['is_active' => $request->boolean('is_active', false)]);
         app(AuditService::class)->record('company.updated', $company, $before, $company->fresh()->toArray());

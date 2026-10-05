@@ -23,6 +23,8 @@ use App\Services\PurchaseInvoiceService;
 use App\Models\PurchaseInvoice;
 use App\Models\PurchaseInvoiceLine;
 use App\Models\LandedCost;
+use App\Models\QualityInspection;
+use App\Models\QualityInspectionPlan;
 use App\Models\SupplierCorrectiveAction;
 use App\Services\TaxCalculationService;
 use App\Services\TaxRateResolver;
@@ -313,6 +315,7 @@ class ProcurementIntegrationController extends Controller
             'location_id' => ['nullable', 'integer', $locationScope], 'location_scan_code' => ['nullable', 'string', 'max:120'], 'date' => ['required', 'date'],
             'description' => ['nullable', 'string', 'max:2000'], 'inspection_required' => ['nullable', 'boolean'], 'is_final_delivery' => ['nullable', 'boolean'], 'discrepancy_reason' => ['nullable', 'string', 'max:3000', 'required_if:is_final_delivery,1'], 'over_receipt_reason' => ['nullable', 'string', 'max:3000'],
             'lines' => ['required', 'array', 'min:1'], 'lines.*.purchase_order_line_id' => ['required', 'integer', $orderLineScope],
+            'lines.*.quality_plan_id' => ['nullable', 'integer'],
             'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_cost' => ['required', 'numeric', 'min:0'],
             'lines.*.product_scan_code' => ['nullable', 'string', 'max:150'],
             'lines.*.uom_id' => ['nullable', 'integer', $owned('units')],
@@ -369,7 +372,7 @@ class ProcurementIntegrationController extends Controller
                     if ($overReceiptTolerance <= 0 || $overage > $allowed + 0.000001 || empty($data['over_receipt_reason'])) abort(422, 'Receipt exceeds remaining quantity for '.$product->name.'; configure an over-receipt tolerance and provide a reason.');
                 }
                 $conversion = $receivedQuantity / $enteredQuantity;
-                GoodsReceiptLine::create([
+                $receiptLine = GoodsReceiptLine::create([
                     'goods_receipt_id' => $receipt->id, 'purchase_order_line_id' => $line->id, 'product_id' => $product->id,
                     'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'received_qty' => $receivedQuantity,
                     'unit_cost' => (float) $input['unit_cost'] / max($conversion, 0.000001), 'batch_no' => $input['batch_no'] ?? null,
@@ -377,6 +380,37 @@ class ProcurementIntegrationController extends Controller
                     'manufacturing_date' => $input['manufacturing_date'] ?? null, 'expiry_date' => $input['expiry_date'] ?? null,
                     'best_before_date' => $input['best_before_date'] ?? null, 'warranty_until' => $input['warranty_until'] ?? null,
                 ]);
+                if (!empty($data['inspection_required'])) {
+                    $planQuery = QualityInspectionPlan::withoutGlobalScopes()
+                        ->where('company_id', $companyId)
+                        ->where('is_active', true)
+                        ->where('inspection_type', 'receiving')
+                        ->where(fn ($query) => $query->where('product_id', $product->id)->orWhereNull('product_id'));
+                    if (!empty($input['quality_plan_id'])) {
+                        $planQuery->whereKey((int) $input['quality_plan_id']);
+                    } else {
+                        $planQuery->orderByRaw('product_id IS NULL')->orderBy('id');
+                    }
+                    $plan = $planQuery->with('lines')->first();
+                    if (!empty($input['quality_plan_id']) && !$plan) abort(422, 'The selected receiving quality plan is not valid for this product and company.');
+                    if ($plan) {
+                        $inspection = QualityInspection::create([
+                            'company_id' => $companyId,
+                            'plan_id' => $plan->id,
+                            'product_id' => $product->id,
+                            'location_id' => $receipt->location_id,
+                            'inspection_no' => $receipt->grn_no.'-QI-'.$receiptLine->id,
+                            'external_reference' => $receipt->grn_no.'-LINE-'.$receiptLine->id,
+                            'source_type' => 'goods_receipt_line',
+                            'source_id' => $receiptLine->id,
+                            'quantity' => $receivedQuantity,
+                            'sample_quantity' => min((float) $receivedQuantity, max(1.0, ceil((float) $receivedQuantity * (float) ($plan->sampling_percent ?: 100) / 100))),
+                            'status' => 'pending',
+                            'notes' => 'Receiving quality inspection for '.$receipt->grn_no,
+                        ]);
+                        $receiptLine->update(['quality_inspection_id' => $inspection->id]);
+                    }
+                }
             }
             app(AuditService::class)->record('goods_receipt.created', $receipt, null, $receipt->toArray() + [
                 'scanner_validation' => [
@@ -386,7 +420,7 @@ class ProcurementIntegrationController extends Controller
             ]);
             return $receipt;
         });
-        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product'), 'status' => 'pending_approval'], 201);
+        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product', 'lines.qualityInspection.plan'), 'status' => 'pending_approval'], 201);
     }
 
     public function createOrder(Request $request): JsonResponse
@@ -463,7 +497,7 @@ class ProcurementIntegrationController extends Controller
             app(AuditService::class)->record('goods_receipt.inspected', $receipt, $before, $receipt->fresh()->only(['inspection_status', 'inspection_notes', 'inspected_by', 'inspected_at']));
             return $receipt->fresh();
         });
-        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product'), 'status' => $receipt->inspection_status]);
+        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product', 'lines.qualityInspection.plan'), 'status' => $receipt->inspection_status]);
     }
 
     public function rejectOrder(Request $request, int $id): JsonResponse
@@ -485,7 +519,8 @@ class ProcurementIntegrationController extends Controller
     {
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(GoodsReceipt::class, $id);
         $actorId = request()->user()?->id ?? auth()->id();
-        $receipt = DB::transaction(function () use ($id, $actorId): GoodsReceipt {
+        try {
+            $receipt = DB::transaction(function () use ($id, $actorId): GoodsReceipt {
             $receipt = GoodsReceipt::with(['lines.purchaseOrderLine', 'lines.product', 'purchaseOrder'])->lockForUpdate()->findOrFail($id);
             if ($receipt->status !== 'pending') throw new \RuntimeException('This receipt has already been processed.');
             if ($receipt->inspection_status !== 'not_required' && $receipt->inspection_status !== 'passed') throw new \RuntimeException('This receipt must pass inspection before stock can be posted.');
@@ -529,7 +564,10 @@ class ProcurementIntegrationController extends Controller
             app(AuditService::class)->record('goods_receipt.approved', $receipt, ['status' => 'pending'], ['status' => 'approved']);
             return $receipt->fresh();
         });
-        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product'), 'status' => $receipt->status]);
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product', 'lines.qualityInspection.plan'), 'status' => $receipt->status]);
     }
 
     public function rejectReceipt(Request $request, int $id): JsonResponse
@@ -546,7 +584,7 @@ class ProcurementIntegrationController extends Controller
             app(AuditService::class)->record('goods_receipt.rejected', $receipt, $before, $receipt->fresh()->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']));
             return $receipt->fresh();
         });
-        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product'), 'status' => $receipt->status]);
+        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product', 'lines.qualityInspection.plan'), 'status' => $receipt->status]);
     }
 
     public function resolveReceiptDiscrepancy(Request $request, int $id): JsonResponse
@@ -565,7 +603,7 @@ class ProcurementIntegrationController extends Controller
             app(AuditService::class)->record('goods_receipt.discrepancy_resolved', $receipt, $before, $receipt->fresh()->only(['discrepancy_status', 'discrepancy_resolution', 'discrepancy_resolved_by', 'discrepancy_resolved_at']));
             return $receipt->fresh();
         });
-        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product'), 'status' => $receipt->discrepancy_status]);
+        return response()->json(['data' => $receipt->load('purchaseOrder', 'lines.product', 'lines.qualityInspection.plan'), 'status' => $receipt->discrepancy_status]);
     }
 
     public function cancelOrder(Request $request, int $id): JsonResponse

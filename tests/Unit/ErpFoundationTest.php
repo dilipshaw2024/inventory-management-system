@@ -90,6 +90,16 @@ class ErpFoundationTest extends TestCase
         self::assertSame('2026-09-18 08:00', $end->format('Y-m-d H:i'));
     }
 
+    public function test_production_slots_support_multiple_non_overlapping_shifts(): void
+    {
+        [$start, $end] = (new ProductionSchedulingService())->slot('2026-09-18 11:30:00', 120, 8, [
+            'shifts' => [['start' => '08:00', 'end' => '12:00'], ['start' => '13:00', 'end' => '17:00']],
+        ]);
+
+        self::assertSame('2026-09-18 11:30', $start->format('Y-m-d H:i'));
+        self::assertSame('2026-09-18 14:30', $end->format('Y-m-d H:i'));
+    }
+
     public function test_production_slots_reject_invalid_shift_window(): void
     {
         $this->expectException(\InvalidArgumentException::class);
@@ -384,14 +394,22 @@ class ErpFoundationTest extends TestCase
         self::assertEqualsWithDelta(6.75 * 5, $forecast, 0.0001);
     }
 
+    public function test_demand_forecast_croston_handles_intermittent_demand(): void
+    {
+        $forecast = (new DemandForecastService())->crostonForecast(collect([0, 0, 10, 0, 0, 10]), 6, 0.0);
+        self::assertEqualsWithDelta(20.0, $forecast, 0.0001);
+    }
+
     public function test_demand_forecast_auto_selection_chooses_weekly_pattern_when_backtest_is_better(): void
     {
         $history = collect(range(0, 55))->map(fn (int $day): float => ((CarbonImmutable::parse('2026-01-05')->addDays($day)->dayOfWeek) === 1) ? 10.0 : 1.0);
         $selection = (new DemandForecastService())->selectModel($history, CarbonImmutable::parse('2026-01-05'), 14, 2.2857);
         self::assertSame('weekly', $selection['model']);
         self::assertLessThan($selection['naive_error'], $selection['weekly_error']);
+        self::assertArrayHasKey('croston_error', $selection);
         self::assertArrayHasKey('rmse', $selection['metrics']['weekly']);
         self::assertArrayHasKey('wape', $selection['metrics']['weekly']);
+        self::assertArrayHasKey('croston', $selection['metrics']);
     }
 
     public function test_webhook_signature_is_hmac_sha256(): void

@@ -9,6 +9,8 @@ use App\Models\Payment;
 use App\Models\InventoryReturn;
 use App\Models\Delivery;
 use App\Models\InventoryTransfer;
+use App\Models\InventoryIntercompanyTransfer;
+use App\Models\InventoryIntercompanyReceipt;
 use App\Models\LandedCost;
 use App\Models\SupplierClaim;
 use App\Models\SupplierCreditNote;
@@ -58,6 +60,8 @@ class AutomaticAccountingService
     public function postInventoryMovement(InventoryMovement $movement, float $totalCost, ?Model $source = null): void
     {
         $internalTransfer = $source instanceof InventoryTransfer;
+        $intercompanyDispatch = $source instanceof InventoryIntercompanyTransfer;
+        $intercompanyReceipt = $source instanceof InventoryIntercompanyReceipt;
         $salesReturn = $movement->movement_type === 'return_in' && $source instanceof InventoryReturn && $source->return_type === 'sales';
         $purchaseReturn = $movement->movement_type === 'return_out' && $source instanceof InventoryReturn && $source->return_type === 'purchase';
         $recoveryReceipt = $movement->movement_type === 'receipt'
@@ -65,6 +69,10 @@ class AutomaticAccountingService
             && $source->getAttribute('recovery_product_id');
         $operation = $recoveryReceipt
             ? ['debit' => 'inventory', 'credit' => 'inventory_loss']
+            : ($intercompanyDispatch && $movement->movement_type === 'transfer_out'
+            ? ['debit' => 'intercompany_due_from', 'credit' => 'inventory']
+            : ($intercompanyReceipt && $movement->movement_type === 'transfer_in'
+            ? ['debit' => 'inventory', 'credit' => 'intercompany_due_to']
             : ($internalTransfer && $movement->movement_type === 'transfer_in'
             ? ['debit' => 'inventory', 'credit' => 'inventory_in_transit']
             : ($internalTransfer && $movement->movement_type === 'transfer_out'
@@ -76,7 +84,7 @@ class AutomaticAccountingService
                     'adjustment_out', 'scrap' => ['debit' => 'inventory_loss', 'credit' => 'inventory'],
                     'return_out' => $purchaseReturn ? ['debit' => 'accounts_payable', 'credit' => 'inventory'] : ['debit' => 'inventory_loss', 'credit' => 'inventory'],
                     default => null,
-                }));
+                }))));
         if (!$operation || $totalCost <= 0) return;
         $companyId = $source?->getAttribute('company_id') ?: $movement->getAttribute('company_id') ?: auth()->user()?->company_id;
         $currency = $this->currency($companyId);

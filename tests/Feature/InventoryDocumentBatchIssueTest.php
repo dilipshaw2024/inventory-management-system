@@ -70,8 +70,8 @@ class InventoryDocumentBatchIssueTest extends TestCase
         $unit = Unit::create(['company_id' => $company->id, 'name' => 'FEFO Each', 'code' => 'FEFO-EA', 'dimension' => 'unit', 'status' => 1]);
         $category = Category::create(['company_id' => $company->id, 'name' => 'FEFO Category', 'status' => 1]);
         $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'FEFO Item', 'sku' => 'FEFO-ITEM', 'quantity' => 10, 'purchase_price' => 5, 'tracking_type' => 'batch', 'status' => 1]);
-        $laterExpiry = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'FEFO-LATER', 'location_id' => $location->id, 'expiry_date' => '2026-12-31']);
-        $earlierExpiry = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'FEFO-EARLIER', 'location_id' => $location->id, 'expiry_date' => '2026-10-01']);
+        $laterExpiry = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'FEFO-LATER', 'location_id' => $location->id, 'expiry_date' => now()->addDays(30)->toDateString()]);
+        $earlierExpiry = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'FEFO-EARLIER', 'location_id' => $location->id, 'expiry_date' => now()->addDays(10)->toDateString()]);
         InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $location->id, 'batch_id' => $laterExpiry->id, 'movement_type' => 'receipt', 'quantity' => 4, 'unit_cost' => 5, 'posted_at' => now()->subDay()]);
         InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'location_id' => $location->id, 'batch_id' => $earlierExpiry->id, 'movement_type' => 'receipt', 'quantity' => 6, 'unit_cost' => 6, 'posted_at' => now()]);
         InventoryCostLayer::create(['product_id' => $product->id, 'location_id' => $location->id, 'batch_id' => $laterExpiry->id, 'original_quantity' => 4, 'remaining_quantity' => 4, 'unit_cost' => 5, 'received_at' => now()->subDay()]);

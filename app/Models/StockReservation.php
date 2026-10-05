@@ -13,6 +13,7 @@ class StockReservation extends Model
     protected $casts = ['quantity' => 'decimal:6', 'released_quantity' => 'decimal:6', 'expires_at' => 'datetime'];
     public function product() { return $this->belongsTo(Product::class); }
     public function batch() { return $this->belongsTo(InventoryBatch::class); }
+    public function serial() { return $this->belongsTo(InventorySerial::class); }
     public function location() { return $this->belongsTo(InventoryLocation::class); }
     public function salesOrderLine() { return $this->belongsTo(SalesOrderLine::class); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }

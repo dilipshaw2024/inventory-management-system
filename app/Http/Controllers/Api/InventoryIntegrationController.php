@@ -155,7 +155,19 @@ class InventoryIntegrationController extends Controller
                     if ($serialNumbers) {
                         if (count($serialNumbers) !== (int) round((float) $line->delivered_qty)) throw new \RuntimeException('Serial count must equal delivered quantity for '.$product->name.'.');
                         $issuedSerials = app(SerialLifecycleService::class)->issueSpecific($product, $serialNumbers, $delivery->location_id, $batch?->id);
-                    } else foreach ($batchAllocations as $allocation) $issuedSerials = $issuedSerials->merge(app(SerialLifecycleService::class)->issue($product, (float) $allocation['quantity'], $delivery->location_id, $allocation['batch_id']));
+                    } else {
+                        $reservedSerials = app(\App\Services\StockReservationService::class)->serialAllocations($orderLine->id, (float) $line->delivered_qty, $delivery->location_id, $product->id, $batch?->id);
+                        if ($reservedSerials->count() === (int) round((float) $line->delivered_qty)) {
+                            foreach ($reservedSerials as $allocation) {
+                                $serial = \App\Models\InventorySerial::lockForUpdate()->findOrFail($allocation['serial_id']);
+                                $issuedSerials = $issuedSerials->merge(app(SerialLifecycleService::class)->issueSpecific($product, [$serial->serial_no], $delivery->location_id, $allocation['batch_id'], true));
+                            }
+                        } elseif ($reservedSerials->isNotEmpty()) {
+                            throw new \RuntimeException('Explicit serial reservations do not cover the delivered quantity for '.$product->name.'.');
+                        } else {
+                            foreach ($batchAllocations as $allocation) $issuedSerials = $issuedSerials->merge(app(SerialLifecycleService::class)->issue($product, (float) $allocation['quantity'], $delivery->location_id, $allocation['batch_id']));
+                        }
+                    }
                 }
                 $product->quantity = (float) $product->quantity - (float) $line->delivered_qty;
                 $product->save();

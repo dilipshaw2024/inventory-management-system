@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Permission;
 use App\Models\Role;
 use App\Models\User;
+use App\Models\Warehouse;
 use App\Models\AuditLog;
 use App\Models\ApprovalDelegation;
 use App\Models\ApprovalPolicy;
@@ -99,13 +100,43 @@ class SecurityIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         $data = $request->validate(['is_active' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $users = User::query()->select(['id', 'name', 'username', 'email', 'company_id', 'branch_id', 'store_id', 'department_id', 'is_active', 'email_verified_at', 'created_at', 'updated_at'])
-            ->with(['roles:id,name,code,is_active', 'store:id,name,code,branch_id'])
+        $users = User::query()->select(['id', 'name', 'username', 'email', 'company_id', 'branch_id', 'warehouse_id', 'store_id', 'department_id', 'is_active', 'email_verified_at', 'created_at', 'updated_at'])
+            ->with(['roles:id,name,code,is_active', 'store:id,name,code,branch_id', 'warehouse:id,name,code,branch_id'])
             ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
             ->when(array_key_exists('is_active', $data), fn ($query) => $query->where('is_active', (bool) $data['is_active']))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($users, $request, 'security.users', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function assignWarehouse(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for warehouse assignment.');
+        abort_if($request->user()?->warehouse_id, 403, 'Warehouse-scoped users cannot assign warehouse scope.');
+
+        $data = $request->validate([
+            'warehouse_id' => ['nullable', 'integer'],
+        ]);
+        $user = User::where('company_id', $companyId)->findOrFail($id);
+        $warehouse = null;
+        if (!empty($data['warehouse_id'])) {
+            $warehouse = Warehouse::withoutGlobalScopes()
+                ->whereKey($data['warehouse_id'])
+                ->whereHas('branch', fn ($query) => $query->where('company_id', $companyId))
+                ->where('is_active', true)
+                ->firstOrFail();
+            if ($user->branch_id && (int) $warehouse->branch_id !== (int) $user->branch_id) {
+                return response()->json(['message' => "The warehouse must belong to the user's assigned branch."], 422);
+            }
+        }
+
+        $before = $user->toArray();
+        $user->update(['warehouse_id' => $warehouse?->id]);
+        $user->load(['roles:id,name,code,is_active', 'store:id,name,code,branch_id', 'warehouse:id,name,code,branch_id']);
+        app(AuditService::class)->record('security.user_warehouse_scope.updated', $user, $before, $user->toArray());
+
+        return response()->json(['data' => $user, 'status' => 'updated']);
     }
 
     public function roles(Request $request): JsonResponse

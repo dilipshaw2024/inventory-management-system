@@ -22,6 +22,7 @@ use App\Models\User;
 use App\Services\ErpSettingService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Http;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -212,6 +213,23 @@ class DeliveryIntegrationTest extends TestCase
 
         $this->postJson('/api/integration/deliveries/'.$delivery->id.'/delivery-tracking/sync', ['provider' => 'http'])
             ->assertOk()->assertJsonPath('summary.recorded', 0)->assertJsonPath('summary.duplicates', 1);
+    }
+
+    public function test_scheduled_carrier_polling_syncs_eligible_deliveries_and_is_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Scheduled Carrier Co', 'code' => 'SCHEDULED-CARRIER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Scheduled Carrier Customer', 'is_active' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-SCHEDULED-CARRIER', 'date' => now()->toDateString(), 'status' => 'approved']);
+        $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-SCHEDULED-CARRIER', 'tracking_no' => 'TRACK-SCHEDULED-1', 'date' => now()->toDateString(), 'status' => 'approved', 'fulfillment_status' => 'dispatched']);
+        DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed', 'performed_by' => $user->id, 'completed_at' => now()]);
+        CarrierTrackingProviderSetting::create(['company_id' => $company->id, 'provider' => 'http', 'connection_config' => ['endpoint' => 'https://carrier.test/scheduled/{tracking_number}', 'token' => 'scheduled-secret'], 'is_active' => true]);
+        Http::fake(['https://carrier.test/scheduled/TRACK-SCHEDULED-1*' => Http::response(['events' => [['status' => 'in_transit', 'occurred_at' => '2026-09-30 12:00:00', 'event_id' => 'SCHEDULED-EVENT-1']]], 200)]);
+
+        $this->assertSame(0, Artisan::call('erp:logistics:sync-carrier-tracking', ['--company' => $company->id]));
+        $this->assertDatabaseHas('delivery_tracking_events', ['company_id' => $company->id, 'delivery_id' => $delivery->id, 'external_reference' => 'SCHEDULED-EVENT-1']);
+        $this->assertSame(0, Artisan::call('erp:logistics:sync-carrier-tracking', ['--company' => $company->id]));
+        $this->assertSame(1, DeliveryTrackingEvent::where('company_id', $company->id)->count());
     }
 
     public function test_sales_return_can_reverse_a_delivered_delivery(): void

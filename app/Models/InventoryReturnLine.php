@@ -11,4 +11,5 @@ class InventoryReturnLine extends Model
     public function inventoryReturn() { return $this->belongsTo(InventoryReturn::class, 'return_id'); }
     public function product() { return $this->belongsTo(Product::class); }
     public function batch() { return $this->belongsTo(InventoryBatch::class); }
+    public function qualityInspection() { return $this->belongsTo(QualityInspection::class, 'quality_inspection_id'); }
 }

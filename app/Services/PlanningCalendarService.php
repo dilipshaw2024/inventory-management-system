@@ -25,6 +25,26 @@ class PlanningCalendarService
         return $this->addWorkingDays($start, $days, $companyId);
     }
 
+    public function countWorkingDays(CarbonImmutable|string $start, CarbonImmutable|string $end, ?int $companyId = null): int
+    {
+        $calendar = app(ErpSettingService::class)->get('planning_calendar', ['weekend_days' => [0, 6], 'holidays' => []], $companyId);
+        return $this->countWorkingDaysWithCalendar($start, $end, is_array($calendar) ? $calendar : []);
+    }
+
+    public function countWorkingDaysWithCalendar(CarbonImmutable|string $start, CarbonImmutable|string $end, array $calendar): int
+    {
+        $from = $start instanceof CarbonImmutable ? $start->startOfDay() : CarbonImmutable::parse($start)->startOfDay();
+        $to = $end instanceof CarbonImmutable ? $end->startOfDay() : CarbonImmutable::parse($end)->startOfDay();
+        if ($to->lessThan($from)) return 0;
+        $weekends = collect($calendar['weekend_days'] ?? [0, 6])->map(fn ($day): int => (int) $day)->filter(fn (int $day): bool => $day >= 0 && $day <= 6)->unique()->values()->all();
+        $holidays = collect($calendar['holidays'] ?? [])->map(fn ($holiday): string => (string) $holiday)->filter(fn (string $holiday): bool => preg_match('/^\d{4}-\d{2}-\d{2}$/', $holiday) === 1)->flip();
+        $days = 0;
+        for ($date = $from; $date->lessThanOrEqualTo($to); $date = $date->addDay()) {
+            if (!in_array($date->dayOfWeek, $weekends, true) && !$holidays->has($date->toDateString())) $days++;
+        }
+        return $days;
+    }
+
     public function addWorkingDaysWithCalendar(CarbonImmutable|string $start, int $days, array $calendar): CarbonImmutable
     {
         $date = $start instanceof CarbonImmutable ? $start->startOfDay() : CarbonImmutable::parse($start)->startOfDay();
