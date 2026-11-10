@@ -8,6 +8,7 @@ use App\Services\Integrations\BankStatementPoller;
 use App\Services\Integrations\CarrierTrackingAdapterRegistry;
 use App\Services\Integrations\CarrierTrackingPoller;
 use App\Services\Integrations\EInvoiceProviderRegistry;
+use App\Services\Integrations\ExchangeRateProviderRegistry;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use App\Models\EInvoiceProviderSetting;
@@ -20,6 +21,7 @@ class IntegrationProviderController extends Controller
         EInvoiceProviderRegistry $eInvoices,
         BankStatementAdapterRegistry $bankStatements,
         CarrierTrackingAdapterRegistry $carrierTracking,
+        ExchangeRateProviderRegistry $exchangeRates,
     ): JsonResponse {
         $eInvoiceKeys = $eInvoices->keys();
         $tenantHttpSetting = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)
@@ -54,6 +56,11 @@ class IntegrationProviderController extends Controller
                         'ready' => $key !== 'http' || $tenantCarrierEndpoint !== '' || trim((string) config('integrations.carrier_tracking_http_endpoint')) !== '',
                     ];
                 }, $carrierTracking->keys())],
+                'exchange_rate' => ['providers' => array_map(fn (string $key): array => [
+                    'key' => $key,
+                    'supports_sync' => true,
+                    'ready' => $key !== 'http' || trim((string) config('integrations.exchange_rate_http_endpoint')) !== '',
+                ], $exchangeRates->keys())],
             ],
         ]);
     }

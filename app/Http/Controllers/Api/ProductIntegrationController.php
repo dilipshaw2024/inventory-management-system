@@ -13,6 +13,7 @@ use App\Models\ProductAttributeAssignment;
 use App\Models\ProductAttributeValue;
 use App\Models\ProductAttribute;
 use App\Models\ProductUom;
+use App\Models\ProductTranslation;
 use App\Models\InventoryLocation;
 use App\Services\AuditService;
 use App\Services\InventoryAvailabilityService;
@@ -26,6 +27,77 @@ use Illuminate\Validation\Rule;
 
 class ProductIntegrationController extends Controller
 {
+    public function translations(Request $request, int $id): JsonResponse
+    {
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        $data = $request->validate([
+            'language_code' => ['nullable', 'string', 'max:35'], 'is_active' => ['nullable', 'boolean'],
+            'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $language = array_key_exists('language_code', $data) ? ProductTranslation::normalizeLanguageCode($data['language_code']) : null;
+        $translations = ProductTranslation::where('product_id', $product->id)
+            ->when($language, fn ($query) => $query->where('language_code', $language))
+            ->when(array_key_exists('is_active', $data), fn ($query) => $query->where('is_active', (bool) $data['is_active']))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(\App\Services\IntegrationCursorService::class)->paginate($translations, $request, 'inventory.product-translations', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeTranslation(Request $request, int $id): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $companyId = (int) $request->user()?->company_id;
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        $request->merge(['language_code' => ProductTranslation::normalizeLanguageCode($request->input('language_code'))]);
+        $data = $request->validate([
+            'language_code' => ['required', 'string', 'max:35', 'regex:/^[a-z]{2,8}(?:-[A-Z0-9]{2,8})*$/'],
+            'name' => ['required', 'string', 'max:255'], 'short_description' => ['nullable', 'string', 'max:500'], 'description' => ['nullable', 'string'],
+            'external_reference' => ['nullable', 'string', 'max:150'], 'is_active' => ['nullable', 'boolean'],
+        ]);
+        $existing = ProductTranslation::where('product_id', $product->id)->where('language_code', $data['language_code'])->first();
+        if ($existing) return response()->json(['data' => $existing, 'status' => 'duplicate_ignored']);
+        if (!empty($data['external_reference'])) {
+            $existing = ProductTranslation::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing, 'status' => 'duplicate_ignored']);
+        }
+        $translation = DB::transaction(function () use ($data, $product, $companyId): ProductTranslation {
+            $translation = ProductTranslation::create($data + ['company_id' => $companyId, 'product_id' => $product->id, 'is_active' => $data['is_active'] ?? true, 'created_by' => auth()->id()]);
+            app(AuditService::class)->record('product_translation.created', $translation, null, $translation->toArray());
+            return $translation;
+        });
+        return response()->json(['data' => $translation, 'status' => 'created'], 201);
+    }
+
+    public function updateTranslation(Request $request, int $id, int $translationId): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        $translation = ProductTranslation::where('product_id', $product->id)->findOrFail($translationId);
+        $request->mergeIfMissing(['language_code' => $translation->language_code]);
+        $request->merge(['language_code' => ProductTranslation::normalizeLanguageCode($request->input('language_code'))]);
+        $data = $request->validate([
+            'language_code' => ['sometimes', 'required', 'string', 'max:35', 'regex:/^[a-z]{2,8}(?:-[A-Z0-9]{2,8})*$/'],
+            'name' => ['sometimes', 'required', 'string', 'max:255'], 'short_description' => ['sometimes', 'nullable', 'string', 'max:500'], 'description' => ['sometimes', 'nullable', 'string'],
+            'external_reference' => ['sometimes', 'nullable', 'string', 'max:150'], 'is_active' => ['sometimes', 'boolean'],
+        ]);
+        $conflict = ProductTranslation::where('product_id', $product->id)->where('language_code', $data['language_code'])->where('id', '<>', $translation->id)->exists();
+        if ($conflict) abort(422, 'A translation already exists for this product and language.');
+        $before = $translation->only(array_keys($data));
+        $translation->update($data + ['updated_by' => auth()->id()]);
+        app(AuditService::class)->record('product_translation.updated', $translation, $before, $translation->fresh()->only(array_keys($data)));
+        return response()->json(['data' => $translation->fresh(), 'status' => 'updated']);
+    }
+
+    public function deactivateTranslation(Request $request, int $id, int $translationId): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        $translation = ProductTranslation::where('product_id', $product->id)->findOrFail($translationId);
+        $translation->update(['is_active' => false, 'updated_by' => auth()->id()]);
+        app(AuditService::class)->record('product_translation.deactivated', $translation, ['is_active' => true], ['is_active' => false]);
+        return response()->json(['data' => $translation->fresh(), 'status' => 'deactivated']);
+    }
+
     public function media(Request $request, int $id): JsonResponse
     {
         $product = $this->companyScope(Product::query())->findOrFail($id);

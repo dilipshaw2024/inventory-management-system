@@ -10,4 +10,9 @@ class TaxRate extends Model
     use BelongsToCompany;
     protected $guarded = [];
     protected $casts = ['rate' => 'decimal:4', 'is_active' => 'boolean', 'effective_from' => 'date', 'effective_until' => 'date'];
+
+    public function components()
+    {
+        return $this->hasMany(TaxRateComponent::class)->orderBy('sequence')->orderBy('id');
+    }
 }

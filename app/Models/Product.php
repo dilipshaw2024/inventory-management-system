@@ -59,6 +59,21 @@ class Product extends Model
     public function bundleComponents(){ return $this->hasMany(ProductBundleComponent::class, 'bundle_product_id'); }
     public function bundledIn(){ return $this->hasMany(ProductBundleComponent::class, 'component_product_id'); }
     public function attachments(){ return $this->morphMany(DocumentAttachment::class, 'attachable'); }
+    public function translations(){ return $this->hasMany(ProductTranslation::class); }
+
+    public function localizedName(?string $languageCode = null, ?int $companyId = null): string
+    {
+        $languageCode = ProductTranslation::normalizeLanguageCode($languageCode);
+        $companyId = $companyId ?: $this->company_id;
+        $translations = $this->relationLoaded('translations')
+            ? $this->translations
+            : $this->translations()->where('company_id', $companyId)->get();
+        $preferred = $translations->first(fn (ProductTranslation $translation): bool => $translation->is_active && $translation->language_code === $languageCode);
+        if ($preferred) return $preferred->name;
+        $baseLanguage = strtolower((string) strtok($languageCode, '-'));
+        $regionalFallback = $translations->first(fn (ProductTranslation $translation): bool => $translation->is_active && strtolower((string) strtok($translation->language_code, '-')) === $baseLanguage);
+        return $regionalFallback?->name ?: (string) $this->name;
+    }
 
 
 

@@ -15,6 +15,7 @@ class SystemSettingsController extends Controller
             'negative_stock_policy' => $service->get('negative_stock_policy', 'block'),
             'date_format' => $service->get('date_format', 'Y-m-d'),
             'decimal_precision' => $service->get('decimal_precision', 2),
+            'tax_rounding_precision' => $service->get('tax_rounding_precision', 6),
             'default_tax_mode' => $service->get('default_tax_mode', 'exclusive'),
             'document_print_size' => $service->get('document_print_size', 'A4'),
             'purchase_price_variance_percent' => $service->get('purchase_price_variance_percent', 0),
@@ -49,6 +50,7 @@ class SystemSettingsController extends Controller
             'negative_stock_policy' => ['required', 'in:block,approval,allow'],
             'date_format' => ['required', 'in:Y-m-d,d-m-Y,m/d/Y'],
             'decimal_precision' => ['required', 'integer', 'min:0', 'max:6'],
+            'tax_rounding_precision' => ['required', 'integer', 'min:0', 'max:6'],
             'default_tax_mode' => ['required', 'in:exclusive,inclusive'],
             'document_print_size' => ['required', 'in:A4,Letter'],
             'purchase_price_variance_percent' => ['required', 'numeric', 'min:0', 'max:100'],
@@ -106,7 +108,7 @@ class SystemSettingsController extends Controller
             }
             $data[$calendarKey] = $decoded;
         }
-        foreach ($data as $key => $value) $service->put($key, $value, in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars'], true) ? 'json' : (in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : ($key === 'decimal_precision' || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string'))));
+        foreach ($data as $key => $value) $service->put($key, $value, in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars'], true) ? 'json' : (in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (($key === 'decimal_precision' || $key === 'tax_rounding_precision') || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string'))));
         $service->put('planning_calendar', $calendar, 'json');
         app(AuditService::class)->record('erp_settings.updated', auth()->user(), null, $data);
         return back()->with(['message' => 'ERP settings updated.', 'alert-type' => 'success']);

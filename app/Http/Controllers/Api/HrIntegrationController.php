@@ -182,6 +182,28 @@ class HrIntegrationController extends Controller
         ], 'meta' => ['from' => $data['from'] ?? null, 'to' => $data['to'] ?? null]]);
     }
 
+    public function exportStatutoryRemittances(Request $request)
+    {
+        $format = $request->validate(['format' => ['nullable', 'in:json,csv']])['format'] ?? 'json';
+        $summary = $this->statutoryRemittances($request)->getData(true);
+        $package = [
+            'schema' => 'erp.hr.statutory-remittance.v1',
+            'company_id' => $this->companyId($request),
+            'filters' => ['from' => $summary['meta']['from'] ?? null, 'to' => $summary['meta']['to'] ?? null, 'authority' => $request->input('authority'), 'mapping_key' => $request->input('mapping_key')],
+            'data' => $summary['data'] ?? [],
+            'summary' => $summary['summary'] ?? [],
+        ];
+        $hash = hash('sha256', json_encode($package, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION) ?: '');
+        if ($format === 'json') return response()->json(['data' => $package, 'integrity_hash' => $hash, 'status' => 'exported']);
+        return response()->streamDownload(function () use ($package, $hash): void {
+            $handle = fopen('php://output', 'wb');
+            fputcsv($handle, ['package_sha256', $hash]);
+            fputcsv($handle, ['pay_run_id', 'run_no', 'period_from', 'period_to', 'pay_date', 'status', 'authority', 'mapping_key', 'employee_withheld', 'employer_contribution', 'total_remittance', 'employee_count']);
+            foreach ($package['data'] as $row) fputcsv($handle, [$row['pay_run_id'] ?? null, $row['run_no'] ?? null, $row['period_from'] ?? null, $row['period_to'] ?? null, $row['pay_date'] ?? null, $row['status'] ?? null, $row['authority'] ?? null, $row['mapping_key'] ?? null, $row['employee_withheld'] ?? 0, $row['employer_contribution'] ?? 0, $row['total_remittance'] ?? 0, $row['employee_count'] ?? 0]);
+            fclose($handle);
+        }, 'statutory-remittances.csv', ['Content-Type' => 'text/csv; charset=UTF-8', 'X-Package-SHA256' => $hash]);
+    }
+
     public function payrollRules(Request $request): JsonResponse
     {
         $companyId = $this->companyId($request);

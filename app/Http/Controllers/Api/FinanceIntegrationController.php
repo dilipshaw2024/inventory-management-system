@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Currency;
 use App\Models\ExchangeRate;
 use App\Models\TaxRate;
+use App\Models\TaxRateComponent;
 use App\Models\FiscalYear;
 use App\Models\FiscalPeriod;
 use App\Models\InvoiceDetail;
@@ -21,12 +22,14 @@ use App\Models\ProductClassification;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
 use App\Services\FinancialReportingService;
+use App\Services\TaxCalculationService;
 use App\Services\ConsolidatedReportingService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use App\Services\Integrations\TaxFilingProviderRegistry;
+use App\Services\Integrations\ExchangeRateProviderRegistry;
 
 class FinanceIntegrationController extends Controller
 {
@@ -99,15 +102,17 @@ class FinanceIntegrationController extends Controller
         $data = $request->validate(['from' => ['required', 'date'], 'to' => ['required', 'date', 'after_or_equal:from'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'classification_id' => ['nullable', 'integer', Rule::exists('product_classifications', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))]]);
         $from = $data['from']; $to = $data['to']; $jurisdiction = $data['jurisdiction'] ?? null;
         $classificationId = isset($data['classification_id']) ? (int) $data['classification_id'] : null;
+        $taxCalculator = app(TaxCalculationService::class);
+        $taxPrecision = $taxCalculator->precision((int) $companyId);
         $taxKey = static fn (float $rate, ?string $jurisdiction, $classification): string => number_format($rate, 4, '.', '').'|'.($jurisdiction ?: 'UNSPECIFIED').'|'.($classification ? $classification->scheme.':'.$classification->code : 'UNCLASSIFIED');
         $sales = InvoiceDetail::with(['invoice', 'product.classification'])->whereHas('invoice', fn ($query) => $query->whereIn('status', [1, 'approved'])->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->when($classificationId, fn ($query) => $query->whereHas('product', fn ($product) => $product->where('classification_id', $classificationId)))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction, $line->product?->classification));
         $returns = InventoryReturn::with('lines.product.classification')->where('return_type', 'sales')->where('status', 'approved')->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($query) => $query->where('tax_jurisdiction', $jurisdiction))->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->get()->flatMap(fn (InventoryReturn $return) => $return->lines->map(fn ($line): array => ['return' => $return, 'line' => $line]))->filter(fn (array $item): bool => !$classificationId || (int) ($item['line']->product?->classification_id ?? 0) === (int) $classificationId)->groupBy(fn (array $item): string => $taxKey((float) ($item['line']->tax_rate ?? 0), $item['return']->tax_jurisdiction, $item['line']->product?->classification));
         $purchases = PurchaseInvoiceLine::with(['invoice', 'product.classification'])->whereHas('invoice', fn ($query) => $query->where('status', 'approved')->whereBetween('invoice_date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->when($classificationId, fn ($query) => $query->whereHas('product', fn ($product) => $product->where('classification_id', $classificationId)))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction, $line->product?->classification));
         $rates = $sales->keys()->merge($returns->keys())->merge($purchases->keys())->unique()->sort()->values();
-        $rows = $rates->map(function ($rate) use ($sales, $returns, $purchases): array {
+        $rows = $rates->map(function ($rate) use ($sales, $returns, $purchases, $taxCalculator, $taxPrecision): array {
             $sale = $sales->get($rate, collect()); $return = $returns->get($rate, collect()); $purchase = $purchases->get($rate, collect());
             $returnTaxable = (float) $return->sum(fn (array $item): float => (float) $item['line']->quantity * (float) ($item['line']->unit_price ?? $item['line']->product?->sales_price ?? 0));
-            $returnTax = (float) $return->sum(fn (array $item): float => $item['return']->tax_exempt ? 0 : (float) $item['line']->quantity * (float) ($item['line']->unit_price ?? $item['line']->product?->sales_price ?? 0) * (float) ($item['line']->tax_rate ?? 0) / 100);
+            $returnTax = (float) $return->sum(fn (array $item): float => $item['return']->tax_exempt ? 0 : $taxCalculator->exclusive((float) $item['line']->quantity * (float) ($item['line']->unit_price ?? $item['line']->product?->sales_price ?? 0), (float) ($item['line']->tax_rate ?? 0), $taxPrecision));
             $salesTaxable = (float) $sale->sum(fn ($line): float => (float) $line->selling_price - ($line->invoice?->tax_mode === 'inclusive' ? (float) ($line->tax_amount ?? 0) : 0)) - $returnTaxable;
             $salesTax = (float) $sale->sum('tax_amount') - $returnTax;
             $purchaseTaxable = (float) $purchase->sum(fn ($line): float => (float) $line->quantity * (float) $line->unit_price - ($line->invoice?->tax_mode === 'inclusive' ? (float) ($line->tax_amount ?? 0) : 0));
@@ -171,9 +176,9 @@ class FinanceIntegrationController extends Controller
 
     public function storeTaxFilingProvider(Request $request): JsonResponse
     {
-        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'url', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $request->merge(['provider' => strtolower(trim((string) $request->input('provider')))]);
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80', Rule::in(app(TaxFilingProviderRegistry::class)->keys())], 'connection_config' => ['required', 'array'], 'is_active' => ['sometimes', 'boolean']]);
         $data['provider'] = strtolower(trim($data['provider']));
-        if (!in_array($data['provider'], app(TaxFilingProviderRegistry::class)->keys(), true)) abort(422, 'Unsupported tax filing provider setting.');
         $setting = TaxFilingProviderSetting::updateOrCreate(['company_id' => $request->user()?->company_id, 'provider' => $data['provider']], ['connection_config' => $data['connection_config'], 'is_active' => $data['is_active'] ?? true]);
         app(AuditService::class)->record('tax_filing_provider.updated', $setting, null, $setting->toArray());
         return response()->json(['data' => $setting, 'status' => 'configured'], 201);
@@ -182,7 +187,7 @@ class FinanceIntegrationController extends Controller
     public function updateTaxFilingProvider(Request $request, int $id): JsonResponse
     {
         $setting = TaxFilingProviderSetting::where('company_id', $request->user()?->company_id)->findOrFail($id);
-        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'connection_config.endpoint' => ['nullable', 'url', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:2000'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5'], 'connection_config.retry_sleep' => ['nullable', 'integer', 'min:0', 'max:60000'], 'is_active' => ['sometimes', 'boolean']]);
+        $data = $request->validate(['connection_config' => ['sometimes', 'required', 'array'], 'is_active' => ['sometimes', 'boolean']]);
         $setting->update($data);
         app(AuditService::class)->record('tax_filing_provider.updated', $setting, null, $setting->toArray());
         return response()->json(['data' => $setting->fresh(), 'status' => 'updated']);
@@ -524,7 +529,7 @@ class FinanceIntegrationController extends Controller
     public function taxRates(Request $request): JsonResponse
     {
         $data = $request->validate(['is_active' => ['nullable', 'boolean'], 'as_of' => ['nullable', 'date'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
-        $rates = $this->companyScope(TaxRate::query(), $request->user()?->company_id)
+        $rates = $this->companyScope(TaxRate::with('components'), $request->user()?->company_id)
             ->when(array_key_exists('is_active', $data), fn ($query) => $query->where('is_active', (bool) $data['is_active']))
             ->when($data['as_of'] ?? null, fn ($query, $date) => $query->where(fn ($scope) => $scope->whereNull('effective_from')->orWhereDate('effective_from', '<=', $date))->where(fn ($scope) => $scope->whereNull('effective_until')->orWhereDate('effective_until', '>=', $date)))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
@@ -540,14 +545,24 @@ class FinanceIntegrationController extends Controller
             'name' => ['required', 'string', 'max:100'], 'code' => ['required', 'string', 'max:30', 'alpha_dash', Rule::unique('tax_rates', 'code')->where(fn ($query) => $query->where('company_id', $companyId)->where('jurisdiction', $request->input('jurisdiction'))->where('effective_from', $request->input('effective_from')))],
             'rate' => ['required', 'numeric', 'min:0', 'max:100'], 'calculation' => ['required', 'in:exclusive,inclusive'], 'jurisdiction' => ['nullable', 'string', 'max:100'],
             'effective_from' => ['nullable', 'date'], 'effective_until' => ['nullable', 'date', 'after_or_equal:effective_from'],
+            'components' => ['sometimes', 'array', 'max:20'],
+            'components.*.code' => ['required_with:components', 'string', 'max:40', 'alpha_dash', 'distinct'],
+            'components.*.name' => ['required_with:components', 'string', 'max:120'],
+            'components.*.rate' => ['required_with:components', 'numeric', 'min:0', 'max:100'],
+            'components.*.component_type' => ['sometimes', 'string', 'max:40'],
+            'components.*.sequence' => ['sometimes', 'integer', 'min:1', 'max:65535'],
+            'components.*.is_compound' => ['sometimes', 'boolean'],
         ]);
         $this->assertTaxPeriodAvailable($data['code'], (int) $companyId, $data['jurisdiction'] ?? null, $data['effective_from'] ?? null, $data['effective_until'] ?? null);
-        $tax = DB::transaction(function () use ($data, $companyId): TaxRate {
+        $components = $data['components'] ?? null;
+        unset($data['components']);
+        $tax = DB::transaction(function () use ($data, $components, $companyId): TaxRate {
             $tax = TaxRate::create($data + ['company_id' => $companyId, 'is_active' => true]);
+            if ($components !== null) $this->syncTaxComponents($tax, $components);
             app(AuditService::class)->record('tax_rate.created', $tax, null, $tax->toArray());
             return $tax;
         });
-        return response()->json(['data' => $tax, 'status' => 'created'], 201);
+        return response()->json(['data' => $tax->load('components'), 'status' => 'created'], 201);
     }
 
     public function updateTaxRate(Request $request, int $id): JsonResponse
@@ -558,12 +573,24 @@ class FinanceIntegrationController extends Controller
             'name' => ['required', 'string', 'max:100'], 'code' => ['required', 'string', 'max:30', 'alpha_dash', Rule::unique('tax_rates', 'code')->ignore($tax->id)->where(fn ($query) => $query->where('company_id', $tax->company_id)->where('jurisdiction', $request->input('jurisdiction'))->where('effective_from', $request->input('effective_from')))],
             'rate' => ['required', 'numeric', 'min:0', 'max:100'], 'calculation' => ['required', 'in:exclusive,inclusive'], 'jurisdiction' => ['nullable', 'string', 'max:100'], 'is_active' => ['nullable', 'boolean'],
             'effective_from' => ['nullable', 'date'], 'effective_until' => ['nullable', 'date', 'after_or_equal:effective_from'],
+            'components' => ['sometimes', 'array', 'max:20'],
+            'components.*.code' => ['required_with:components', 'string', 'max:40', 'alpha_dash', 'distinct'],
+            'components.*.name' => ['required_with:components', 'string', 'max:120'],
+            'components.*.rate' => ['required_with:components', 'numeric', 'min:0', 'max:100'],
+            'components.*.component_type' => ['sometimes', 'string', 'max:40'],
+            'components.*.sequence' => ['sometimes', 'integer', 'min:1', 'max:65535'],
+            'components.*.is_compound' => ['sometimes', 'boolean'],
         ]);
         $this->assertTaxPeriodAvailable($data['code'], (int) $tax->company_id, $data['jurisdiction'] ?? null, $data['effective_from'] ?? null, $data['effective_until'] ?? null, $tax->id);
+        $components = $data['components'] ?? null;
+        unset($data['components']);
         $before = $tax->only(array_keys($data));
-        $tax->update($data);
+        DB::transaction(function () use ($tax, $data, $components): void {
+            $tax->update($data);
+            if ($components !== null) $this->syncTaxComponents($tax, $components);
+        });
         app(AuditService::class)->record('tax_rate.updated', $tax, $before, $tax->fresh()->only(array_keys($data)));
-        return response()->json(['data' => $tax->fresh(), 'status' => 'updated']);
+        return response()->json(['data' => $tax->fresh()->load('components'), 'status' => 'updated']);
     }
 
     public function currencies(Request $request): JsonResponse
@@ -617,6 +644,55 @@ class FinanceIntegrationController extends Controller
         return response()->json(['data' => $rate->load(['fromCurrency', 'toCurrency']), 'status' => 'created'], 201);
     }
 
+    public function syncExchangeRates(Request $request, ExchangeRateProviderRegistry $providers): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $request->merge(['provider' => strtolower(trim((string) $request->input('provider')))]);
+        $data = $request->validate([
+            'provider' => ['required', 'string', 'max:80', Rule::in($providers->keys())],
+            'base_currency' => ['nullable', 'string', 'size:3'],
+            'effective_date' => ['nullable', 'date'],
+            'symbols' => ['nullable', 'array', 'max:100'],
+            'symbols.*' => ['required', 'string', 'size:3'],
+        ]);
+        $provider = strtolower(trim($data['provider']));
+        try {
+            $rows = $providers->resolve($provider)->fetch([
+                'base_currency' => isset($data['base_currency']) ? strtoupper($data['base_currency']) : null,
+                'effective_date' => $data['effective_date'] ?? null,
+                'symbols' => array_map('strtoupper', $data['symbols'] ?? []),
+            ]);
+        } catch (\RuntimeException | \InvalidArgumentException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+        if (count($rows) > 500) return response()->json(['message' => 'An exchange-rate provider may return at most 500 rates per synchronization.'], 422);
+        $codes = collect($rows)->flatMap(fn (array $row): array => [strtoupper((string) ($row['from_currency'] ?? '')), strtoupper((string) ($row['to_currency'] ?? ''))])->filter()->unique()->values();
+        $currencies = Currency::whereIn('code', $codes)->where('is_active', true)->get()->keyBy('code');
+        $normalized = [];
+        foreach ($rows as $row) {
+            $from = strtoupper((string) ($row['from_currency'] ?? ''));
+            $to = strtoupper((string) ($row['to_currency'] ?? ''));
+            $rate = (float) ($row['rate'] ?? 0);
+            if (!$currencies->has($from) || !$currencies->has($to) || $from === $to || $rate <= 0 || empty($row['effective_date'])) {
+                return response()->json(['message' => 'The exchange-rate provider returned an unknown currency, invalid pair, rate, or effective date.'], 422);
+            }
+            $reference = mb_substr((string) ($row['source_reference'] ?? ($provider.':'.($row['effective_date'] ?? now()->toDateString()).':'.$from.':'.$to)), 0, 150);
+            $normalized[] = ['from_currency_id' => $currencies[$from]->id, 'to_currency_id' => $currencies[$to]->id, 'rate' => $rate, 'effective_date' => $row['effective_date'], 'source_type' => 'provider', 'source_reference' => $reference, 'retrieved_at' => $row['retrieved_at'] ?? now()];
+        }
+        $created = [];
+        $duplicates = 0;
+        DB::transaction(function () use (&$created, &$duplicates, $normalized): void {
+            foreach ($normalized as $attributes) {
+                $existing = ExchangeRate::where('from_currency_id', $attributes['from_currency_id'])->where('to_currency_id', $attributes['to_currency_id'])->where('source_type', 'provider')->where('source_reference', $attributes['source_reference'])->first();
+                if ($existing) { $duplicates++; continue; }
+                $rate = ExchangeRate::create($attributes + ['is_active' => true]);
+                app(AuditService::class)->record('exchange_rate.created', $rate, null, $rate->toArray() + ['synchronized' => true]);
+                $created[] = $rate->load(['fromCurrency', 'toCurrency']);
+            }
+        });
+        return response()->json(['data' => $created, 'status' => 'synchronized', 'summary' => ['created' => count($created), 'duplicates' => $duplicates, 'provider' => $provider]], $created === [] && $duplicates > 0 ? 200 : 201);
+    }
+
     public function deactivateExchangeRate(int $id): JsonResponse
     {
         if (!request()->user()?->tokenCan('accounting:write') && !request()->user()?->tokenCan('integration:write')) abort(403, 'This token cannot modify exchange rates.');
@@ -658,5 +734,26 @@ class FinanceIntegrationController extends Controller
                 return $existingStart->lte($end) && $existingEnd->gte($start);
             });
         if ($overlap) abort(422, 'The tax-rate effective period overlaps an existing period for this code and jurisdiction.');
+    }
+
+    private function syncTaxComponents(TaxRate $tax, array $components): void
+    {
+        $total = round((float) collect($components)->sum(fn (array $component): float => (float) $component['rate']), 4);
+        if (abs($total - (float) $tax->rate) > 0.0001) abort(422, 'Tax component rates must add up to the aggregate tax rate.');
+        $tax->components()->delete();
+        foreach ($components as $index => $component) {
+            TaxRateComponent::create([
+                'company_id' => $tax->company_id,
+                'tax_rate_id' => $tax->id,
+                'code' => strtoupper($component['code']),
+                'name' => $component['name'],
+                'rate' => $component['rate'],
+                'component_type' => $component['component_type'] ?? 'other',
+                'sequence' => $component['sequence'] ?? ($index + 1),
+                'is_compound' => (bool) ($component['is_compound'] ?? false),
+                'is_active' => true,
+            ]);
+        }
+        app(AuditService::class)->record('tax_rate.components_synchronized', $tax, null, ['components' => $tax->fresh('components')->components->toArray()]);
     }
 }

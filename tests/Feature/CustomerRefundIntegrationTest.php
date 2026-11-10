@@ -54,7 +54,8 @@ class CustomerRefundIntegrationTest extends TestCase
         $this->getJson('/api/accounting/settings')
             ->assertOk()
             ->assertJsonPath('data.abc_a_threshold_percent', 80)
-            ->assertJsonPath('data.abc_b_threshold_percent', 95);
+            ->assertJsonPath('data.abc_b_threshold_percent', 95)
+            ->assertJsonPath('data.tax_rounding_precision', 6);
 
         $updated = $this->patchJson('/api/accounting/settings', [
             'abc_a_threshold_percent' => 70,
@@ -63,6 +64,7 @@ class CustomerRefundIntegrationTest extends TestCase
             'slow_moving_days' => 120,
             'dead_stock_days' => 240,
             'expiry_alert_days' => 60,
+            'tax_rounding_precision' => 2,
             'carrier_sla_hours' => ['Carrier One' => 36, 'Carrier Two' => 72],
             'branch_carrier_sla_hours' => [(string) $branch->id => ['Carrier One' => 24]],
             'sla_calendar' => ['weekend_days' => [0, 6], 'holidays' => ['2026-10-02'], 'shift_start' => '08:00', 'shift_end' => '17:00'],
@@ -75,6 +77,7 @@ class CustomerRefundIntegrationTest extends TestCase
             ->assertJsonPath('data.slow_moving_days', 120)
             ->assertJsonPath('data.dead_stock_days', 240)
             ->assertJsonPath('data.expiry_alert_days', 60)
+            ->assertJsonPath('data.tax_rounding_precision', 2)
             ->assertJsonPath('data.carrier_sla_hours.Carrier One', 36)
             ->assertJsonPath('data.carrier_sla_hours.Carrier Two', 72)
             ->assertJsonPath('data.branch_carrier_sla_hours.'.$branch->id.'.Carrier One', 24)

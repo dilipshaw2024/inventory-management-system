@@ -7,6 +7,7 @@ use App\Models\Customer;
 use App\Models\Supplier;
 use App\Models\CustomerContact;
 use App\Models\SupplierContact;
+use App\Models\PartyTranslation;
 use App\Services\AuditService;
 use App\Services\IntegrationCursorService;
 use Illuminate\Http\JsonResponse;
@@ -16,6 +17,65 @@ use Illuminate\Validation\Rule;
 
 class PartyIntegrationController extends Controller
 {
+    public function translations(Request $request, string $partyType, int $id): JsonResponse
+    {
+        $party = $this->translationParty($partyType, $id);
+        $data = $request->validate(['language_code' => ['nullable', 'string', 'max:35'], 'is_active' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $language = array_key_exists('language_code', $data) ? PartyTranslation::normalizeLanguageCode($data['language_code']) : null;
+        $query = PartyTranslation::where('party_type', $partyType)->where('party_id', $party->id)
+            ->when($language, fn ($builder) => $builder->where('language_code', $language))
+            ->when(array_key_exists('is_active', $data), fn ($builder) => $builder->where('is_active', (bool) $data['is_active']))
+            ->when($data['updated_since'] ?? null, fn ($builder, $date) => $builder->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($query, $request, 'inventory.'.$partyType.'-translations', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeTranslation(Request $request, string $partyType, int $id): JsonResponse
+    {
+        $this->assertTranslationAccess($request, $partyType);
+        $party = $this->translationParty($partyType, $id);
+        $companyId = (int) $request->user()?->company_id;
+        $request->merge(['language_code' => PartyTranslation::normalizeLanguageCode($request->input('language_code'))]);
+        $data = $request->validate(['language_code' => ['required', 'string', 'max:35', 'regex:/^[a-z]{2,8}(?:-[A-Z0-9]{2,8})*$/'], 'name' => ['required', 'string', 'max:255'], 'description' => ['nullable', 'string'], 'external_reference' => ['nullable', 'string', 'max:150'], 'is_active' => ['nullable', 'boolean']]);
+        $existing = PartyTranslation::where('party_type', $partyType)->where('party_id', $party->id)->where('language_code', $data['language_code'])->first();
+        if ($existing) return response()->json(['data' => $existing, 'status' => 'duplicate_ignored']);
+        if (!empty($data['external_reference'])) {
+            $existing = PartyTranslation::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->first();
+            if ($existing) return response()->json(['data' => $existing, 'status' => 'duplicate_ignored']);
+        }
+        $translation = DB::transaction(function () use ($data, $partyType, $party, $companyId): PartyTranslation {
+            $translation = PartyTranslation::create($data + ['company_id' => $companyId, 'party_type' => $partyType, 'party_id' => $party->id, 'is_active' => $data['is_active'] ?? true, 'created_by' => auth()->id()]);
+            app(AuditService::class)->record('party_translation.created', $translation, null, $translation->toArray());
+            return $translation;
+        });
+        return response()->json(['data' => $translation, 'status' => 'created'], 201);
+    }
+
+    public function updateTranslation(Request $request, string $partyType, int $id, int $translationId): JsonResponse
+    {
+        $this->assertTranslationAccess($request, $partyType);
+        $party = $this->translationParty($partyType, $id);
+        $translation = PartyTranslation::where('party_type', $partyType)->where('party_id', $party->id)->findOrFail($translationId);
+        $request->mergeIfMissing(['language_code' => $translation->language_code]);
+        $request->merge(['language_code' => PartyTranslation::normalizeLanguageCode($request->input('language_code'))]);
+        $data = $request->validate(['language_code' => ['sometimes', 'required', 'string', 'max:35', 'regex:/^[a-z]{2,8}(?:-[A-Z0-9]{2,8})*$/'], 'name' => ['sometimes', 'required', 'string', 'max:255'], 'description' => ['sometimes', 'nullable', 'string'], 'external_reference' => ['sometimes', 'nullable', 'string', 'max:150'], 'is_active' => ['sometimes', 'boolean']]);
+        if (PartyTranslation::where('party_type', $partyType)->where('party_id', $party->id)->where('language_code', $data['language_code'])->where('id', '<>', $translation->id)->exists()) abort(422, 'A translation already exists for this party and language.');
+        $before = $translation->only(array_keys($data));
+        $translation->update($data + ['updated_by' => auth()->id()]);
+        app(AuditService::class)->record('party_translation.updated', $translation, $before, $translation->fresh()->only(array_keys($data)));
+        return response()->json(['data' => $translation->fresh(), 'status' => 'updated']);
+    }
+
+    public function deactivateTranslation(Request $request, string $partyType, int $id, int $translationId): JsonResponse
+    {
+        $this->assertTranslationAccess($request, $partyType);
+        $party = $this->translationParty($partyType, $id);
+        $translation = PartyTranslation::where('party_type', $partyType)->where('party_id', $party->id)->findOrFail($translationId);
+        $translation->update(['is_active' => false, 'updated_by' => auth()->id()]);
+        app(AuditService::class)->record('party_translation.deactivated', $translation, ['is_active' => true], ['is_active' => false]);
+        return response()->json(['data' => $translation->fresh(), 'status' => 'deactivated']);
+    }
+
     public function customers(Request $request): JsonResponse
     {
         $data = $request->validate(['q' => ['nullable', 'string', 'max:100'], 'is_active' => ['nullable', 'boolean'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
@@ -244,6 +304,21 @@ class PartyIntegrationController extends Controller
     private function assertAccess(Request $request, string $ability): void
     {
         if (!$request->user()?->tokenCan($ability) && !$request->user()?->tokenCan('integration:write')) abort(403, 'This token cannot modify the selected trading partner.');
+    }
+
+    private function assertTranslationAccess(Request $request, string $partyType): void
+    {
+        abort_unless(in_array($partyType, ['customer', 'supplier'], true), 404);
+        $this->assertAccess($request, $partyType === 'customer' ? 'sales:write' : 'purchasing:write');
+    }
+
+    private function translationParty(string $partyType, int $id): Customer|Supplier
+    {
+        return match ($partyType) {
+            'customer' => $this->companyScope(Customer::query())->findOrFail($id),
+            'supplier' => $this->companyScope(Supplier::query())->findOrFail($id),
+            default => abort(404),
+        };
     }
 
     private function companyScope($query)

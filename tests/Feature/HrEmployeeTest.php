@@ -91,6 +91,10 @@ class HrEmployeeTest extends TestCase
             ->assertJsonPath('data.0.employee_withheld', 2625)
             ->assertJsonPath('data.0.total_remittance', 2625)
             ->assertJsonPath('summary.total_remittance', 3937.5);
+        $this->getJson('/api/hr/statutory-remittances/export?from=2026-09-01&to=2026-09-30&authority=GST%20Authority')
+            ->assertOk()->assertJsonPath('data.schema', 'erp.hr.statutory-remittance.v1')->assertJsonStructure(['data' => ['schema', 'company_id', 'filters', 'data', 'summary'], 'integrity_hash']);
+        $this->get('/api/hr/statutory-remittances/export?format=csv&from=2026-09-01&to=2026-09-30&authority=GST%20Authority')
+            ->assertOk()->assertHeader('content-type', 'text/csv; charset=UTF-8')->assertHeader('x-package-sha256');
         $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $approvedRun->json('data.journal_entry_id'), 'account_id' => $statutory->id, 'credit' => 2625]);
         $this->assertDatabaseHas('journal_lines', ['journal_entry_id' => $approvedRun->json('data.journal_entry_id'), 'account_id' => $employerStatutory->id, 'credit' => 1312.5]);
         $paid = $this->postJson('/api/hr/pay-runs/'.$run->json('data.id').'/pay', ['paid_at' => '2026-10-01', 'payment_reference' => 'BANK-1'])

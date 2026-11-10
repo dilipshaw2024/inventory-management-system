@@ -198,6 +198,27 @@ class ErpFoundationTest extends TestCase
         self::assertSame(['net' => 120.0, 'tax' => 18.0], $tax->inclusive(138, 15));
     }
 
+    public function test_tax_calculation_supports_company_rounding_precision(): void
+    {
+        $tax = new TaxCalculationService();
+        self::assertSame(0.33, $tax->exclusive(1, 33.333, 2));
+        self::assertSame(['net' => 0.75, 'tax' => 0.25], $tax->inclusive(1, 33.333, 2));
+        self::assertSame(6, $tax->precision());
+    }
+
+    public function test_tax_calculation_supports_compound_tax_components(): void
+    {
+        $result = (new TaxCalculationService())->exclusiveComponents(100, [
+            ['code' => 'CENTRAL', 'name' => 'Central tax', 'rate' => 5, 'sequence' => 1, 'is_compound' => true],
+            ['code' => 'CESS', 'name' => 'Cess', 'rate' => 2, 'sequence' => 2],
+        ], 2);
+
+        self::assertSame(7.1, $result['tax']);
+        self::assertSame(2, count($result['components']));
+        self::assertSame(5.0, $result['components'][0]['tax']);
+        self::assertSame(2.1, $result['components'][1]['tax']);
+    }
+
     public function test_tax_rate_resolver_honors_effective_period_and_legacy_fallback(): void
     {
         $product = new Product(['tax_rate' => 5, 'tax_rate_id' => 1]);

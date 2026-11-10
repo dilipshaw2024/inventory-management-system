@@ -364,11 +364,12 @@ class InventoryIntegrationController extends Controller
         $data = $request->validate([
             'q' => ['nullable', 'string', 'max:150'], 'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'], 'can_purchase' => ['nullable', 'boolean'],
-            'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'], 'is_variant' => ['nullable', 'boolean'], 'parent_product_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'],
+            'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'], 'is_variant' => ['nullable', 'boolean'], 'parent_product_id' => ['nullable', 'integer'], 'language_code' => ['nullable', 'string', 'max:35'], 'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         $boolean = static fn ($value): bool => (bool) filter_var($value, FILTER_VALIDATE_BOOLEAN);
-        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes', 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value']), $companyId)
+        $language = isset($data['language_code']) ? \App\Models\ProductTranslation::normalizeLanguageCode($data['language_code']) : null;
+        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes', 'translations' => fn ($query) => $query->where('company_id', $companyId)->when($language, fn ($nested) => $nested->where('language_code', $language)), 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value']), $companyId)
             ->when($data['q'] ?? null, function ($query, string $search): void {
                 $query->where(function ($nested) use ($search): void {
                     $nested->where('name', 'like', "%{$search}%")
@@ -1661,10 +1662,13 @@ class InventoryIntegrationController extends Controller
             foreach ($data['lines'] as $line) {
                 $product = $this->companyScope(Product::query(), $companyId)->findOrFail($line['product_id']);
                 $lineTotalValue = (float) $line['quantity'] * (float) $line['unit_price'];
-                $rate = $taxExempt ? 0.0 : app(TaxRateResolver::class)->rateFor($product, $data['date'], $customer->tax_jurisdiction);
+                $taxDefinition = $taxExempt ? null : app(TaxRateResolver::class)->taxFor($product, $data['date'], $customer->tax_jurisdiction);
+                $rate = $taxDefinition?->rate !== null ? (float) $taxDefinition->rate : (float) ($product->tax_rate ?? 0);
                 $taxResult = $taxMode === 'inclusive'
                     ? app(TaxCalculationService::class)->inclusive($lineTotalValue, $rate)
-                    : ['net' => $lineTotalValue, 'tax' => app(TaxCalculationService::class)->exclusive($lineTotalValue, $rate)];
+                    : ($taxDefinition?->components?->isNotEmpty()
+                        ? app(TaxCalculationService::class)->exclusiveComponents($lineTotalValue, $taxDefinition->components)
+                        : ['net' => $lineTotalValue, 'tax' => app(TaxCalculationService::class)->exclusive($lineTotalValue, $rate)]);
                 $lineTotal += $lineTotalValue; $subtotal += (float) $taxResult['net']; $taxTotal += (float) $taxResult['tax'];
                 $lineRows[] = [
                     'product_id' => $product->id, 'quantity' => (float) $line['quantity'], 'unit_price' => (float) $line['unit_price'],

@@ -22,6 +22,7 @@ use Laravel\Sanctum\Sanctum;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
+use Tests\Support\FakeTaxFilingProvider;
 
 class TaxReconciliationTest extends TestCase
 {
@@ -143,6 +144,24 @@ class TaxReconciliationTest extends TestCase
         $this->assertSame('accepted', $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('status'));
         $this->assertSame('GATEWAY-FILING-RETRY', $this->app['db']->table('tax_filings')->where('id', $retryableFiling->json('data.id'))->value('filing_reference'));
         $this->getJson('/api/accounting/tax-filings?status=draft&has_provider_error=1')->assertOk()->assertJsonPath('data', []);
+    }
+
+    public function test_custom_tax_filing_provider_retains_provider_specific_configuration(): void
+    {
+        config(['integrations.tax_filing_adapters' => [FakeTaxFilingProvider::class]]);
+        $this->app->forgetInstance(\App\Services\Integrations\TaxFilingProviderRegistry::class);
+        $company = Company::create(['name' => 'Custom Tax Provider Co', 'code' => 'TAX-CUSTOM']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['accounting:write', 'integration:write']);
+
+        $configured = $this->postJson('/api/accounting/tax-filing-providers', [
+            'provider' => 'TEST-TAX-PROVIDER',
+            'connection_config' => ['jurisdiction_code' => 'DE', 'certificate_alias' => 'erp-prod'],
+        ])->assertCreated()->assertJsonPath('data.provider', 'test-tax-provider');
+
+        $stored = TaxFilingProviderSetting::findOrFail($configured->json('data.id'));
+        $this->assertSame('DE', $stored->connection_config['jurisdiction_code']);
+        $this->assertSame('erp-prod', $stored->connection_config['certificate_alias']);
     }
 
     public function test_browser_tax_filing_operations_are_permission_protected_and_company_scoped(): void

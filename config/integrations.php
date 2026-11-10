@@ -48,4 +48,11 @@ return [
     'tax_filing_http_timeout' => (int) env('ERP_TAX_FILING_HTTP_TIMEOUT', 30),
     'tax_filing_http_retries' => (int) env('ERP_TAX_FILING_HTTP_RETRIES', 2),
     'tax_filing_http_retry_sleep' => (int) env('ERP_TAX_FILING_HTTP_RETRY_SLEEP', 0),
+    'exchange_rate_adapters' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) env('ERP_EXCHANGE_RATE_ADAPTERS', ''))
+    ))),
+    'exchange_rate_http_endpoint' => env('ERP_EXCHANGE_RATE_HTTP_ENDPOINT'),
+    'exchange_rate_http_token' => env('ERP_EXCHANGE_RATE_HTTP_TOKEN'),
+    'exchange_rate_http_timeout' => (int) env('ERP_EXCHANGE_RATE_HTTP_TIMEOUT', 30),
 ];

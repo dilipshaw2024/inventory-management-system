@@ -11,7 +11,7 @@ use Illuminate\Http\Request;
 class SystemSettingsController extends Controller
 {
     private const KEYS = [
-        'negative_stock_policy', 'date_format', 'decimal_precision', 'default_tax_mode',
+        'negative_stock_policy', 'date_format', 'decimal_precision', 'tax_rounding_precision', 'default_tax_mode',
         'document_print_size', 'purchase_price_variance_percent', 'max_discount_percent',
         'stock_count_recount_variance_percent',
         'abc_a_threshold_percent', 'abc_b_threshold_percent', 'allow_expired_batch_issue',
@@ -40,6 +40,7 @@ class SystemSettingsController extends Controller
             'negative_stock_policy' => ['sometimes', 'in:block,approval,allow'],
             'date_format' => ['sometimes', 'in:Y-m-d,d-m-Y,m/d/Y'],
             'decimal_precision' => ['sometimes', 'integer', 'min:0', 'max:6'],
+            'tax_rounding_precision' => ['sometimes', 'integer', 'min:0', 'max:6'],
             'default_tax_mode' => ['sometimes', 'in:exclusive,inclusive'],
             'document_print_size' => ['sometimes', 'in:A4,Letter'],
             'purchase_price_variance_percent' => ['sometimes', 'numeric', 'min:0', 'max:100'],
@@ -88,7 +89,7 @@ class SystemSettingsController extends Controller
         $service = app(ErpSettingService::class);
         $before = $this->values((int) $companyId);
         foreach ($data as $key => $value) {
-            $type = in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars', 'dashboard_widgets'], true) ? 'json' : ($key === 'decimal_precision' || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string')));
+            $type = in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars', 'dashboard_widgets'], true) ? 'json' : (($key === 'decimal_precision' || $key === 'tax_rounding_precision') || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string')));
             $service->put($key, $value, $type, (int) $companyId);
         }
         $after = $this->values((int) $companyId);
@@ -103,6 +104,7 @@ class SystemSettingsController extends Controller
             'negative_stock_policy' => $service->get('negative_stock_policy', 'block', $companyId),
             'date_format' => $service->get('date_format', 'Y-m-d', $companyId),
             'decimal_precision' => $service->get('decimal_precision', 2, $companyId),
+            'tax_rounding_precision' => $service->get('tax_rounding_precision', 6, $companyId),
             'default_tax_mode' => $service->get('default_tax_mode', 'exclusive', $companyId),
             'document_print_size' => $service->get('document_print_size', 'A4', $companyId),
             'purchase_price_variance_percent' => $service->get('purchase_price_variance_percent', 0, $companyId),

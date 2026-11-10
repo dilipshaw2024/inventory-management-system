@@ -127,9 +127,13 @@ class InvoiceController extends Controller
                 return redirect()->back()->withInput()->with(['message' => 'One or more invoice products do not match the selected category.', 'alert-type' => 'error']);
             }
             $lineSubtotal = (float) $request->selling_qty[$key] * (float) $request->unit_price[$key];
-            $taxRate = $taxExempt ? 0 : app(TaxRateResolver::class)->rateFor($product, $request->date, $customer?->tax_jurisdiction);
-            $lineTaxes[$key] = $taxMode === 'inclusive' ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $taxRate)['tax'] : app(TaxCalculationService::class)->exclusive($lineSubtotal, $taxRate);
-            $netTotal += $taxMode === 'inclusive' ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $taxRate)['net'] : $lineSubtotal;
+            $taxDefinition = $taxExempt ? null : app(TaxRateResolver::class)->taxFor($product, $request->date, $customer?->tax_jurisdiction);
+            $taxRate = $taxDefinition?->rate !== null ? (float) $taxDefinition->rate : (float) ($product->tax_rate ?? 0);
+            $taxResult = $taxMode === 'inclusive'
+                ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $taxRate)
+                : ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $taxRate)]);
+            $lineTaxes[$key] = $taxResult['tax'];
+            $netTotal += $taxResult['net'];
             $taxTotal += $lineTaxes[$key];
         }
 

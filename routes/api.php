@@ -103,6 +103,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
     Route::patch('/currencies/{id}', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'updateCurrency'])->middleware('ability:accounting:write,integration:write');
     Route::get('/exchange-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'exchangeRates'])->middleware('abilities:accounting:read');
     Route::post('/exchange-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'storeExchangeRate'])->middleware('ability:accounting:write,integration:write');
+    Route::post('/exchange-rates/sync', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'syncExchangeRates'])->middleware('ability:accounting:write,integration:write');
     Route::post('/exchange-rates/{id}/deactivate', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'deactivateExchangeRate'])->middleware('ability:accounting:write,integration:write');
     Route::get('/tax-rates', [\App\Http\Controllers\Api\FinanceIntegrationController::class, 'taxRates'])->middleware('abilities:accounting:read');
     Route::get('/company-tax-registrations', [\App\Http\Controllers\Api\CompanyTaxRegistrationIntegrationController::class, 'index'])->middleware('abilities:accounting:read');
@@ -168,6 +169,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::get('/products/lookup', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'lookup'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/uoms', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'uoms'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/media', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'media'])->middleware('abilities:inventory:read');
+    Route::get('/products/{id}/translations', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'translations'])->middleware('abilities:inventory:read');
     Route::get('/attachments', [\App\Http\Controllers\Api\DocumentAttachmentIntegrationController::class, 'index'])->middleware('ability:inventory:read,purchasing:read,sales:read,accounting:read,manufacturing:read,service:read,integration:read');
     Route::post('/attachments', [\App\Http\Controllers\Api\DocumentAttachmentIntegrationController::class, 'store'])->middleware('ability:inventory:write,purchasing:write,sales:write,accounting:write,manufacturing:write,service:write,integration:write');
     Route::get('/attachments/{id}/download', [\App\Http\Controllers\Api\DocumentAttachmentIntegrationController::class, 'download'])->middleware('ability:inventory:read,purchasing:read,sales:read,accounting:read,manufacturing:read,service:read,integration:read');
@@ -260,6 +262,9 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::patch('/product-classifications/{id}', [\App\Http\Controllers\Api\ProductClassificationIntegrationController::class, 'update'])->middleware('ability:inventory:write,integration:write');
     Route::post('/product-classifications/{id}/deactivate', [\App\Http\Controllers\Api\ProductClassificationIntegrationController::class, 'deactivate'])->middleware('ability:inventory:write,integration:write');
     Route::post('/products/{id}/barcodes', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'storeBarcode'])->middleware('ability:inventory:write,integration:write');
+    Route::post('/products/{id}/translations', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'storeTranslation'])->middleware('ability:inventory:write,integration:write');
+    Route::patch('/products/{id}/translations/{translationId}', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'updateTranslation'])->middleware('ability:inventory:write,integration:write');
+    Route::post('/products/{id}/translations/{translationId}/deactivate', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'deactivateTranslation'])->middleware('ability:inventory:write,integration:write');
     Route::post('/products/{id}/variants', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'storeVariant'])->middleware('ability:inventory:write,integration:write');
     Route::patch('/products/{id}/variant', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'updateVariant'])->middleware('ability:inventory:write,integration:write');
     Route::get('/attributes', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'attributes'])->middleware('abilities:inventory:read');
@@ -270,6 +275,10 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::post('/products/{id}/deactivate', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'deactivate'])->middleware('ability:inventory:write,integration:write');
     Route::post('/customers', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'storeCustomer'])->middleware('ability:sales:write,integration:write');
     Route::get('/customers', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'customers'])->middleware('abilities:inventory:read');
+    Route::get('/parties/{partyType}/{id}/translations', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'translations'])->middleware('abilities:inventory:read');
+    Route::post('/parties/{partyType}/{id}/translations', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'storeTranslation'])->middleware('ability:sales:write,purchasing:write,integration:write');
+    Route::patch('/parties/{partyType}/{id}/translations/{translationId}', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'updateTranslation'])->middleware('ability:sales:write,purchasing:write,integration:write');
+    Route::post('/parties/{partyType}/{id}/translations/{translationId}/deactivate', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'deactivateTranslation'])->middleware('ability:sales:write,purchasing:write,integration:write');
     Route::get('/customer-contacts', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'customerContacts'])->middleware('abilities:inventory:read');
     Route::patch('/customers/{id}', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'updateCustomer'])->middleware('ability:sales:write,integration:write');
     Route::post('/customers/{customerId}/contacts', [\App\Http\Controllers\Api\PartyIntegrationController::class, 'storeCustomerContact'])->middleware('ability:sales:write,integration:write');
@@ -595,6 +604,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('hr')->group(functio
     Route::post('/employees/{id}/benefits/{benefitId}/deactivate', [\App\Http\Controllers\Api\HrIntegrationController::class, 'deactivateEmployeeBenefit'])->middleware('abilities:hr:write');
     Route::get('/pay-runs', [\App\Http\Controllers\Api\HrIntegrationController::class, 'payRuns'])->middleware('abilities:hr:read');
     Route::get('/statutory-remittances', [\App\Http\Controllers\Api\HrIntegrationController::class, 'statutoryRemittances'])->middleware('abilities:hr:read');
+    Route::get('/statutory-remittances/export', [\App\Http\Controllers\Api\HrIntegrationController::class, 'exportStatutoryRemittances'])->middleware('abilities:hr:read');
     Route::get('/payroll-rules', [\App\Http\Controllers\Api\HrIntegrationController::class, 'payrollRules'])->middleware('abilities:hr:read');
     Route::post('/payroll-rules', [\App\Http\Controllers\Api\HrIntegrationController::class, 'storePayrollRule'])->middleware('abilities:hr:write');
     Route::post('/payroll-rules/{id}/deactivate', [\App\Http\Controllers\Api\HrIntegrationController::class, 'deactivatePayrollRule'])->middleware('abilities:hr:write');

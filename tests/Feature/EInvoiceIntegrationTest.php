@@ -25,7 +25,7 @@ class EInvoiceIntegrationTest extends TestCase
     {
         $company = Company::create(['name' => 'Capability Co', 'code' => 'CAPABILITY-API']);
         $user = User::factory()->create(['company_id' => $company->id]);
-        $token = $user->createToken('capability-test', ['integration:read', 'inventory:read', 'sales:write'])->plainTextToken;
+        $token = $user->createToken('capability-test', ['integration:read', 'inventory:read', 'sales:write', 'hr:read'])->plainTextToken;
 
         $response = $this->withToken($token)->getJson('/api/integration/capabilities');
 
@@ -33,10 +33,13 @@ class EInvoiceIntegrationTest extends TestCase
             ->assertJsonPath('data.contract', 'erp.integration.v1')
             ->assertJsonPath('data.api_version', 'v1')
             ->assertJsonPath('data.modules.inventory.read_ability', 'inventory:read')
+            ->assertJsonPath('data.modules.hr.read_ability', 'hr:read')
+            ->assertJsonPath('data.modules.hr.feed_root', '/api/hr')
             ->assertJsonPath('data.modules.inventory.conventions.idempotency', 'external_reference')
             ->assertJsonPath('meta.company_id', $company->id);
         $this->assertContains('inventory:read', $response->json('data.abilities'));
         $this->assertContains('sales:write', $response->json('data.abilities'));
+        $this->assertContains('hr:read', $response->json('data.abilities'));
         $this->assertNotContains('accounting:write', $response->json('data.abilities'));
     }
 

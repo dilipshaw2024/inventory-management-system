@@ -40,8 +40,17 @@ class TaxJurisdictionTest extends TestCase
         $user = User::factory()->create(['company_id' => $company->id]);
         Sanctum::actingAs($user, ['accounting:write', 'accounting:read']);
         $payload = ['name' => 'API VAT', 'code' => 'API-VAT', 'rate' => 5, 'calculation' => 'exclusive', 'effective_from' => '2026-01-01'];
-        $this->postJson('/api/accounting/tax-rates', $payload + ['jurisdiction' => 'DOMESTIC'])->assertCreated();
-        $this->postJson('/api/accounting/tax-rates', $payload + ['jurisdiction' => 'EXPORT', 'rate' => 12])->assertCreated();
+        $this->postJson('/api/accounting/tax-rates', array_merge($payload, ['jurisdiction' => 'DOMESTIC', 'components' => [
+            ['code' => 'CENTRAL', 'name' => 'Central tax', 'rate' => 3, 'component_type' => 'central'],
+            ['code' => 'STATE', 'name' => 'State tax', 'rate' => 2, 'component_type' => 'state'],
+        ]]))->assertCreated()->assertJsonPath('data.components.0.code', 'CENTRAL');
+        $this->postJson('/api/accounting/tax-rates', array_merge($payload, ['jurisdiction' => 'EXPORT', 'rate' => 12, 'components' => [
+            ['code' => 'FEDERAL', 'name' => 'Federal tax', 'rate' => 7, 'component_type' => 'central'],
+            ['code' => 'LOCAL', 'name' => 'Local tax', 'rate' => 5, 'component_type' => 'local'],
+        ]]))->assertCreated();
+        $this->postJson('/api/accounting/tax-rates', array_merge($payload, ['jurisdiction' => 'INVALID', 'components' => [
+            ['code' => 'ONLY', 'name' => 'Incomplete tax', 'rate' => 4],
+        ]]))->assertStatus(422);
 
         foreach (['DOMESTIC', 'EXPORT'] as $index => $jurisdiction) {
             $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'TAX-JURIS-'.$index, 'date' => '2026-09-16', 'status' => 1, 'tax_jurisdiction' => $jurisdiction, 'subtotal_amount' => 100, 'tax_amount' => 5, 'total_amount' => 105]);

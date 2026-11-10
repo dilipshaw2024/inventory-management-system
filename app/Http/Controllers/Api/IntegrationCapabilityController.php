@@ -20,6 +20,7 @@ class IntegrationCapabilityController extends Controller
             'planning:read', 'planning:write',
             'service:read', 'service:write',
             'accounting:read', 'accounting:write',
+            'hr:read', 'hr:write',
             'integration:read', 'integration:write',
         ];
 
@@ -34,6 +35,7 @@ class IntegrationCapabilityController extends Controller
             'planning' => ['read_ability' => 'planning:read', 'write_ability' => 'planning:write', 'feed_root' => '/api/integration/planning'],
             'service' => ['read_ability' => 'service:read', 'write_ability' => 'service:write', 'feed_root' => '/api/service'],
             'accounting' => ['read_ability' => 'accounting:read', 'write_ability' => 'accounting:write', 'feed_root' => '/api/accounting'],
+            'hr' => ['read_ability' => 'hr:read', 'write_ability' => 'hr:write', 'feed_root' => '/api/hr'],
             'security' => ['read_ability' => 'integration:read', 'write_ability' => 'integration:write', 'feed_root' => '/api/integration/security'],
         ];
 

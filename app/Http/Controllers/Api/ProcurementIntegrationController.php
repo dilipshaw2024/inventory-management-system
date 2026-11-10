@@ -276,8 +276,9 @@ class ProcurementIntegrationController extends Controller
                     }
                 }
                 $quantity = (float) $input['quantity']; $unitPrice = (float) $input['unit_price']; $lineSubtotal = $quantity * $unitPrice;
-                $rate = $taxExempt ? 0 : (isset($input['tax_rate']) ? (float) $input['tax_rate'] : app(TaxRateResolver::class)->rateFor($poLine->product, $data['invoice_date'], $supplier->tax_jurisdiction));
-                $taxResult = $taxMode === 'inclusive' ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $rate) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $rate)];
+                $taxDefinition = $taxExempt || isset($input['tax_rate']) ? null : app(TaxRateResolver::class)->taxFor($poLine->product, $data['invoice_date'], $supplier->tax_jurisdiction);
+                $rate = $taxExempt ? 0 : (isset($input['tax_rate']) ? (float) $input['tax_rate'] : (float) ($taxDefinition?->rate ?? $poLine->product?->tax_rate ?? 0));
+                $taxResult = $taxMode === 'inclusive' ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $rate) : ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $rate)]);
                 $lineTax = (float) $taxResult['tax']; $subtotal += (float) $taxResult['net']; $tax += $lineTax;
                 PurchaseInvoiceLine::create(['purchase_invoice_id' => $invoice->id, 'purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)]);
                 $auditLines[] = ['purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)];

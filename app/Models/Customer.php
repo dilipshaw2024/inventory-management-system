@@ -18,4 +18,15 @@ class Customer extends Model
     }
     public function contacts(){ return $this->hasMany(CustomerContact::class); }
     public function salesPriceList() { return $this->belongsTo(PriceList::class, 'sales_price_list_id'); }
+    public function translations(){ return $this->hasMany(PartyTranslation::class, 'party_id')->where('party_type', 'customer'); }
+
+    public function localizedName(?string $languageCode = null): string
+    {
+        $languageCode = PartyTranslation::normalizeLanguageCode($languageCode);
+        $translations = $this->relationLoaded('translations') ? $this->translations : $this->translations()->get();
+        $preferred = $translations->first(fn (PartyTranslation $translation): bool => $translation->is_active && $translation->language_code === $languageCode);
+        if ($preferred) return $preferred->name;
+        $base = strtolower((string) strtok($languageCode, '-'));
+        return $translations->first(fn (PartyTranslation $translation): bool => $translation->is_active && strtolower((string) strtok($translation->language_code, '-')) === $base)?->name ?: (string) $this->name;
+    }
 }
