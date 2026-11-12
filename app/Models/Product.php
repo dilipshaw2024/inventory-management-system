@@ -33,6 +33,11 @@ class Product extends Model
         return $this->belongsTo(TaxRate::class, 'tax_rate_id');
     }
 
+    /** Publicly named relation used by integration feeds to avoid colliding with the legacy numeric tax_rate field. */
+    public function taxDefinition(){
+        return $this->belongsTo(TaxRate::class, 'tax_rate_id');
+    }
+
     public function classification(){
         return $this->belongsTo(ProductClassification::class, 'classification_id');
     }

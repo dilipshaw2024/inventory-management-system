@@ -60,7 +60,9 @@ class SendApprovalEscalations extends Command
                 $escalationPermission = $policy->required_permission;
                 $tierPermissions = is_array($policy->escalation_permissions) ? array_values($policy->escalation_permissions) : [];
                 if ($level > 1 && !empty($tierPermissions[$level - 2])) $escalationPermission = $tierPermissions[$level - 2];
+                $configuredRecipients = is_array($policy->escalation_user_ids) ? ($policy->escalation_user_ids[$level - 1] ?? null) : null;
                 $users = User::query()->where('is_active', true)->where('company_id', $document->company_id)
+                    ->when(is_array($configuredRecipients), fn ($query) => $query->whereIn('id', array_values(array_unique(array_map('intval', $configuredRecipients)))))
                     ->with('roles.permissions')->get()
                     ->filter(fn (User $user): bool => $user->hasPermission($escalationPermission));
                 foreach ($users as $user) {

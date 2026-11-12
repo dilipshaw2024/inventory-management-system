@@ -51,4 +51,29 @@ class TaxCalculationService
         }
         return ['net' => $this->roundAmount($netAmount, $precision), 'tax' => $this->roundAmount($totalTax, $precision), 'components' => $breakdown];
     }
+
+    /** Split an inclusive amount across ordered, optionally compound components. */
+    public function inclusiveComponents(float $grossAmount, iterable $components, ?int $precision = null): array
+    {
+        $precision ??= $this->precision();
+        $components = collect($components)->values();
+        if ($components->isEmpty()) {
+            return ['net' => $this->roundAmount($grossAmount, $precision), 'tax' => 0.0, 'components' => []];
+        }
+
+        // Solve the inverse of exclusiveComponents so non-compound and
+        // compound components retain the same ordering semantics.
+        $low = 0.0;
+        $high = max(0.0, $grossAmount);
+        for ($iteration = 0; $iteration < 80; $iteration++) {
+            $mid = ($low + $high) / 2;
+            $estimate = $this->exclusiveComponents($mid, $components, null);
+            if ($mid + $estimate['tax'] < $grossAmount) $low = $mid;
+            else $high = $mid;
+        }
+
+        $net = $this->roundAmount(($low + $high) / 2, $precision);
+        $breakdown = $this->exclusiveComponents($net, $components, $precision);
+        return ['net' => $net, 'tax' => $this->roundAmount($grossAmount - $net, $precision), 'components' => $breakdown['components']];
+    }
 }

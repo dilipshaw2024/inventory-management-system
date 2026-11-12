@@ -18,7 +18,9 @@ use App\Models\CostCenter;
 use App\Models\FiscalPeriod;
 use Auth;
 use Illuminate\Support\Carbon;
+use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpFoundation\StreamedResponse;
+use App\Services\ProductSpreadsheetService;
 use App\Models\StockReservation;
 use App\Models\InventoryStatusBalance;
  
@@ -129,10 +131,10 @@ class StockController extends Controller
         return view('backend.stock.movement_report', compact('movements', 'products'));
     }
 
-    public function MovementExport(Request $request): StreamedResponse
+    public function MovementExport(Request $request, ProductSpreadsheetService $spreadsheet): Response
     {
         $companyId = auth()->user()?->company_id;
-        $validated = $request->validate(['product_id' => ['nullable', 'integer', $this->owned('products')], 'movement_type' => ['nullable', 'string', 'in:opening,receipt,issue,transfer_in,transfer_out,adjustment_in,adjustment_out,return_in,return_out,scrap,quarantine_in,quarantine_out,reservation,release'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from']]);
+        $validated = $request->validate(['product_id' => ['nullable', 'integer', $this->owned('products')], 'movement_type' => ['nullable', 'string', 'in:opening,receipt,issue,transfer_in,transfer_out,adjustment_in,adjustment_out,return_in,return_out,scrap,quarantine_in,quarantine_out,reservation,release'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'format' => ['nullable', 'in:csv,xlsx']]);
         $movements = InventoryMovement::withoutGlobalScopes()->with(['product', 'location', 'creator'])
             ->from('inventory_movements as ledger_rows')
             ->select('ledger_rows.*')
@@ -140,7 +142,13 @@ class StockController extends Controller
             ->selectSub($this->movementBalanceQuery($validated['to'] ?? now()->toDateString(), true), 'closing_balance')
             ->where(fn ($query) => $query->where('ledger_rows.company_id', $companyId)->orWhereNull('ledger_rows.company_id'))
             ->when($validated['product_id'] ?? null, fn ($query, $id) => $query->where('product_id', $id))->when($validated['movement_type'] ?? null, fn ($query, $type) => $query->where('movement_type', $type))->when($validated['from'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '>=', $date))->when($validated['to'] ?? null, fn ($query, $date) => $query->whereDate('posted_at', '<=', $date))->latest('posted_at')->latest('id')->cursor();
-        return response()->streamDownload(function () use ($movements): void { $handle = fopen('php://output', 'w'); fputcsv($handle, ['Date', 'Product', 'Movement', 'Quantity', 'Unit cost', 'Opening balance', 'Closing balance', 'Reference', 'Location', 'User']); foreach ($movements as $movement) fputcsv($handle, [$movement->posted_at, $movement->product?->name, $movement->movement_type, $movement->quantity, $movement->unit_cost, $movement->opening_balance, $movement->closing_balance, $movement->reference_no, $movement->location?->code, $movement->creator?->name]); fclose($handle); }, 'stock-ledger-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
+        $headers = ['Date', 'Product', 'Movement', 'Quantity', 'Unit cost', 'Opening balance', 'Closing balance', 'Reference', 'Location', 'User'];
+        if (($validated['format'] ?? 'csv') === 'xlsx') {
+            $rows = [];
+            foreach ($movements as $movement) $rows[] = [$movement->posted_at, $movement->product?->name, $movement->movement_type, $movement->quantity, $movement->unit_cost, $movement->opening_balance, $movement->closing_balance, $movement->reference_no, $movement->location?->code, $movement->creator?->name];
+            return response($spreadsheet->write($headers, $rows), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="stock-ledger-'.now()->format('Ymd-His').'.xlsx"']);
+        }
+        return response()->streamDownload(function () use ($movements, $headers): void { $handle = fopen('php://output', 'w'); fputcsv($handle, $headers); foreach ($movements as $movement) fputcsv($handle, [$movement->posted_at, $movement->product?->name, $movement->movement_type, $movement->quantity, $movement->unit_cost, $movement->opening_balance, $movement->closing_balance, $movement->reference_no, $movement->location?->code, $movement->creator?->name]); fclose($handle); }, 'stock-ledger-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
     }
 
     private function movementBalanceQuery(?string $date, bool $inclusive)

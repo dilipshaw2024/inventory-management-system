@@ -89,4 +89,35 @@ class ApprovalEscalationTierTest extends TestCase
         $this->assertDatabaseHas('approval_escalations', ['document_id' => $purchaseOrder->id, 'escalation_level' => 2, 'status' => 'pending']);
         Carbon::setTestNow();
     }
+
+    public function test_configured_escalation_recipients_limit_notifications_per_tier(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-09-18 12:00:00'));
+        $company = Company::create(['name' => 'Approval Routing Co', 'code' => 'APPROVAL-ROUTING']);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Routing Supplier', 'is_active' => true]);
+        $permission = Permission::create(['code' => 'purchasing.manage', 'name' => 'Manage purchasing', 'module' => 'purchasing']);
+        $role = Role::create(['code' => 'routing-approver', 'name' => 'Routing approver', 'is_active' => true]);
+        $role->permissions()->attach($permission->id);
+        $selected = User::factory()->create(['company_id' => $company->id, 'is_active' => true]);
+        $notSelected = User::factory()->create(['company_id' => $company->id, 'is_active' => true]);
+        $selected->roles()->attach($role->id);
+        $notSelected->roles()->attach($role->id);
+        $purchaseOrder = PurchaseOrder::create([
+            'company_id' => $company->id, 'supplier_id' => $supplier->id, 'po_no' => 'PO-APPROVAL-ROUTING',
+            'date' => '2026-09-17', 'status' => 'submitted', 'created_by' => $selected->id,
+            'created_at' => Carbon::parse('2026-09-18 08:00:00'), 'updated_at' => Carbon::parse('2026-09-18 08:00:00'),
+        ]);
+        ApprovalPolicy::create([
+            'company_id' => $company->id, 'document_type' => PurchaseOrder::class, 'required_permission' => 'purchasing.manage',
+            'approval_step' => 1, 'escalation_after_hours' => 1, 'max_escalation_level' => 1, 'escalation_user_ids' => [[$selected->id]],
+        ]);
+
+        $this->artisan('erp:approvals:escalate', ['--company' => $company->id])->assertExitCode(0);
+
+        $this->assertDatabaseHas('approval_escalations', ['document_id' => $purchaseOrder->id, 'user_id' => $selected->id]);
+        $this->assertDatabaseMissing('approval_escalations', ['document_id' => $purchaseOrder->id, 'user_id' => $notSelected->id]);
+        $this->assertCount(1, $selected->notifications()->get());
+        $this->assertCount(0, $notSelected->notifications()->get());
+        Carbon::setTestNow();
+    }
 }

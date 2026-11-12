@@ -10,6 +10,8 @@ use App\Services\Integrations\HttpBankStatementAdapter;
 use App\Services\Integrations\HttpEInvoiceProvider;
 use App\Services\Integrations\TaxFilingProviderRegistry;
 use App\Services\Integrations\HttpTaxFilingProvider;
+use App\Services\Integrations\StatutoryRemittanceProviderRegistry;
+use App\Services\Integrations\HttpStatutoryRemittanceProvider;
 use App\Services\Integrations\ExchangeRateProviderRegistry;
 use App\Services\Integrations\HttpExchangeRateProvider;
 use Illuminate\Support\ServiceProvider;
@@ -51,6 +53,14 @@ class AppServiceProvider extends ServiceProvider
             $registry = new TaxFilingProviderRegistry();
             $registry->register($app->make(HttpTaxFilingProvider::class));
             foreach ((array) config('integrations.tax_filing_adapters', []) as $providerClass) {
+                $registry->register($app->make($providerClass));
+            }
+            return $registry;
+        });
+        $this->app->singleton(StatutoryRemittanceProviderRegistry::class, function ($app): StatutoryRemittanceProviderRegistry {
+            $registry = new StatutoryRemittanceProviderRegistry();
+            $registry->register($app->make(HttpStatutoryRemittanceProvider::class));
+            foreach ((array) config('integrations.statutory_remittance_adapters', []) as $providerClass) {
                 $registry->register($app->make($providerClass));
             }
             return $registry;

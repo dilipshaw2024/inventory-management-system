@@ -25,12 +25,15 @@ class SalesQuotationIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
             'status' => ['nullable', 'in:draft,submitted,approved,rejected,expired,converted'],
-            'customer_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'],
+            'customer_id' => ['nullable', 'integer'], 'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'], 'salesperson_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
-        $quotations = $this->companyScope(SalesQuotation::with(['customer', 'lines.product']), $companyId)
+        $quotations = $this->companyScope(SalesQuotation::with(['customer', 'salesperson', 'lines.product']), $companyId)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
             ->when($data['customer_id'] ?? null, fn ($query, $customerId) => $query->where('customer_id', $customerId))
+            ->when($data['sales_channel'] ?? null, fn ($query, $channel) => $query->where('sales_channel', $channel))
+            ->when($data['delivery_method'] ?? null, fn ($query, $method) => $query->where('delivery_method', $method))
+            ->when($data['salesperson_id'] ?? null, fn ($query, $salespersonId) => $query->where('salesperson_id', $salespersonId))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($quotations, $request, 'sales.quotations', (int) ($data['per_page'] ?? 50));
@@ -41,7 +44,7 @@ class SalesQuotationIntegrationController extends Controller
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
             'external_reference' => ['nullable', 'string', 'max:150'], 'customer_id' => ['required', 'integer'],
-            'quote_date' => ['required', 'date'], 'valid_until' => ['nullable', 'date', 'after_or_equal:quote_date'],
+            'quote_date' => ['required', 'date'], 'valid_until' => ['nullable', 'date', 'after_or_equal:quote_date'], 'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'], 'salesperson_id' => ['nullable', 'integer', \Illuminate\Validation\Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'description' => ['nullable', 'string', 'max:2000'], 'lines' => ['required', 'array', 'min:1'],
             'lines.*.product_id' => ['required', 'integer'], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
             'lines.*.unit_price' => ['required', 'numeric', 'min:0'], 'lines.*.discount_amount' => ['required', 'numeric', 'min:0'],
@@ -54,11 +57,11 @@ class SalesQuotationIntegrationController extends Controller
         if (!$customer) abort(422, 'Customer is not authorized or inactive.');
         $productIds = collect($data['lines'])->pluck('product_id');
         if ($this->companyScope(Product::query(), $companyId)->whereIn('id', $productIds)->count() !== $productIds->unique()->count()) abort(422, 'One or more products are not authorized for this company.');
-        $quotation = DB::transaction(function () use ($data, $companyId, $request): SalesQuotation {
+        $quotation = DB::transaction(function () use ($data, $companyId, $customer, $request): SalesQuotation {
             $quotation = SalesQuotation::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
                 'quote_no' => app(NumberingSequenceService::class)->nextOrFallback('sales_quotation', 'QT-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
-                'customer_id' => $data['customer_id'], 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
+                'customer_id' => $data['customer_id'], 'sales_channel' => $data['sales_channel'] ?? ($customer->sales_channel ?: null), 'delivery_method' => $data['delivery_method'] ?? null, 'salesperson_id' => $data['salesperson_id'] ?? $request->user()?->id, 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
                 'description' => $data['description'] ?? null, 'created_by' => $request->user()?->id, 'status' => 'submitted',
             ]);
             foreach ($data['lines'] as $line) SalesQuotationLine::create(['sales_quotation_id' => $quotation->id, 'product_id' => $line['product_id'], 'quantity' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount_amount']]);
@@ -73,7 +76,7 @@ class SalesQuotationIntegrationController extends Controller
     {
         $companyId = $request->user()?->company_id;
         $data = $request->validate([
-            'customer_id' => ['required', 'integer'], 'quote_date' => ['required', 'date'],
+            'customer_id' => ['required', 'integer'], 'quote_date' => ['required', 'date'], 'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'], 'salesperson_id' => ['nullable', 'integer', \Illuminate\Validation\Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'valid_until' => ['nullable', 'date', 'after_or_equal:quote_date'],
             'description' => ['nullable', 'string', 'max:2000'], 'lines' => ['required', 'array', 'min:1'],
             'lines.*.product_id' => ['required', 'integer'], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
@@ -83,13 +86,13 @@ class SalesQuotationIntegrationController extends Controller
         if (!$customer) abort(422, 'Customer is not authorized or inactive.');
         $productIds = collect($data['lines'])->pluck('product_id');
         if ($this->companyScope(Product::query(), $companyId)->whereIn('id', $productIds)->count() !== $productIds->unique()->count()) abort(422, 'One or more products are not authorized for this company.');
-        $quotation = DB::transaction(function () use ($data, $id, $companyId, $request): SalesQuotation {
+        $quotation = DB::transaction(function () use ($data, $id, $companyId, $request, $customer): SalesQuotation {
             $quotation = SalesQuotation::with('lines')->where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
             if (!in_array($quotation->status, ['draft', 'rejected'], true)) abort(422, 'Only draft or rejected quotations can be revised.');
             $before = $quotation->toArray();
             $before['lines'] = $quotation->lines->map(fn (SalesQuotationLine $line): array => $line->only(['product_id', 'quantity', 'unit_price', 'discount_amount']))->values()->all();
             $quotation->update([
-                'customer_id' => $data['customer_id'], 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
+                'customer_id' => $data['customer_id'], 'sales_channel' => array_key_exists('sales_channel', $data) ? $data['sales_channel'] : ($quotation->sales_channel ?: $customer->sales_channel ?: null), 'delivery_method' => array_key_exists('delivery_method', $data) ? $data['delivery_method'] : $quotation->delivery_method, 'salesperson_id' => array_key_exists('salesperson_id', $data) ? $data['salesperson_id'] : ($quotation->salesperson_id ?: $quotation->created_by), 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
                 'description' => $data['description'] ?? null, 'status' => 'submitted', 'approved_by' => null, 'approved_at' => null,
                 'rejection_reason' => null, 'rejected_by' => null, 'rejected_at' => null, 'customer_response_status' => 'pending',
                 'customer_responded_at' => null, 'customer_response_notes' => null, 'customer_portal_token_hash' => null,
@@ -150,7 +153,7 @@ class SalesQuotationIntegrationController extends Controller
                 if ($quotation->status !== 'approved') throw new \RuntimeException('Only approved quotations can be converted.');
                 if ($quotation->valid_until && $quotation->valid_until->isPast()) throw new \RuntimeException('This quotation has expired.');
                 $order = SalesOrder::create([
-                    'company_id' => $quotation->company_id ?: $request->user()?->company_id, 'customer_id' => $quotation->customer_id,
+                    'company_id' => $quotation->company_id ?: $request->user()?->company_id, 'customer_id' => $quotation->customer_id, 'sales_channel' => $quotation->sales_channel ?: $quotation->customer?->sales_channel, 'delivery_method' => $quotation->delivery_method, 'salesperson_id' => $quotation->salesperson_id ?: $quotation->created_by,
                     'order_no' => app(NumberingSequenceService::class)->nextOrFallback('sales_order', 'SO-'.now()->format('YmdHis').'-'.random_int(100, 999), $request->user()?->company_id, $request->user()?->branch_id),
                     'date' => now()->toDateString(), 'requested_date' => $quotation->valid_until, 'description' => 'Converted from quotation '.$quotation->quote_no,
                     'status' => 'submitted', 'created_by' => $request->user()?->id,

@@ -11,6 +11,11 @@ use App\Models\Unit;
 use App\Models\ServiceAsset;
 use App\Models\ServiceAssetMeterReading;
 use App\Models\ServiceMaintenanceSchedule;
+use App\Models\MaintenanceOrder;
+use App\Models\ServiceTechnician;
+use App\Models\HrEmployee;
+use App\Models\HrLeaveRequest;
+use App\Models\HrLeaveType;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Laravel\Sanctum\Sanctum;
@@ -62,6 +67,75 @@ class ServiceMeterTelemetryTest extends TestCase
 
         $this->getJson('/api/service/assets/'.$asset->id.'/meter-readings?per_page=10')
             ->assertOk()->assertJsonPath('data.0.external_reference', 'meter-reading-001');
+    }
+
+    public function test_technician_availability_respects_calendar_and_approved_leave(): void
+    {
+        $company = Company::create(['name' => 'Technician Calendar Co', 'code' => 'TECH-CALENDAR']);
+        $admin = User::factory()->create(['company_id' => $company->id]);
+        $technicianUser = User::factory()->create(['company_id' => $company->id, 'is_active' => true]);
+        $technician = ServiceTechnician::create([
+            'company_id' => $company->id, 'user_id' => $technicianUser->id, 'employee_code' => 'TECH-001',
+            'is_available' => true, 'skills' => ['electrical'], 'working_calendar' => ['weekend_days' => [0, 6], 'holidays' => [], 'shift_start' => '08:00', 'shift_end' => '17:00'],
+        ]);
+        $asset = ServiceAsset::create(['company_id' => $company->id, 'asset_no' => 'TECH-ASSET-001', 'name' => 'Service asset', 'status' => 'active']);
+        $employee = HrEmployee::create(['company_id' => $company->id, 'employee_no' => 'EMP-TECH-001', 'user_id' => $technicianUser->id, 'first_name' => 'Service', 'status' => 'active']);
+        $leaveType = HrLeaveType::create(['company_id' => $company->id, 'code' => 'ANNUAL', 'name' => 'Annual leave', 'annual_entitlement' => 20]);
+
+        Sanctum::actingAs($admin, ['service:read', 'service:write']);
+        $this->getJson('/api/service/technicians/availability?start_at=2026-09-21%2010:00:00&end_at=2026-09-21%2012:00:00')
+            ->assertOk()->assertJsonPath('data.0.id', $technician->id);
+        $this->getJson('/api/service/technicians/availability?start_at=2026-09-21%2010:00:00&end_at=2026-09-21%2012:00:00&required_skills[]=electrical')
+            ->assertOk()->assertJsonPath('data.0.id', $technician->id);
+        $this->getJson('/api/service/technicians/availability?start_at=2026-09-21%2010:00:00&end_at=2026-09-21%2012:00:00&required_skills[]=refrigeration')
+            ->assertOk()->assertJsonCount(0, 'data');
+        $this->getJson('/api/service/technicians/availability?start_at=2026-09-19%2010:00:00&end_at=2026-09-19%2012:00:00')
+            ->assertOk()->assertJsonCount(0, 'data');
+
+        HrLeaveRequest::create(['company_id' => $company->id, 'employee_id' => $employee->id, 'leave_type_id' => $leaveType->id, 'starts_on' => '2026-09-21', 'ends_on' => '2026-09-21', 'days' => 1, 'status' => 'approved']);
+        $this->getJson('/api/service/technicians/availability?start_at=2026-09-21%2010:00:00&end_at=2026-09-21%2012:00:00')
+            ->assertOk()->assertJsonCount(0, 'data');
+        $this->postJson('/api/service/orders', [
+            'asset_id' => $asset->id, 'maintenance_type' => 'corrective', 'scheduled_date' => '2026-09-21',
+            'scheduled_start_at' => '2026-09-21 10:00:00', 'scheduled_end_at' => '2026-09-21 12:00:00', 'assigned_to' => $technicianUser->id,
+        ])->assertStatus(422)->assertJsonPath('message', 'The technician is outside working hours, on a non-working day, or on approved leave for this window.');
+    }
+
+    public function test_service_order_feed_supports_scheduled_window_filters(): void
+    {
+        $company = Company::create(['name' => 'Service Calendar Feed Co', 'code' => 'SERVICE-CALENDAR-FEED']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $asset = ServiceAsset::create(['company_id' => $company->id, 'asset_no' => 'CAL-FEED-ASSET', 'name' => 'Calendar feed asset', 'status' => 'active']);
+        MaintenanceOrder::create([
+            'company_id' => $company->id, 'order_no' => 'CAL-FEED-IN', 'asset_id' => $asset->id,
+            'maintenance_type' => 'preventive', 'status' => 'planned', 'scheduled_date' => '2026-09-22',
+            'scheduled_start_at' => '2026-09-22 10:00:00', 'scheduled_end_at' => '2026-09-22 11:00:00',
+        ]);
+        MaintenanceOrder::create([
+            'company_id' => $company->id, 'order_no' => 'CAL-FEED-OUT', 'asset_id' => $asset->id,
+            'maintenance_type' => 'preventive', 'status' => 'planned', 'scheduled_date' => '2026-09-30',
+            'scheduled_start_at' => '2026-09-30 10:00:00', 'scheduled_end_at' => '2026-09-30 11:00:00',
+        ]);
+
+        Sanctum::actingAs($user, ['service:read']);
+        $this->getJson('/api/service/orders?scheduled_from=2026-09-22%2000:00:00&scheduled_to=2026-09-23%2023:59:59')
+            ->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.order_no', 'CAL-FEED-IN');
+        $this->getJson('/api/service/orders?scheduled_from=2026-09-23&scheduled_to=2026-09-22')
+            ->assertStatus(422);
+    }
+
+    public function test_dispatch_calendar_groups_orders_and_reports_technician_workload(): void
+    {
+        $company = Company::create(['name' => 'Service Calendar API Co', 'code' => 'SERVICE-CALENDAR-API']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $technicianUser = User::factory()->create(['company_id' => $company->id, 'is_active' => true]);
+        $technician = ServiceTechnician::create(['company_id' => $company->id, 'user_id' => $technicianUser->id, 'employee_code' => 'CAL-TECH-001', 'is_available' => true, 'working_calendar' => ['weekend_days' => [0, 6], 'holidays' => [], 'shift_start' => '08:00', 'shift_end' => '17:00']]);
+        $asset = ServiceAsset::create(['company_id' => $company->id, 'asset_no' => 'CAL-API-ASSET', 'name' => 'Calendar API asset', 'status' => 'active']);
+        MaintenanceOrder::create(['company_id' => $company->id, 'order_no' => 'CAL-API-001', 'asset_id' => $asset->id, 'maintenance_type' => 'corrective', 'status' => 'planned', 'scheduled_date' => '2026-09-22', 'scheduled_start_at' => '2026-09-22 10:00:00', 'scheduled_end_at' => '2026-09-22 12:00:00', 'estimated_hours' => 2, 'assigned_to' => $technicianUser->id]);
+        Sanctum::actingAs($user, ['service:read']);
+        $this->getJson('/api/service/dispatch/calendar?start_date=2026-09-22&end_date=2026-09-23')
+            ->assertOk()->assertJsonPath('data.days.0.orders.0.order_no', 'CAL-API-001')->assertJsonPath('data.technicians.0.order_count', 1)->assertJsonPath('data.technicians.0.estimated_hours', 2)->assertJsonPath('data.technicians.0.capacity_hours', 18)->assertJsonPath('data.technicians.0.utilization_percent', 11.11)->assertJsonPath('data.technicians.0.daily.0.date', '2026-09-22')->assertJsonPath('data.technicians.0.daily.0.estimated_hours', 2)->assertJsonPath('data.technicians.0.daily.0.utilization_percent', 22.22)->assertJsonPath('data.unassigned_order_count', 0);
+        $this->getJson('/api/service/dispatch/calendar?start_date=2026-09-01&end_date=2026-10-15')->assertStatus(422);
     }
 
     public function test_service_asset_can_link_to_a_tenant_serial_for_traceability(): void

@@ -3,6 +3,8 @@
 namespace Tests\Feature;
 
 use App\Models\Company;
+use App\Models\Permission;
+use App\Models\Role;
 use App\Models\Supplier;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -27,7 +29,12 @@ class SupplierCorrectiveActionTest extends TestCase
         $this->patchJson('/api/integration/supplier-corrective-actions/'.$id, ['status' => 'closed', 'resolution' => 'Supplier added a delivery-control review.'])->assertOk()->assertJsonPath('data.status', 'closed');
         $this->getJson('/api/integration/supplier-corrective-actions?status=closed')->assertOk()->assertJsonPath('data.0.id', $id);
         $this->getJson('/api/integration/supplier-corrective-actions/summary?from=2026-01-01&to=2026-03-31&include_trend=1')->assertOk()->assertJsonPath('data.total', 1)->assertJsonPath('data.closed', 1)->assertJsonPath('data.overdue', 0)->assertJsonCount(3, 'data.trend');
-        $this->getJson('/api/integration/supplier-performance?from=2026-01-01&to=2026-03-31&include_trend=1')->assertOk()->assertJsonPath('meta.trend_granularity', 'month')->assertJsonCount(3, 'trend');
+        $this->getJson('/api/integration/supplier-performance?from=2026-01-01&to=2026-03-31&include_trend=1')->assertOk()->assertJsonPath('meta.trend_granularity', 'month')->assertJsonCount(3, 'trend')->assertJsonStructure(['trend' => [['invoiced_quantity', 'invoiced_value', 'price_variance', 'price_variance_amount']]]);
+        $permissions = collect(['reports.view', 'reports.export'])->map(fn (string $code): Permission => Permission::create(['code' => $code, 'name' => $code, 'module' => 'reports']));
+        $role = Role::create(['code' => 'supplier-performance-viewer', 'name' => 'Supplier performance viewer', 'is_active' => true]);
+        $role->permissions()->attach($permissions->pluck('id')->all());
+        $user->roles()->attach($role->id);
+        $this->actingAs($user)->get('/procurement/supplier-performance?from=2026-01-01&to=2026-12-31&supplier_id='.$supplier->id)->assertOk()->assertSee('CAPA')->assertSee('Price variance amount')->assertSee('1');
         $this->assertDatabaseHas('supplier_corrective_actions', ['id' => $id, 'status' => 'closed', 'closed_by' => $user->id]);
         $this->assertDatabaseHas('audit_logs', ['action' => 'supplier_corrective_action.updated', 'auditable_id' => $id]);
     }

@@ -15,6 +15,7 @@ use App\Services\NumberingSequenceService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use Carbon\Carbon;
 
 class PurchaseInvoiceController extends Controller
 {
@@ -70,7 +71,7 @@ class PurchaseInvoiceController extends Controller
             return back()->withErrors(['currency_code' => $exception->getMessage()])->withInput();
         }
         $supplier = Supplier::where('company_id', $companyId)->findOrFail($order->supplier_id);
-        $taxExempt = (bool) $supplier->tax_exempt;
+        $taxExempt = $supplier->taxExemptionIsActive(Carbon::parse($data['invoice_date']));
         $taxExemptionNumber = Supplier::whereKey($order->supplier_id)->value('tax_exemption_number');
         $invoice = DB::transaction(function () use ($data, $currency, $exchangeRate, $taxExempt, $taxExemptionNumber, $supplier, $companyId): PurchaseInvoice {
             $order = PurchaseOrder::where('company_id', $companyId)->findOrFail($data['purchase_order_id']);
@@ -78,9 +79,9 @@ class PurchaseInvoiceController extends Controller
             $dueDate = $data['due_date'] ?? \Carbon\CarbonImmutable::parse($data['invoice_date'])->addDays((int) $supplier->payment_terms_days)->toDateString();
             $invoice = PurchaseInvoice::create(['company_id' => $companyId, 'invoice_no' => $data['invoice_no'] ?: app(NumberingSequenceService::class)->nextOrFallback('purchase_invoice', 'PINV-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id), 'supplier_id' => $order->supplier_id, 'purchase_order_id' => $order->id, 'invoice_date' => $data['invoice_date'], 'due_date' => $dueDate, 'currency_code' => $currency, 'exchange_rate' => $exchangeRate, 'tax_mode' => $taxMode, 'tax_exempt' => $taxExempt, 'tax_exemption_number' => $taxExempt ? $taxExemptionNumber : null, 'tax_jurisdiction' => $supplier->tax_jurisdiction, 'description' => $data['description'] ?? null, 'created_by' => auth()->id()]);
             foreach ($data['line_id'] as $index => $lineId) {
-                $poLine = $order->lines()->whereKey($lineId)->firstOrFail(); $qty = (float) $data['quantity'][$index]; $price = (float) $data['unit_price'][$index]; $lineSubtotal = $qty * $price; $taxDefinition = $taxExempt || isset($data['tax_rate'][$index]) ? null : app(TaxRateResolver::class)->taxFor($poLine->product, $data['invoice_date'], $supplier->tax_jurisdiction); $rate = $taxExempt ? 0 : (isset($data['tax_rate'][$index]) ? (float) $data['tax_rate'][$index] : (float) ($taxDefinition?->rate ?? $poLine->product?->tax_rate ?? 0)); $taxResult = $taxMode === 'inclusive' ? app(\App\Services\TaxCalculationService::class)->inclusive($lineSubtotal, $rate) : ($taxDefinition?->components?->isNotEmpty() ? app(\App\Services\TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(\App\Services\TaxCalculationService::class)->exclusive($lineSubtotal, $rate)]); $lineTax = $taxResult['tax'];
+                $poLine = $order->lines()->whereKey($lineId)->firstOrFail(); $qty = (float) $data['quantity'][$index]; $price = (float) $data['unit_price'][$index]; $lineSubtotal = $qty * $price; $taxDefinition = $taxExempt || isset($data['tax_rate'][$index]) ? null : app(TaxRateResolver::class)->taxFor($poLine->product, $data['invoice_date'], $supplier->tax_jurisdiction); $rate = $taxExempt ? 0 : (isset($data['tax_rate'][$index]) ? (float) $data['tax_rate'][$index] : (float) ($taxDefinition?->rate ?? $poLine->product?->tax_rate ?? 0)); $taxResult = $taxMode === 'inclusive' ? ($taxDefinition?->components?->isNotEmpty() ? app(\App\Services\TaxCalculationService::class)->inclusiveComponents($lineSubtotal, $taxDefinition->components) : app(\App\Services\TaxCalculationService::class)->inclusive($lineSubtotal, $rate)) : ($taxDefinition?->components?->isNotEmpty() ? app(\App\Services\TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(\App\Services\TaxCalculationService::class)->exclusive($lineSubtotal, $rate)]); $lineTax = $taxResult['tax'];
                 $subtotal += $taxResult['net']; $tax += $lineTax;
-                PurchaseInvoiceLine::create(['purchase_invoice_id' => $invoice->id, 'purchase_order_line_id' => $poLine->id, 'product_id' => $poLine->product_id, 'quantity' => $qty, 'unit_price' => $price, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)]);
+                PurchaseInvoiceLine::create(['purchase_invoice_id' => $invoice->id, 'purchase_order_line_id' => $poLine->id, 'product_id' => $poLine->product_id, 'quantity' => $qty, 'unit_price' => $price, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'tax_components' => $taxResult['components'] ?? null, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)]);
                 $auditLines[] = ['purchase_order_line_id' => $poLine->id, 'product_id' => $poLine->product_id, 'quantity' => $qty, 'unit_price' => $price, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)];
             }
             $invoice->update(['subtotal_amount' => $subtotal, 'tax_amount' => $tax, 'total_amount' => $subtotal + $tax]);

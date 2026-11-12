@@ -45,11 +45,15 @@ class InvoiceController extends Controller
 
     private function companyInvoice(int $id): Invoice
     {
-        return Invoice::where('company_id', $this->companyId())->findOrFail($id);
+        return Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->findOrFail($id);
     }
 
     public function InvoiceAll(){
-        $allData = Invoice::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
+        $allData = Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
             return view('backend.invoice.invoice_all',compact('allData'));
 
     } // End Method
@@ -116,9 +120,10 @@ class InvoiceController extends Controller
         $taxTotal = 0;
         $netTotal = 0;
         $lineTaxes = [];
+        $lineComponents = [];
         $taxMode = $request->input('tax_mode') ?: app(\App\Services\ErpSettingService::class)->get('default_tax_mode', 'exclusive');
         $customer = (int) $request->input('customer_id') > 0 ? Customer::where(fn ($query) => $query->where('company_id', $this->companyId())->orWhereNull('company_id'))->find((int) $request->input('customer_id')) : null;
-        $taxExempt = (bool) ($customer?->tax_exempt);
+        $taxExempt = $customer?->taxExemptionIsActive(Carbon::parse($request->date)) ?? false;
         $taxExemptionNumber = $customer?->tax_exemption_number;
 
         foreach ($request->product_id as $key => $productId) {
@@ -130,9 +135,10 @@ class InvoiceController extends Controller
             $taxDefinition = $taxExempt ? null : app(TaxRateResolver::class)->taxFor($product, $request->date, $customer?->tax_jurisdiction);
             $taxRate = $taxDefinition?->rate !== null ? (float) $taxDefinition->rate : (float) ($product->tax_rate ?? 0);
             $taxResult = $taxMode === 'inclusive'
-                ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $taxRate)
+                ? ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->inclusiveComponents($lineSubtotal, $taxDefinition->components) : app(TaxCalculationService::class)->inclusive($lineSubtotal, $taxRate))
                 : ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $taxRate)]);
             $lineTaxes[$key] = $taxResult['tax'];
+            $lineComponents[$key] = $taxResult['components'] ?? null;
             $netTotal += $taxResult['net'];
             $taxTotal += $lineTaxes[$key];
         }
@@ -167,6 +173,9 @@ class InvoiceController extends Controller
     $invoice->date = date('Y-m-d',strtotime($request->date));
     $invoice->due_date = $request->filled('due_date') ? date('Y-m-d', strtotime($request->due_date)) : null;
     $invoice->store_id = $storeId;
+    $invoice->sales_channel = $request->filled('sales_channel') ? trim((string) $request->input('sales_channel')) : ($customer?->sales_channel ?: null);
+    $invoice->delivery_method = $request->filled('delivery_method') ? (string) $request->input('delivery_method') : null;
+    $invoice->salesperson_id = $request->filled('salesperson_id') ? (int) $request->input('salesperson_id') : Auth::id();
     $invoice->description = $request->description;
     $invoice->currency_code = strtoupper($request->currency_code ?: (auth()->user()?->company?->base_currency ?? 'USD'));
     $invoice->tax_mode = $taxMode;
@@ -182,7 +191,7 @@ class InvoiceController extends Controller
     $invoice->status = '0';
     $invoice->created_by = Auth::user()->id; 
 
-    DB::transaction(function() use($request,$invoice,$discount,$promotion,$estimatedAmount,$netTotal,$taxTotal,$lineTaxes,$taxExempt){
+    DB::transaction(function() use($request,$invoice,$discount,$promotion,$estimatedAmount,$netTotal,$taxTotal,$lineTaxes,$lineComponents,$taxExempt){
         $companyId = $this->companyId();
         if ($invoice->save()) {
            $invoice->company_id = $companyId;
@@ -207,6 +216,7 @@ class InvoiceController extends Controller
               $invoice_details->selling_price = (float) $request->selling_qty[$i] * (float) $request->unit_price[$i];
               $invoice_details->tax_rate = $taxExempt ? 0 : ($request->product_id[$i] ? (float) $this->visibleProducts()->whereKey($request->product_id[$i])->value('tax_rate') : 0);
               $invoice_details->tax_amount = $lineTaxes[$i] ?? 0;
+              $invoice_details->tax_components = $lineComponents[$i] ?? null;
               $invoice_details->status = '0'; 
               $invoice_details->save(); 
            }
@@ -278,7 +288,9 @@ class InvoiceController extends Controller
 
 
     public function PendingList(){
-        $allData = Invoice::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->whereIn('status',[0, 2])->get();
+        $allData = Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->orderBy('date','desc')->orderBy('id','desc')->whereIn('status',[0, 2])->get();
             return view('backend.invoice.invoice_pending_list',compact('allData'));
     } // End Method
 
@@ -309,7 +321,9 @@ class InvoiceController extends Controller
 
     public function InvoiceApprove($id){
 
-        $invoice = Invoice::where('company_id', $this->companyId())->with('invoice_details')->findOrFail($id);
+        $invoice = Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->with('invoice_details')->findOrFail($id);
         return view('backend.invoice.invoice_approve',compact('invoice'));
 
     }// End Method
@@ -319,7 +333,9 @@ class InvoiceController extends Controller
         app(\App\Services\ApprovalGuard::class)->assertBeforeTransaction(Invoice::class, (int) $id);
         try {
             DB::transaction(function () use ($id) {
-                $invoice = Invoice::where('company_id', $this->companyId())->lockForUpdate()->with(['invoice_details', 'payment'])->findOrFail($id);
+                $invoice = Invoice::where('company_id', $this->companyId())
+                    ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+                    ->lockForUpdate()->with(['invoice_details', 'payment'])->findOrFail($id);
                 if ((int) $invoice->status !== 0) {
                     throw new \RuntimeException('Only pending invoices can be approved.');
                 }
@@ -391,7 +407,9 @@ class InvoiceController extends Controller
 
         try {
             DB::transaction(function () use ($id, $data): void {
-                $invoice = Invoice::where('company_id', $this->companyId())->lockForUpdate()->findOrFail($id);
+                $invoice = Invoice::where('company_id', $this->companyId())
+                    ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+                    ->lockForUpdate()->findOrFail($id);
                 if ((int) $invoice->status !== 0) throw new \RuntimeException('Only pending invoices can be rejected.');
                 app(\App\Services\ApprovalGuard::class)->assertDifferent($invoice);
                 $before = $invoice->only(['status', 'rejection_reason', 'rejected_by', 'rejected_at']);
@@ -410,13 +428,17 @@ class InvoiceController extends Controller
 
     public function PrintInvoiceList(){
 
-    $allData = Invoice::where('company_id', $this->companyId())->orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
+    $allData = Invoice::where('company_id', $this->companyId())
+        ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+        ->orderBy('date','desc')->orderBy('id','desc')->where('status','1')->get();
        return view('backend.invoice.print_invoice_list',compact('allData'));
     } // End Method
 
 
     public function PrintInvoice($id){
-        $invoice = Invoice::where('company_id', $this->companyId())->with(['invoice_details', 'store'])->findOrFail($id);
+        $invoice = Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->with(['invoice_details', 'store'])->findOrFail($id);
         $posSettings = app(StorePosSettingsService::class)->normalize($invoice->store?->pos_settings) ?? [];
         return view('backend.pdf.invoice_pdf', compact('invoice', 'posSettings'));
 
@@ -432,7 +454,9 @@ class InvoiceController extends Controller
 
         $sdate = date('Y-m-d',strtotime($request->start_date));
         $edate = date('Y-m-d',strtotime($request->end_date));
-        $allData = Invoice::where('company_id', $this->companyId())->whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
+        $allData = Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
 
 
         $start_date = date('Y-m-d',strtotime($request->start_date));

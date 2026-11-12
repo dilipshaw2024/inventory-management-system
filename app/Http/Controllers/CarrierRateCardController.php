@@ -38,7 +38,7 @@ class CarrierRateCardController extends Controller
         $card = CarrierRateCard::where('company_id', $companyId)->findOrFail($id);
         $data = $this->validated($request, $companyId, $card->id, true);
         $before = $card->toArray();
-        $card->update($data + ['currency_code' => strtoupper($data['currency_code'])]);
+        $card->update($data + (isset($data['currency_code']) ? ['currency_code' => strtoupper($data['currency_code'])] : []));
         app(AuditService::class)->record('carrier_rate_card.updated_from_browser', $card, $before, $card->fresh()->toArray());
         return back()->with(['message' => 'Carrier rate card updated.', 'alert-type' => 'success']);
     }
@@ -61,6 +61,7 @@ class CarrierRateCardController extends Controller
             'origin_zone' => ['sometimes', 'nullable', 'string', 'max:80'], 'destination_zone' => ['sometimes', 'nullable', 'string', 'max:80'],
             'min_weight_kg' => ['sometimes', 'nullable', 'numeric', 'gte:0'], 'max_weight_kg' => ['sometimes', 'nullable', 'numeric', 'gte:min_weight_kg'],
             'base_amount' => [$required, 'numeric', 'gte:0'], 'per_kg_amount' => [$required, 'numeric', 'gte:0'],
+            'minimum_charge' => ['sometimes', 'numeric', 'gte:0'], 'fuel_surcharge_percent' => ['sometimes', 'numeric', 'gte:0', 'lte:100'], 'billable_weight_increment_kg' => ['sometimes', 'numeric', 'gte:0'], 'dimensional_divisor' => ['sometimes', 'numeric', 'gte:0'],
             'currency_code' => [$required, 'string', 'size:3'], 'transit_days' => ['sometimes', 'nullable', 'integer', 'min:0', 'max:365'],
             'valid_from' => ['sometimes', 'nullable', 'date'], 'valid_until' => ['sometimes', 'nullable', 'date', 'after_or_equal:valid_from'],
             'is_active' => ['sometimes', 'boolean'],

@@ -3,6 +3,8 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Customer;
+use App\Models\Supplier;
 use App\Models\Currency;
 use App\Models\ExchangeRate;
 use App\Models\TaxRate;
@@ -28,6 +30,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use Carbon\Carbon;
 use App\Services\Integrations\TaxFilingProviderRegistry;
 use App\Services\Integrations\ExchangeRateProviderRegistry;
 
@@ -105,11 +108,29 @@ class FinanceIntegrationController extends Controller
         $taxCalculator = app(TaxCalculationService::class);
         $taxPrecision = $taxCalculator->precision((int) $companyId);
         $taxKey = static fn (float $rate, ?string $jurisdiction, $classification): string => number_format($rate, 4, '.', '').'|'.($jurisdiction ?: 'UNSPECIFIED').'|'.($classification ? $classification->scheme.':'.$classification->code : 'UNCLASSIFIED');
+        $componentTotals = static function ($lines): array {
+            return collect($lines)->flatMap(function ($line): array {
+                $components = is_array($line) ? ($line['tax_components'] ?? null) : ($line->tax_components ?? null);
+                $tax = (float) (is_array($line) ? ($line['tax_amount'] ?? 0) : ($line->tax_amount ?? 0));
+                $rate = (float) (is_array($line) ? ($line['tax_rate'] ?? 0) : ($line->tax_rate ?? 0));
+                if (!is_array($components) || $components === []) {
+                    return [['code' => '__aggregate__', 'name' => 'Aggregate tax (legacy)', 'component_type' => 'aggregate', 'rate' => $rate, 'base' => null, 'tax' => $tax]];
+                }
+                return collect($components)->map(fn (array $component): array => [
+                    'code' => (string) ($component['code'] ?? ''), 'name' => (string) ($component['name'] ?? ''),
+                    'component_type' => (string) ($component['component_type'] ?? 'other'), 'rate' => (float) ($component['rate'] ?? 0),
+                    'base' => isset($component['base']) ? (float) $component['base'] : null, 'tax' => (float) ($component['tax'] ?? 0),
+                ])->all();
+            })->groupBy('code')->map(function ($items): array {
+                $first = $items->first();
+                return ['code' => $first['code'], 'name' => $first['name'], 'component_type' => $first['component_type'], 'rate' => (float) $first['rate'], 'base' => $items->whereNotNull('base')->sum('base') ?: null, 'tax' => (float) $items->sum('tax')];
+            })->values()->all();
+        };
         $sales = InvoiceDetail::with(['invoice', 'product.classification'])->whereHas('invoice', fn ($query) => $query->whereIn('status', [1, 'approved'])->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->when($classificationId, fn ($query) => $query->whereHas('product', fn ($product) => $product->where('classification_id', $classificationId)))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction, $line->product?->classification));
         $returns = InventoryReturn::with('lines.product.classification')->where('return_type', 'sales')->where('status', 'approved')->whereBetween('date', [$from, $to])->when($jurisdiction !== null, fn ($query) => $query->where('tax_jurisdiction', $jurisdiction))->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->get()->flatMap(fn (InventoryReturn $return) => $return->lines->map(fn ($line): array => ['return' => $return, 'line' => $line]))->filter(fn (array $item): bool => !$classificationId || (int) ($item['line']->product?->classification_id ?? 0) === (int) $classificationId)->groupBy(fn (array $item): string => $taxKey((float) ($item['line']->tax_rate ?? 0), $item['return']->tax_jurisdiction, $item['line']->product?->classification));
         $purchases = PurchaseInvoiceLine::with(['invoice', 'product.classification'])->whereHas('invoice', fn ($query) => $query->where('status', 'approved')->whereBetween('invoice_date', [$from, $to])->when($jurisdiction !== null, fn ($scope) => $scope->where('tax_jurisdiction', $jurisdiction))->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))->when($classificationId, fn ($query) => $query->whereHas('product', fn ($product) => $product->where('classification_id', $classificationId)))->get()->groupBy(fn ($line): string => $taxKey((float) ($line->tax_rate ?? 0), $line->invoice?->tax_jurisdiction, $line->product?->classification));
         $rates = $sales->keys()->merge($returns->keys())->merge($purchases->keys())->unique()->sort()->values();
-        $rows = $rates->map(function ($rate) use ($sales, $returns, $purchases, $taxCalculator, $taxPrecision): array {
+        $rows = $rates->map(function ($rate) use ($sales, $returns, $purchases, $taxCalculator, $taxPrecision, $componentTotals): array {
             $sale = $sales->get($rate, collect()); $return = $returns->get($rate, collect()); $purchase = $purchases->get($rate, collect());
             $returnTaxable = (float) $return->sum(fn (array $item): float => (float) $item['line']->quantity * (float) ($item['line']->unit_price ?? $item['line']->product?->sales_price ?? 0));
             $returnTax = (float) $return->sum(fn (array $item): float => $item['return']->tax_exempt ? 0 : $taxCalculator->exclusive((float) $item['line']->quantity * (float) ($item['line']->unit_price ?? $item['line']->product?->sales_price ?? 0), (float) ($item['line']->tax_rate ?? 0), $taxPrecision));
@@ -120,9 +141,57 @@ class FinanceIntegrationController extends Controller
             [$rateValue, $jurisdiction] = explode('|', $rate, 3);
             $returnClassification = $return->isNotEmpty() ? $return->first()['line']->product?->classification : null;
             $classification = $sale->first()?->product?->classification ?: $purchase->first()?->product?->classification ?: $returnClassification;
-            return ['rate' => (float) $rateValue, 'jurisdiction' => $jurisdiction === 'UNSPECIFIED' ? null : $jurisdiction, 'classification' => $classification ? ['id' => $classification->id, 'scheme' => $classification->scheme, 'code' => $classification->code, 'jurisdiction' => $classification->jurisdiction] : null, 'sales' => ['taxable' => $salesTaxable, 'tax' => $salesTax, 'documents' => $sale->pluck('invoice_id')->unique()->count(), 'return_documents' => $return->pluck('return.id')->unique()->count()], 'purchases' => ['taxable' => $purchaseTaxable, 'tax' => $purchaseTax, 'documents' => $purchase->pluck('purchase_invoice_id')->unique()->count()], 'net_tax' => $salesTax - $purchaseTax];
+            return ['rate' => (float) $rateValue, 'jurisdiction' => $jurisdiction === 'UNSPECIFIED' ? null : $jurisdiction, 'classification' => $classification ? ['id' => $classification->id, 'scheme' => $classification->scheme, 'code' => $classification->code, 'jurisdiction' => $classification->jurisdiction] : null, 'sales' => ['taxable' => $salesTaxable, 'tax' => $salesTax, 'documents' => $sale->pluck('invoice_id')->unique()->count(), 'return_documents' => $return->pluck('return.id')->unique()->count(), 'tax_components' => $componentTotals($sale)], 'purchases' => ['taxable' => $purchaseTaxable, 'tax' => $purchaseTax, 'documents' => $purchase->pluck('purchase_invoice_id')->unique()->count(), 'tax_components' => $componentTotals($purchase)], 'net_tax' => $salesTax - $purchaseTax];
         })->values();
         return response()->json(['data' => $rows, 'summary' => ['sales_tax' => (float) $rows->sum('sales.tax'), 'purchase_tax' => (float) $rows->sum('purchases.tax'), 'net_tax' => (float) $rows->sum('net_tax'), 'sales_documents' => (int) $rows->sum('sales.documents'), 'return_documents' => (int) $rows->sum('sales.return_documents'), 'purchase_documents' => (int) $rows->sum('purchases.documents')], 'meta' => ['from' => $from, 'to' => $to, 'jurisdiction' => $jurisdiction, 'classification_id' => $classificationId, 'rates' => $rows->count()]]);
+    }
+
+    public function taxExemptionCertificates(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for tax-exemption monitoring.');
+        $data = $request->validate([
+            'party_type' => ['nullable', Rule::in(['customer', 'supplier'])],
+            'status' => ['nullable', Rule::in(['active', 'expired', 'expiring'])],
+            'days' => ['nullable', 'integer', 'min:1', 'max:3650'],
+            'expires_before' => ['nullable', 'date'],
+            'updated_since' => ['nullable', 'date'],
+            'page' => ['nullable', 'integer', 'min:1'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+
+        $today = now()->startOfDay();
+        $cutoff = ! empty($data['expires_before']) ? Carbon::parse($data['expires_before'])->endOfDay() : $today->copy()->addDays((int) ($data['days'] ?? 90))->endOfDay();
+        $status = $data['status'] ?? null;
+        $types = ! empty($data['party_type']) ? [$data['party_type']] : ['customer', 'supplier'];
+        $rows = collect();
+
+        foreach ($types as $type) {
+            $model = $type === 'customer' ? Customer::class : Supplier::class;
+            $parties = $model::query()->where('company_id', $companyId)->where('tax_exempt', true)
+                ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+                ->when($status === 'expired', fn ($query) => $query->whereNotNull('tax_exemption_expires_at')->whereDate('tax_exemption_expires_at', '<', $today))
+                ->when($status === 'active', fn ($query) => $query->where(fn ($scope) => $scope->whereNull('tax_exemption_expires_at')->orWhereDate('tax_exemption_expires_at', '>=', $today)))
+                ->when($status === 'expiring', fn ($query) => $query->whereBetween('tax_exemption_expires_at', [$today->toDateString(), $cutoff->toDateString()]))
+                ->when($status === null && array_key_exists('expires_before', $data), fn ($query) => $query->whereNotNull('tax_exemption_expires_at')->whereDate('tax_exemption_expires_at', '<=', $cutoff))
+                ->orderBy('tax_exemption_expires_at')->orderBy('id')->get();
+
+            $rows = $rows->merge($parties->map(function ($party) use ($type, $today, $cutoff, $status): array {
+                $expiresAt = $party->tax_exemption_expires_at;
+                $expired = $expiresAt && $expiresAt->startOfDay()->lt($today);
+                $expiring = $expiresAt && !$expired && $expiresAt->startOfDay()->lte($cutoff->startOfDay());
+                return [
+                    'party_type' => $type, 'party_id' => $party->id, 'code' => $party->code, 'name' => $party->name,
+                    'tax_exemption_number' => $party->tax_exemption_number, 'expires_at' => $expiresAt?->toDateString(),
+                    'status' => $expired ? 'expired' : ($status === 'expiring' || ($status === null && $expiring) ? 'expiring' : 'active'),
+                    'days_until_expiry' => $expiresAt ? $today->diffInDays($expiresAt->startOfDay(), false) : null,
+                ];
+            }));
+        }
+
+        $rows = $rows->sortBy(fn (array $row): array => [$row['expires_at'] ?? '9999-12-31', $row['party_type'], $row['party_id']])->values();
+        $page = (int) ($data['page'] ?? 1); $perPage = (int) ($data['per_page'] ?? 50); $total = $rows->count();
+        return response()->json(['data' => $rows->forPage($page, $perPage)->values(), 'meta' => ['page' => $page, 'per_page' => $perPage, 'total' => $total, 'pages' => (int) max(1, ceil($total / $perPage)), 'status' => $status, 'as_of' => $today->toDateString(), 'expiring_through' => $cutoff->toDateString()]]);
     }
 
     public function taxReconciliation(Request $request): JsonResponse

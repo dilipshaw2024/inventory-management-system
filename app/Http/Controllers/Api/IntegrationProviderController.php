@@ -9,10 +9,12 @@ use App\Services\Integrations\CarrierTrackingAdapterRegistry;
 use App\Services\Integrations\CarrierTrackingPoller;
 use App\Services\Integrations\EInvoiceProviderRegistry;
 use App\Services\Integrations\ExchangeRateProviderRegistry;
+use App\Services\Integrations\StatutoryRemittanceProviderRegistry;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use App\Models\EInvoiceProviderSetting;
 use App\Models\CarrierTrackingProviderSetting;
+use App\Models\HrStatutoryRemittanceProviderSetting;
 
 class IntegrationProviderController extends Controller
 {
@@ -22,6 +24,7 @@ class IntegrationProviderController extends Controller
         BankStatementAdapterRegistry $bankStatements,
         CarrierTrackingAdapterRegistry $carrierTracking,
         ExchangeRateProviderRegistry $exchangeRates,
+        StatutoryRemittanceProviderRegistry $statutoryRemittances,
     ): JsonResponse {
         $eInvoiceKeys = $eInvoices->keys();
         $tenantHttpSetting = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)
@@ -33,6 +36,11 @@ class IntegrationProviderController extends Controller
             ->where('provider', 'http')->where('is_active', true)->first();
         $tenantCarrierEndpoint = is_array($tenantCarrierSetting?->connection_config)
             ? trim((string) ($tenantCarrierSetting->connection_config['endpoint'] ?? ''))
+            : '';
+        $tenantStatutorySetting = HrStatutoryRemittanceProviderSetting::where('company_id', $request->user()?->company_id)
+            ->where('provider', 'http')->where('is_active', true)->first();
+        $tenantStatutoryEndpoint = is_array($tenantStatutorySetting?->connection_config)
+            ? trim((string) ($tenantStatutorySetting->connection_config['endpoint'] ?? ''))
             : '';
 
         return response()->json([
@@ -61,6 +69,11 @@ class IntegrationProviderController extends Controller
                     'supports_sync' => true,
                     'ready' => $key !== 'http' || trim((string) config('integrations.exchange_rate_http_endpoint')) !== '',
                 ], $exchangeRates->keys())],
+                'statutory_remittance' => ['providers' => array_map(fn (string $key): array => [
+                    'key' => $key,
+                    'supports_submission' => true,
+                    'ready' => $key !== 'http' || $tenantStatutoryEndpoint !== '' || trim((string) config('integrations.statutory_remittance_http_endpoint')) !== '',
+                ], $statutoryRemittances->keys())],
             ],
         ]);
     }

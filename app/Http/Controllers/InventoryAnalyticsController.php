@@ -4,19 +4,23 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
+use App\Models\Customer;
 use App\Services\ProductSpreadsheetService;
 
 class InventoryAnalyticsController extends Controller
 {
     public function index(Request $request)
     {
-        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'abc_basis' => ['nullable', 'in:revenue,movement,value'], 'category_id' => ['nullable', 'integer']]);
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'abc_basis' => ['nullable', 'in:revenue,movement,value'], 'category_id' => ['nullable', 'integer'], 'customer_id' => ['nullable', 'integer']]);
         $from = $data['from'] ?? now()->subYear()->toDateString();
         $to = $data['to'] ?? now()->toDateString();
         $abcBasis = $data['abc_basis'] ?? 'revenue';
         $categoryId = $data['category_id'] ?? null;
-        $rows = $this->analyticsRows($from, $to, $abcBasis, $categoryId);
-        return view('backend.stock.inventory_analytics', compact('rows', 'from', 'to', 'abcBasis', 'categoryId'));
+        $customerId = $data['customer_id'] ?? null;
+        $this->authorizeCustomer($customerId);
+        $rows = $this->analyticsRows($from, $to, $abcBasis, $categoryId, $customerId);
+        $customers = Customer::where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))->where('is_active', true)->orderBy('name')->get(['id', 'name']);
+        return view('backend.stock.inventory_analytics', compact('rows', 'from', 'to', 'abcBasis', 'categoryId', 'customerId', 'customers'));
     }
 
     public function export(Request $request, ProductSpreadsheetService $spreadsheet): Response
@@ -27,15 +31,18 @@ class InventoryAnalyticsController extends Controller
             'format' => ['nullable', 'in:csv,xlsx'],
             'abc_basis' => ['nullable', 'in:revenue,movement,value'],
             'category_id' => ['nullable', 'integer'],
+            'customer_id' => ['nullable', 'integer'],
         ]);
         $from = $validated['from'];
         $to = $validated['to'];
         $abcBasis = $validated['abc_basis'] ?? 'revenue';
         $categoryId = $validated['category_id'] ?? null;
-        $rows = $this->analyticsRows($from, $to, $abcBasis, $categoryId);
+        $customerId = $validated['customer_id'] ?? null;
+        $this->authorizeCustomer($customerId);
+        $rows = $this->analyticsRows($from, $to, $abcBasis, $categoryId, $customerId);
         $format = $validated['format'] ?? 'csv';
-        $headers = ['Product', 'Category', 'Revenue', 'COGS', 'Gross profit', 'Margin %', 'Quantity sold', 'Opening stock', 'Average stock', 'Inventory value', 'Turnover', 'Days of inventory', 'ABC basis', 'ABC'];
-        $values = $rows->map(fn (array $row): array => [$row['product']->name, $row['product']->category?->name ?: 'Uncategorized', number_format($row['revenue'], 2, '.', ''), number_format($row['cogs'], 2, '.', ''), number_format($row['gross_profit'], 2, '.', ''), number_format($row['margin_percent'], 2, '.', ''), number_format($row['quantity_sold'], 3, '.', ''), number_format($row['opening_stock'], 3, '.', ''), number_format($row['average_stock'], 3, '.', ''), number_format($row['inventory_value'], 2, '.', ''), number_format($row['turnover'], 2, '.', ''), $row['days_of_inventory'] === null ? '' : number_format($row['days_of_inventory'], 2, '.', ''), $row['abc_basis'] ?? 'revenue', $row['abc']])->all();
+        $headers = ['Product', 'Category', 'Customer', 'Gross revenue', 'Discount', 'Revenue', 'COGS', 'Gross profit', 'Margin %', 'Quantity sold', 'Opening stock', 'Average stock', 'Inventory value', 'Turnover', 'Days of inventory', 'ABC basis', 'ABC'];
+        $values = $rows->map(fn (array $row): array => [$row['product']->name, $row['product']->category?->name ?: 'Uncategorized', $row['customer']?->name ?: 'All customers', number_format($row['gross_revenue'], 2, '.', ''), number_format($row['discount_amount'], 2, '.', ''), number_format($row['revenue'], 2, '.', ''), number_format($row['cogs'], 2, '.', ''), number_format($row['gross_profit'], 2, '.', ''), number_format($row['margin_percent'], 2, '.', ''), number_format($row['quantity_sold'], 3, '.', ''), number_format($row['opening_stock'], 3, '.', ''), number_format($row['average_stock'], 3, '.', ''), number_format($row['inventory_value'], 2, '.', ''), number_format($row['turnover'], 2, '.', ''), $row['days_of_inventory'] === null ? '' : number_format($row['days_of_inventory'], 2, '.', ''), $row['abc_basis'] ?? 'revenue', $row['abc']])->all();
 
         if ($format === 'xlsx') {
             return response($spreadsheet->write($headers, $values), 200, [
@@ -52,8 +59,13 @@ class InventoryAnalyticsController extends Controller
         }, 'inventory-analytics-'.$from.'-to-'.$to.'.csv', ['Content-Type' => 'text/csv']);
     }
 
-    private function analyticsRows(string $from, string $to, string $abcBasis = 'revenue', ?int $categoryId = null)
+    private function analyticsRows(string $from, string $to, string $abcBasis = 'revenue', ?int $categoryId = null, ?int $customerId = null)
     {
-        return app(\App\Services\InventoryAnalyticsService::class)->rowsForCompany((int) auth()->user()?->company_id, $from, $to, null, $abcBasis, $categoryId);
+        return app(\App\Services\InventoryAnalyticsService::class)->rowsForCompany((int) auth()->user()?->company_id, $from, $to, null, $abcBasis, $categoryId, $customerId);
+    }
+
+    private function authorizeCustomer(?int $customerId): void
+    {
+        if ($customerId && !Customer::whereKey($customerId)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))->exists()) abort(422, 'Customer is not authorized for this company.');
     }
 }

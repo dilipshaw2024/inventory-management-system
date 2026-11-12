@@ -66,10 +66,11 @@ use App\Http\Controllers\InventoryDocumentController;
 use App\Http\Controllers\Pos\StockReservationController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\CostCenterController;
+use App\Http\Controllers\ErpHealthController;
 
-Route::get('/', function () {
-    return view('welcome');
-});
+Route::view('/', 'welcome');
+
+Route::get('/health/erp', ErpHealthController::class)->name('health.erp');
  
 
 Route::controller(DemoController::class)->group(function () {
@@ -450,6 +451,8 @@ Route::middleware(['auth', 'permission:accounting.manage'])->controller(Accounti
     Route::get('/cash-flow', 'cashFlow')->name('cash-flow');
     Route::get('/recurring-journals', 'recurringJournals')->name('recurring-journals');
     Route::get('/tax-report', 'taxReport')->name('tax-report');
+    Route::get('/tax-exemption-certificates', 'taxExemptionCertificates')->name('tax-exemption-certificates');
+    Route::get('/tax-exemption-certificates/export', 'taxExemptionCertificatesExport')->name('tax-exemption-certificates.export')->middleware('permission:reports.export');
     Route::get('/tax-filings', [\App\Http\Controllers\TaxFilingController::class, 'index'])->name('tax-filings');
     Route::post('/tax-filings', [\App\Http\Controllers\TaxFilingController::class, 'create'])->name('tax-filings.create');
     Route::post('/tax-filing-providers', [\App\Http\Controllers\TaxFilingController::class, 'storeProvider'])->name('tax-filing-providers.store');
@@ -702,6 +705,7 @@ Route::middleware(['auth', 'permission:accounting.manage'])->controller(FinanceC
     Route::post('/currency', 'currency')->name('currency')->middleware('permission:accounting.manage');
     Route::post('/rate', 'rate')->name('rate')->middleware('permission:accounting.manage');
     Route::post('/tax', 'tax')->name('tax')->middleware('permission:accounting.manage');
+    Route::patch('/tax/{id}', 'updateTax')->name('tax.update')->middleware('permission:accounting.manage');
     Route::post('/fiscal-year', 'fiscalYear')->name('fiscal')->middleware('permission:accounting.manage');
     Route::post('/fiscal-year/{id}/close', 'closeFiscalYear')->name('fiscal.close')->middleware('permission:accounting.manage');
     Route::post('/fiscal-year/{id}/reopen', 'reopenFiscalYear')->name('fiscal.reopen')->middleware('permission:accounting.manage');
@@ -717,13 +721,17 @@ Route::middleware(['auth', 'permission:accounting.manage'])->controller(\App\Htt
 Route::middleware(['auth', 'permission:service.manage'])->controller(ServiceMaintenanceController::class)->prefix('erp/service')->name('erp.service.')->group(function () {
     Route::get('/', 'index')->name('index');
     Route::get('/add', 'create')->name('create');
+    Route::get('/dispatch', 'dispatchBoard')->name('dispatch');
     Route::post('/asset', 'asset')->name('asset')->middleware('permission:service.manage');
     Route::post('/technician', 'technician')->name('technician')->middleware('permission:service.manage');
+    Route::get('/technician/{id}/edit', 'editTechnician')->name('technician.edit')->middleware('permission:service.manage');
+    Route::patch('/technician/{id}', 'updateTechnician')->name('technician.update')->middleware('permission:service.manage');
     Route::post('/schedule', 'schedule')->name('schedule')->middleware('permission:service.manage');
     Route::post('/schedule/{id}/generate', 'generateSchedule')->name('schedule.generate')->middleware('permission:service.manage');
     Route::post('/request', 'request')->name('request')->middleware('permission:service.manage');
     Route::post('/request/{id}/assign', 'assignRequest')->name('request.assign')->middleware('permission:service.manage');
     Route::post('/order', 'order')->name('order')->middleware('permission:service.manage');
+    Route::post('/order/{id}/schedule', 'scheduleOrder')->name('order.schedule')->middleware('permission:service.manage');
     Route::post('/order/{id}/status', 'updateOrderStatus')->name('order.status')->middleware('permission:service.manage');
     Route::get('/order/{id}/parts', 'parts')->name('parts')->middleware('permission:service.manage');
     Route::post('/order/{id}/parts/reserve', 'reservePart')->name('parts.reserve')->middleware('permission:service.manage');

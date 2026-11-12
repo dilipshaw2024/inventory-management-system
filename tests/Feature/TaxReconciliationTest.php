@@ -42,7 +42,7 @@ class TaxReconciliationTest extends TestCase
         $category = Category::create(['name' => 'Tax category', 'status' => 1]);
         $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Taxable item', 'quantity' => 0, 'status' => 1]);
         $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'INV-TAX-1', 'date' => '2026-09-15', 'status' => 1, 'tax_jurisdiction' => 'IN', 'subtotal_amount' => 100, 'tax_amount' => 10, 'total_amount' => 110]);
-        $invoice->invoice_details()->create(['date' => '2026-09-15', 'product_id' => $product->id, 'selling_qty' => 1, 'unit_price' => 100, 'selling_price' => 100, 'tax_rate' => 10, 'tax_amount' => 10, 'status' => 1]);
+        $invoice->invoice_details()->create(['date' => '2026-09-15', 'product_id' => $product->id, 'selling_qty' => 1, 'unit_price' => 100, 'selling_price' => 100, 'tax_rate' => 10, 'tax_amount' => 10, 'tax_components' => [['code' => 'STATE', 'name' => 'State tax', 'component_type' => 'state', 'rate' => 10, 'base' => 100, 'tax' => 10]], 'status' => 1]);
         $entry = JournalEntry::create(['company_id' => $company->id, 'entry_no' => 'JE-TAX-1', 'date' => '2026-09-15', 'description' => 'Tax control posting', 'status' => 'draft']);
         $entry->lines()->create(['account_id' => $taxAccount->id, 'debit' => 0, 'credit' => 8, 'currency_code' => 'USD', 'exchange_rate' => 1]);
         $entry->update(['status' => 'posted', 'posted_by' => $user->id, 'posted_at' => now()]);
@@ -52,6 +52,8 @@ class TaxReconciliationTest extends TestCase
 
         $response->assertOk()
             ->assertJsonPath('summary.expected_net_tax', 10)
+            ->assertJsonPath('data.0.sales.tax_components.0.code', 'STATE')
+            ->assertJsonPath('data.0.sales.tax_components.0.tax', 10)
             ->assertJsonPath('summary.posted_tax_control_net', 8)
             ->assertJsonPath('summary.variance', 2)
             ->assertJsonPath('summary.status', 'variance')

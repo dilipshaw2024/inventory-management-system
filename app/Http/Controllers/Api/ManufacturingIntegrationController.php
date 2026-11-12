@@ -9,6 +9,8 @@ use App\Models\BomByproduct;
 use App\Models\ProductionOrder;
 use App\Models\ProductionOperation;
 use App\Models\ProductionScrapRecord;
+use App\Models\Routing;
+use App\Models\RoutingOperation;
 use App\Models\InventoryMovement;
 use App\Models\InventoryDocumentLine;
 use App\Models\StockReservation;
@@ -225,6 +227,29 @@ class ManufacturingIntegrationController extends Controller
         return response()->json(['data' => $order->load('bom', 'product'), 'status' => $order->status]);
     }
 
+    public function releaseOrders(Request $request): JsonResponse
+    {
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for production release.');
+        $data = $request->validate(['order_ids' => ['required', 'array', 'min:1', 'max:100'], 'order_ids.*' => ['integer', 'distinct']]);
+        $orders = $this->companyScope(ProductionOrder::query(), $companyId)->whereIn('id', $data['order_ids'])->pluck('id')->all();
+        $results = [];
+        foreach ($data['order_ids'] as $id) {
+            if (!in_array((int) $id, array_map('intval', $orders), true)) {
+                $results[] = ['production_order_id' => (int) $id, 'status' => 'failed', 'message' => 'Production order not found for this company.'];
+                continue;
+            }
+            try {
+                $order = app(ProductionService::class)->release((int) $id, $companyId, $request->user()?->id);
+                $results[] = ['production_order_id' => (int) $id, 'status' => 'released', 'data' => $order->load('bom', 'product')];
+            } catch (\RuntimeException $exception) {
+                $results[] = ['production_order_id' => (int) $id, 'status' => 'failed', 'message' => $exception->getMessage()];
+            }
+        }
+        $released = collect($results)->where('status', 'released')->count(); $failed = count($results) - $released;
+        return response()->json(['data' => $results, 'status' => $failed === 0 ? 'released' : ($released > 0 ? 'partial' : 'failed'), 'summary' => ['requested' => count($results), 'released' => $released, 'failed' => $failed]], $failed > 0 && $released > 0 ? 207 : ($failed > 0 ? 422 : 200));
+    }
+
     public function cancelOrder(Request $request, int $id): JsonResponse
     {
         $data = $request->validate(['cancellation_reason' => ['required', 'string', 'max:2000']]);
@@ -286,7 +311,7 @@ class ManufacturingIntegrationController extends Controller
 
     public function scheduleOrders(Request $request): JsonResponse
     {
-        $data = $request->validate(['order_ids' => ['required', 'array', 'min:1', 'max:100'], 'order_ids.*' => ['integer'], 'start_at' => ['nullable', 'date'], 'dispatch_rule' => ['nullable', 'in:planned_date,shortest_processing_time,critical_ratio']]);
+        $data = $request->validate(['order_ids' => ['required', 'array', 'min:1', 'max:100'], 'order_ids.*' => ['integer'], 'start_at' => ['nullable', 'date'], 'dispatch_rule' => ['nullable', 'in:planned_date,shortest_processing_time,critical_ratio,setup_optimized']]);
         $companyId = $request->user()?->company_id;
         $orders = $this->companyScope(ProductionOrder::query(), $companyId)->whereIn('id', $data['order_ids'])->get();
         if ($orders->count() !== count(array_unique($data['order_ids']))) abort(422, 'Every production order must belong to the current company.');
@@ -471,6 +496,109 @@ class ManufacturingIntegrationController extends Controller
         return app(IntegrationCursorService::class)->paginate($boms, $request, 'manufacturing.boms', (int) ($data['per_page'] ?? 50));
     }
 
+    public function routings(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'bom_id' => ['nullable', 'integer'], 'is_active' => ['nullable', 'boolean'],
+            'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $routings = $this->companyScope(Routing::with([
+            'bom:id,company_id,code,name,version,product_id', 'bom.product:id,name,sku',
+            'operations.workCenter:id,company_id,code,name',
+        ]), $request->user()?->company_id)
+            ->when($data['bom_id'] ?? null, fn ($query, $id) => $query->where('bom_id', $id))
+            ->when(array_key_exists('is_active', $data), fn ($query) => $query->where('is_active', (bool) $data['is_active']))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
+            ->orderBy('updated_at')->orderBy('id');
+        return app(IntegrationCursorService::class)->paginate($routings, $request, 'manufacturing.routings', (int) ($data['per_page'] ?? 50));
+    }
+
+    public function storeRouting(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $data = $request->validate([
+            'bom_id' => ['required', 'integer', $owned('bills_of_materials')],
+            'code' => ['required', 'string', 'max:50'], 'name' => ['required', 'string', 'max:255'], 'is_active' => ['nullable', 'boolean'],
+            'operations' => ['required', 'array', 'min:1'],
+            'operations.*.work_center_id' => ['required', 'integer', $owned('work_centers')],
+            'operations.*.sequence' => ['nullable', 'integer', 'min:1'], 'operations.*.operation' => ['required', 'string', 'max:255'],
+            'operations.*.setup_group' => ['nullable', 'string', 'max:100'],
+            'operations.*.setup_minutes' => ['nullable', 'numeric', 'min:0'], 'operations.*.run_minutes' => ['nullable', 'numeric', 'min:0'],
+            'operations.*.alternate_work_center_ids' => ['nullable', 'array'],
+            'operations.*.alternate_work_center_ids.*' => ['integer', $owned('work_centers')],
+        ]);
+        $bom = $this->companyScope(BillOfMaterial::query(), $companyId)->findOrFail((int) $data['bom_id']);
+        $duplicate = $this->companyScope(Routing::query(), $companyId)->where('bom_id', $bom->id)->where('code', $data['code'])->exists();
+        abort_if($duplicate, 422, 'A routing with this code already exists for the BOM.');
+        $routing = DB::transaction(function () use ($data, $companyId, $request): Routing {
+            $routing = Routing::create(['company_id' => $companyId, 'bom_id' => $data['bom_id'], 'code' => $data['code'], 'name' => $data['name'], 'is_active' => $data['is_active'] ?? true]);
+            foreach (array_values($data['operations']) as $index => $operation) {
+                RoutingOperation::create([
+                    'company_id' => $companyId, 'routing_id' => $routing->id, 'work_center_id' => $operation['work_center_id'],
+                    'sequence' => $operation['sequence'] ?? ($index + 1), 'operation' => $operation['operation'],
+                    'setup_group' => isset($operation['setup_group']) ? trim((string) $operation['setup_group']) ?: null : null,
+                    'setup_minutes' => $operation['setup_minutes'] ?? 0, 'run_minutes' => $operation['run_minutes'] ?? 0,
+                    'alternate_work_center_ids' => array_values(array_unique(array_filter(array_map('intval', $operation['alternate_work_center_ids'] ?? []), fn (int $id): bool => $id !== (int) $operation['work_center_id']))),
+                ]);
+            }
+            app(AuditService::class)->record('routing.created', $routing, null, $routing->toArray() + ['api' => true, 'created_by' => $request->user()?->id]);
+            return $routing;
+        });
+        return response()->json(['data' => $routing->load(['bom.product', 'operations.workCenter']), 'status' => 'created'], 201);
+    }
+
+    public function updateRouting(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $routing = $this->companyScope(Routing::query(), $companyId)->findOrFail($id);
+        $data = $request->validate([
+            'bom_id' => ['sometimes', 'integer', $owned('bills_of_materials')],
+            'code' => ['sometimes', 'string', 'max:50'], 'name' => ['sometimes', 'string', 'max:255'], 'is_active' => ['sometimes', 'boolean'],
+            'operations' => ['sometimes', 'array', 'min:1'], 'operations.*.work_center_id' => ['required_with:operations', 'integer', $owned('work_centers')],
+            'operations.*.sequence' => ['nullable', 'integer', 'min:1'], 'operations.*.operation' => ['required_with:operations', 'string', 'max:255'],
+            'operations.*.setup_group' => ['nullable', 'string', 'max:100'], 'operations.*.setup_minutes' => ['nullable', 'numeric', 'min:0'],
+            'operations.*.run_minutes' => ['nullable', 'numeric', 'min:0'], 'operations.*.alternate_work_center_ids' => ['nullable', 'array'],
+            'operations.*.alternate_work_center_ids.*' => ['integer', $owned('work_centers')],
+        ]);
+        $bomId = (int) ($data['bom_id'] ?? $routing->bom_id);
+        $code = $data['code'] ?? $routing->code;
+        $duplicate = $this->companyScope(Routing::query(), $companyId)->where('bom_id', $bomId)->where('code', $code)->where('id', '<>', $routing->id)->exists();
+        abort_if($duplicate, 422, 'A routing with this code already exists for the BOM.');
+        if (array_key_exists('operations', $data)) {
+            $used = ProductionOperation::whereHas('routingOperation', fn ($query) => $query->where('routing_id', $routing->id))->exists();
+            abort_if($used, 422, 'This routing is immutable because production operations already reference it. Create a new routing instead.');
+        }
+        $updated = DB::transaction(function () use ($data, $routing, $bomId, $code, $companyId, $request): Routing {
+            $routing->update(['bom_id' => $bomId, 'code' => $code, 'name' => $data['name'] ?? $routing->name, 'is_active' => $data['is_active'] ?? $routing->is_active]);
+            if (array_key_exists('operations', $data)) {
+                $routing->operations()->delete();
+                foreach (array_values($data['operations']) as $index => $operation) {
+                    RoutingOperation::create([
+                        'company_id' => $companyId, 'routing_id' => $routing->id, 'work_center_id' => $operation['work_center_id'],
+                        'sequence' => $operation['sequence'] ?? ($index + 1), 'operation' => $operation['operation'],
+                        'setup_group' => isset($operation['setup_group']) ? trim((string) $operation['setup_group']) ?: null : null,
+                        'setup_minutes' => $operation['setup_minutes'] ?? 0, 'run_minutes' => $operation['run_minutes'] ?? 0,
+                        'alternate_work_center_ids' => array_values(array_unique(array_filter(array_map('intval', $operation['alternate_work_center_ids'] ?? []), fn (int $id): bool => $id !== (int) $operation['work_center_id']))),
+                    ]);
+                }
+            }
+            app(AuditService::class)->record('routing.updated', $routing, null, $routing->toArray() + ['api' => true, 'updated_by' => $request->user()?->id]);
+            return $routing;
+        });
+        return response()->json(['data' => $updated->load(['bom.product', 'operations.workCenter']), 'status' => 'updated']);
+    }
+
+    public function deactivateRouting(Request $request, int $id): JsonResponse
+    {
+        $routing = $this->companyScope(Routing::query(), $request->user()?->company_id)->findOrFail($id);
+        if (!$routing->is_active) return response()->json(['data' => $routing, 'status' => 'already_inactive']);
+        $routing->update(['is_active' => false]);
+        app(AuditService::class)->record('routing.deactivated', $routing, ['is_active' => true], ['is_active' => false, 'api' => true, 'updated_by' => $request->user()?->id]);
+        return response()->json(['data' => $routing->fresh(), 'status' => 'deactivated']);
+    }
+
     public function storeBom(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -649,7 +777,7 @@ class ManufacturingIntegrationController extends Controller
         ]);
         $operations = $this->companyScope(ProductionOperation::with([
             'order:id,company_id,order_no,product_id,status,planned_date', 'order.product:id,name,sku',
-            'routingOperation:id,routing_id,sequence,operation,setup_minutes,run_minutes,alternate_work_center_ids', 'workCenter:id,code,name,capacity_hours_per_day,calendar,labor_rate,machine_rate',
+            'routingOperation:id,routing_id,sequence,operation,setup_group,setup_minutes,run_minutes,alternate_work_center_ids', 'workCenter:id,code,name,capacity_hours_per_day,calendar,labor_rate,machine_rate',
             'starter:id,name,email', 'completer:id,name,email',
         ]), $request->user()?->company_id)
             ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))

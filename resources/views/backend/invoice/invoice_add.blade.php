@@ -1,6 +1,6 @@
 @extends('admin.admin_master')
 @section('admin')
-<div class="container-fluid"><div class="row g-3 mb-3"><div class="col-md-3"><label class="form-label">Store</label><select id="invoice-store" class="form-select"><option value="">No store</option>@foreach($stores as $store)<option value="{{ $store->id }}" data-tenders='@json(app(\App\Services\StorePosSettingsService::class)->allowedTenders($store))' @selected(old('store_id', (int) auth()->user()->store_id ?: null) == $store->id)>{{ $store->name }} ({{ $store->branch->name }})</option>@endforeach</select></div></div></div>
+<div class="container-fluid"><div class="row g-3 mb-3"><div class="col-md-3"><label class="form-label">Store</label><select id="invoice-store" class="form-select"><option value="">No store</option>@foreach($stores as $store)<option value="{{ $store->id }}" data-tenders='@json(app(\App\Services\StorePosSettingsService::class)->allowedTenders($store))' @selected(old('store_id', (int) auth()->user()->store_id ?: null) == $store->id)>{{ $store->name }} ({{ $store->branch->name }})</option>@endforeach</select></div><div class="col-md-3"><label class="form-label">Sales channel</label><input form="invoice-form" name="sales_channel" value="{{ old('sales_channel') }}" class="form-control" placeholder="online, retail, marketplace"></div><div class="col-md-3"><label class="form-label">Delivery method</label><select form="invoice-form" name="delivery_method" class="form-select"><option value="">Not specified</option>@foreach(['pickup' => 'Pickup', 'delivery' => 'Delivery', 'shipping' => 'Shipping', 'digital' => 'Digital'] as $value => $label)<option value="{{ $value }}" @selected(old('delivery_method') === $value)>{{ $label }}</option>@endforeach</select></div></div></div>
  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
 
 <div class="page-content">
@@ -85,7 +85,7 @@
 <!--  ---------------------------------- -->
 
         <div class="card-body">
-        <form method="post" action="{{ route('invoice.store') }}">
+        <form id="invoice-form" method="post" action="{{ route('invoice.store') }}">
             @csrf
             <div class="row g-2 mb-3">
                 <div class="col-md-2"><label class="form-label">Currency</label><input name="currency_code" value="{{ old('currency_code', auth()->user()?->company?->base_currency ?? 'USD') }}" maxlength="3" class="form-control"></div>

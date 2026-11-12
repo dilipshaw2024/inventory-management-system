@@ -53,12 +53,14 @@ class AnalyticsIntegrationController extends Controller
 
     public function inventory(Request $request): JsonResponse
     {
-        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'product_id' => ['nullable', 'integer'], 'category_id' => ['nullable', 'integer'], 'abc_basis' => ['nullable', 'in:revenue,movement,value'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $data = $request->validate(['from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'product_id' => ['nullable', 'integer'], 'category_id' => ['nullable', 'integer'], 'customer_id' => ['nullable', 'integer'], 'abc_basis' => ['nullable', 'in:revenue,movement,value'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
         $companyId = $request->user()?->company_id; abort_unless($companyId, 403, 'A company is required for inventory analytics.');
-        $from = $data['from'] ?? now()->subYear()->toDateString(); $to = $data['to'] ?? now()->toDateString(); $abcBasis = $data['abc_basis'] ?? 'revenue'; $rows = app(InventoryAnalyticsService::class)->rowsForCompany((int) $companyId, $from, $to, $data['product_id'] ?? null, $abcBasis, $data['category_id'] ?? null);
+        $from = $data['from'] ?? now()->subYear()->toDateString(); $to = $data['to'] ?? now()->toDateString(); $abcBasis = $data['abc_basis'] ?? 'revenue';
+        if (!empty($data['customer_id']) && !Customer::whereKey($data['customer_id'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->exists()) abort(422, 'Customer is not authorized for this company.');
+        $rows = app(InventoryAnalyticsService::class)->rowsForCompany((int) $companyId, $from, $to, $data['product_id'] ?? null, $abcBasis, $data['category_id'] ?? null, $data['customer_id'] ?? null);
         $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1)); $paged = $rows->forPage($page, $perPage)->values();
         $summaryQuantity = (float) $rows->sum('quantity_sold'); $summaryAverageStock = (float) $rows->sum('average_stock'); $periodDays = max(1, \Carbon\Carbon::parse($from)->diffInDays(\Carbon\Carbon::parse($to)) + 1);
-        $summary = ['revenue' => (float) $rows->sum('revenue'), 'cogs' => (float) $rows->sum('cogs'), 'gross_profit' => (float) $rows->sum('gross_profit'), 'quantity_sold' => $summaryQuantity, 'inventory_value' => (float) $rows->sum('inventory_value'), 'turnover' => $summaryAverageStock > 0 ? $summaryQuantity / $summaryAverageStock : 0, 'days_of_inventory' => $summaryQuantity > 0 ? $summaryAverageStock / ($summaryQuantity / $periodDays) : null];
+        $summary = ['gross_revenue' => (float) $rows->sum('gross_revenue'), 'discount_amount' => (float) $rows->sum('discount_amount'), 'revenue' => (float) $rows->sum('revenue'), 'cogs' => (float) $rows->sum('cogs'), 'gross_profit' => (float) $rows->sum('gross_profit'), 'quantity_sold' => $summaryQuantity, 'inventory_value' => (float) $rows->sum('inventory_value'), 'turnover' => $summaryAverageStock > 0 ? $summaryQuantity / $summaryAverageStock : 0, 'days_of_inventory' => $summaryQuantity > 0 ? $summaryAverageStock / ($summaryQuantity / $periodDays) : null];
         $categorySummary = $rows->groupBy(fn (array $row) => $row['product']->category_id ?: 0)->map(function ($categoryRows, $categoryId) use ($periodDays): array {
             $category = $categoryRows->first()['product']->category;
             $quantity = (float) $categoryRows->sum('quantity_sold'); $averageStock = (float) $categoryRows->sum('average_stock');
@@ -66,6 +68,6 @@ class AnalyticsIntegrationController extends Controller
         })->sortByDesc('revenue')->values();
         $aThreshold = (float) app(\App\Services\ErpSettingService::class)->get('abc_a_threshold_percent', 80, (int) $companyId);
         $bThreshold = (float) app(\App\Services\ErpSettingService::class)->get('abc_b_threshold_percent', 95, (int) $companyId);
-        return response()->json(['data' => $paged, 'summary' => $summary, 'category_summary' => $categorySummary, 'meta' => ['from' => $from, 'to' => $to, 'abc_basis' => $abcBasis, 'abc_a_threshold_percent' => $aThreshold, 'abc_b_threshold_percent' => $bThreshold, 'category_id' => $data['category_id'] ?? null, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
+        return response()->json(['data' => $paged, 'summary' => $summary, 'category_summary' => $categorySummary, 'meta' => ['from' => $from, 'to' => $to, 'abc_basis' => $abcBasis, 'abc_a_threshold_percent' => $aThreshold, 'abc_b_threshold_percent' => $bThreshold, 'category_id' => isset($data['category_id']) ? (int) $data['category_id'] : null, 'customer_id' => isset($data['customer_id']) ? (int) $data['customer_id'] : null, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
     }
 }

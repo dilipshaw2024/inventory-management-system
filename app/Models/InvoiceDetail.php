@@ -10,7 +10,7 @@ class InvoiceDetail extends Model
 {
     use HasFactory, BelongsToProductCompany;
     protected $guarded = [];
-    protected $casts = ['selling_qty' => 'decimal:6', 'unit_price' => 'decimal:6', 'selling_price' => 'decimal:6', 'tax_rate' => 'decimal:4', 'tax_amount' => 'decimal:6'];
+    protected $casts = ['selling_qty' => 'decimal:6', 'unit_price' => 'decimal:6', 'selling_price' => 'decimal:6', 'tax_rate' => 'decimal:4', 'tax_amount' => 'decimal:6', 'tax_components' => 'array'];
     public function batch() { return $this->belongsTo(InventoryBatch::class); }
 
       public function product(){

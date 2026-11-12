@@ -22,6 +22,7 @@ class SupplierRequest extends FormRequest
             'tax_jurisdiction' => ['nullable', 'string', 'max:100'],
             'tax_exempt' => ['nullable', 'boolean'],
             'tax_exemption_number' => ['required_if:tax_exempt,1', 'nullable', 'string', 'max:100'],
+            'tax_exemption_expires_at' => ['nullable', 'date'],
             'payment_terms_days' => ['nullable', 'integer', 'min:0', 'max:3650'],
             'bank_name' => ['nullable', 'string', 'max:150'],
             'bank_account' => ['nullable', 'string', 'max:100'],

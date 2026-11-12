@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -11,7 +12,12 @@ class Supplier extends Model
 {
     use HasFactory, SoftDeletes, BelongsToCompany;
     protected $guarded = [];
-    protected $casts = ['payment_terms_days' => 'integer', 'rating' => 'decimal:2', 'tax_exempt' => 'boolean', 'is_active' => 'boolean', 'planning_calendar' => 'array'];
+    protected $casts = ['payment_terms_days' => 'integer', 'rating' => 'decimal:2', 'tax_exempt' => 'boolean', 'tax_exemption_expires_at' => 'date', 'is_active' => 'boolean', 'planning_calendar' => 'array'];
+
+    public function taxExemptionIsActive(?CarbonInterface $asOf = null): bool
+    {
+        return (bool) $this->tax_exempt && (!$this->tax_exemption_expires_at || $this->tax_exemption_expires_at->greaterThanOrEqualTo($asOf ?: now()));
+    }
 
     public function products(){
         return $this->hasMany(Product::class, 'supplier_id');

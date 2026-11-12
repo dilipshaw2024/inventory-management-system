@@ -52,6 +52,52 @@ class DeliveryIntegrationTest extends TestCase
         $this->getJson('/api/integration/delivery-tracking-events?carrier_status=in_transit')->assertOk()->assertJsonPath('data.0.external_reference', 'TRACK-EVENT-1');
         $confirmed = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/delivered', ['proof_of_delivery' => 'POD-SIGNATURE-1', 'delivered_at' => now()->toDateTimeString()]);
         $confirmed->assertOk()->assertJsonPath('status', 'delivered')->assertJsonPath('data.proof_of_delivery', 'POD-SIGNATURE-1');
+
+        $proof = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/proofs', [
+            'proof_type' => 'signature', 'external_reference' => 'POD-STRUCTURED-1',
+            'recipient_name' => 'Asha Receiver', 'recipient_contact' => '+91-9000000000',
+            'latitude' => 19.076, 'longitude' => 72.8777, 'notes' => 'Signed at receiving desk',
+        ]);
+        $proof->assertCreated()->assertJsonPath('status', 'created')->assertJsonPath('data.recipient_name', 'Asha Receiver');
+        $this->postJson('/api/integration/deliveries/'.$delivery->id.'/proofs', [
+            'proof_type' => 'signature', 'external_reference' => 'POD-STRUCTURED-1', 'recipient_name' => 'Changed name',
+        ])->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.recipient_name', 'Asha Receiver');
+        $this->getJson('/api/integration/deliveries/'.$delivery->id.'/proofs')->assertOk()->assertJsonPath('data.0.external_reference', 'POD-STRUCTURED-1');
+    }
+
+    public function test_batch_delivery_operation_completion_is_tenant_scoped_and_idempotent(): void
+    {
+        $company = Company::create(['name' => 'Batch Fulfillment Co', 'code' => 'BATCH-FULFILLMENT']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Batch Fulfillment Customer', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Batch Fulfillment Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Batch Fulfillment Each', 'code' => 'EA-BATCH-FULFILLMENT', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Batch Fulfillment Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch fulfillment item', 'status' => 1]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-BATCH-FULFILLMENT', 'date' => now()->toDateString(), 'status' => 'approved']);
+        $firstLine = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 1, 'delivered_qty' => 0, 'unit_price' => 10]);
+        $secondLine = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 1, 'delivered_qty' => 0, 'unit_price' => 10]);
+        $first = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-BATCH-FULFILLMENT-1', 'date' => now()->toDateString(), 'status' => 'pending', 'fulfillment_status' => 'pending']);
+        $second = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-BATCH-FULFILLMENT-2', 'date' => now()->toDateString(), 'status' => 'pending', 'fulfillment_status' => 'pending']);
+        $first->lines()->create(['sales_order_line_id' => $firstLine->id, 'product_id' => $product->id, 'delivered_qty' => 1, 'unit_price' => 10]);
+        $second->lines()->create(['sales_order_line_id' => $secondLine->id, 'product_id' => $product->id, 'delivered_qty' => 1, 'unit_price' => 10]);
+
+        Sanctum::actingAs($user, ['sales:write']);
+        $this->postJson('/api/integration/deliveries/operations/complete-batch', ['type' => 'pick', 'deliveries' => [['delivery_id' => $first->id], ['delivery_id' => $second->id]]])
+            ->assertOk()->assertJsonPath('status', 'completed')->assertJsonPath('summary.completed', 2);
+        $this->postJson('/api/integration/deliveries/operations/complete-batch', ['type' => 'pick', 'deliveries' => [['delivery_id' => $first->id], ['delivery_id' => $second->id]]])
+            ->assertOk()->assertJsonPath('status', 'completed')->assertJsonPath('summary.completed', 2);
+        $this->assertDatabaseCount('delivery_operations', 4);
+    }
+
+    public function test_batch_delivery_approval_returns_scoped_failure_for_unknown_delivery(): void
+    {
+        $company = Company::create(['name' => 'Batch Approval Co', 'code' => 'BATCH-APPROVAL']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['sales:write']);
+
+        $this->postJson('/api/integration/deliveries/approve-batch', ['delivery_ids' => [999999]])
+            ->assertStatus(422)->assertJsonPath('status', 'failed')->assertJsonPath('summary.failed', 1);
     }
 
     public function test_delivery_creation_replay_returns_the_original_delivery(): void

@@ -46,10 +46,14 @@ use App\Services\Integrations\CarrierTrackingAdapterRegistry;
 use App\Services\Integrations\CarrierTrackingAdapter;
 use App\Services\Integrations\BankStatementAdapterRegistry;
 use App\Services\Integrations\BankStatementAdapter;
+use App\Services\Integrations\StatutoryRemittanceProvider;
+use App\Services\Integrations\StatutoryRemittanceProviderRegistry;
 use App\Services\ProductionSchedulingService;
 use App\Services\PasswordPolicyService;
 use App\Services\InventoryStatusService;
+use App\Models\ServiceTechnician;
 use Carbon\CarbonImmutable;
+use Carbon\Carbon;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
 use PHPUnit\Framework\TestCase;
@@ -57,6 +61,35 @@ use Illuminate\Validation\Rules\Password;
 
 class ErpFoundationTest extends TestCase
 {
+    public function test_technician_skill_certifications_are_optional_but_expiry_aware(): void
+    {
+        $technician = new ServiceTechnician([
+            'skills' => ['HVAC', 'Electrical'],
+            'skill_certifications' => [
+                ['skill' => 'hvac', 'certificate_no' => 'HV-1', 'expires_on' => '2026-12-31'],
+                ['skill' => 'electrical', 'certificate_no' => 'EL-1', 'expires_on' => '2026-01-01'],
+            ],
+        ]);
+
+        self::assertTrue($technician->hasSkill('HVAC', Carbon::parse('2026-06-01')));
+        self::assertFalse($technician->hasSkill('electrical', Carbon::parse('2026-06-01')));
+        self::assertFalse($technician->hasSkill('plumbing', Carbon::parse('2026-06-01')));
+    }
+
+    public function test_statutory_remittance_provider_registry_is_case_insensitive_and_rejects_unknown_providers(): void
+    {
+        $provider = new class implements StatutoryRemittanceProvider {
+            public function key(): string { return 'AcmeTax'; }
+            public function submit(array $package): array { return ['status' => 'submitted', 'reference' => 'ACME-1']; }
+        };
+        $registry = new StatutoryRemittanceProviderRegistry([$provider]);
+
+        self::assertSame(['acmetax'], $registry->keys());
+        self::assertSame('submitted', $registry->resolve(' ACMETAX ')->submit([])['status']);
+        $this->expectException(InvalidArgumentException::class);
+        $registry->resolve('missing');
+    }
+
     public function test_planning_calendar_skips_weekends_and_holidays(): void
     {
         $date = (new PlanningCalendarService())->addWorkingDaysWithCalendar('2026-09-18', 2, [
@@ -215,6 +248,19 @@ class ErpFoundationTest extends TestCase
 
         self::assertSame(7.1, $result['tax']);
         self::assertSame(2, count($result['components']));
+        self::assertSame(5.0, $result['components'][0]['tax']);
+        self::assertSame(2.1, $result['components'][1]['tax']);
+    }
+
+    public function test_inclusive_compound_tax_components_reverse_the_ordered_tax_stack(): void
+    {
+        $result = (new TaxCalculationService())->inclusiveComponents(107.1, [
+            ['code' => 'CENTRAL', 'name' => 'Central tax', 'rate' => 5, 'sequence' => 1, 'is_compound' => true],
+            ['code' => 'CESS', 'name' => 'Cess', 'rate' => 2, 'sequence' => 2],
+        ], 2);
+
+        self::assertSame(100.0, $result['net']);
+        self::assertSame(7.1, $result['tax']);
         self::assertSame(5.0, $result['components'][0]['tax']);
         self::assertSame(2.1, $result['components'][1]['tax']);
     }
@@ -734,4 +780,5 @@ class ErpFoundationTest extends TestCase
         self::assertSame('approval.rejected', $notification->toDatabase(new \App\Models\User())['alert_type']);
         self::assertSame('Supplier quote expired', $notification->toDatabase(new \App\Models\User())['rejection_reason']);
     }
+
 }

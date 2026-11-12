@@ -9,9 +9,11 @@ use App\Models\DataRetentionPolicy;
 use App\Models\DataRetentionPurgeRequest;
 use App\Models\DocumentRevision;
 use App\Services\AuditService;
+use App\Services\ProductSpreadsheetService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use Symfony\Component\HttpFoundation\Response;
 
 class DataRetentionController extends Controller
 {
@@ -107,12 +109,18 @@ class DataRetentionController extends Controller
         return back()->with(['message' => 'Legal hold released.', 'alert-type' => 'success']);
     }
 
-    public function exportArchives()
+    public function exportArchives(Request $request, ProductSpreadsheetService $spreadsheet): Response
     {
+        $request->validate(['format' => ['nullable', 'in:csv,xlsx']]);
         $archives = DataRetentionArchive::where('company_id', $this->companyId())->orderBy('id')->cursor();
-        return response()->streamDownload(function () use ($archives): void {
+        $headers = ['id', 'record_type', 'record_id', 'archived_at', 'payload_hash', 'payload'];
+        if ($request->input('format') === 'xlsx') {
+            $values = $archives->map(fn ($archive): array => [$archive->id, $archive->record_type, $archive->record_id, optional($archive->archived_at)->toIso8601String(), $archive->payload_hash, json_encode($archive->payload, JSON_UNESCAPED_SLASHES)])->all();
+            return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="retention-archives-'.now()->format('YmdHis').'.xlsx"']);
+        }
+        return response()->streamDownload(function () use ($archives, $headers): void {
             $handle = fopen('php://output', 'wb');
-            fputcsv($handle, ['id', 'record_type', 'record_id', 'archived_at', 'payload_hash', 'payload']);
+            fputcsv($handle, $headers);
             foreach ($archives as $archive) {
                 fputcsv($handle, [$archive->id, $archive->record_type, $archive->record_id, optional($archive->archived_at)->toIso8601String(), $archive->payload_hash, json_encode($archive->payload, JSON_UNESCAPED_SLASHES)]);
             }

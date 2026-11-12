@@ -27,12 +27,16 @@ class CustomerCreditController extends Controller
 
     private function companyPayment(int $id): Payment
     {
-        return Payment::where('company_id', $this->companyId())->findOrFail($id);
+        return Payment::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->whereHas('invoice', fn ($invoice) => $invoice->where('store_id', (int) auth()->user()->store_id)))
+            ->findOrFail($id);
     }
 
     private function companyInvoice(int $id): Invoice
     {
-        return Invoice::where('company_id', $this->companyId())->findOrFail($id);
+        return Invoice::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->findOrFail($id);
     }
 
     public function index()
@@ -56,8 +60,12 @@ class CustomerCreditController extends Controller
 
     public function allocations()
     {
-        $payments = Payment::with(['customer', 'allocations'])->where('company_id', $this->companyId())->where('approval_status', 'approved')->where('paid_amount', '>', 0)->where('is_reversed', false)->latest()->get();
-        $invoices = Invoice::with('customer')->where('company_id', $this->companyId())->where('status', 1)->whereNotNull('customer_id')->latest('date')->get();
+        $payments = Payment::with(['customer', 'allocations'])->where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->whereHas('invoice', fn ($invoice) => $invoice->where('store_id', (int) auth()->user()->store_id)))
+            ->where('approval_status', 'approved')->where('paid_amount', '>', 0)->where('is_reversed', false)->latest()->get();
+        $invoices = Invoice::with('customer')->where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
+            ->where('status', 1)->whereNotNull('customer_id')->latest('date')->get();
         return view('backend.customer.payment_allocations', compact('payments', 'invoices'));
     }
 
@@ -74,7 +82,9 @@ class CustomerCreditController extends Controller
     public function voidAllocation(Request $request, int $id)
     {
         $data = $request->validate(['void_reason' => ['required', 'string', 'max:2000']]);
-        $allocation = \App\Models\CustomerPaymentAllocation::where('company_id', $this->companyId())->findOrFail($id);
+        $allocation = \App\Models\CustomerPaymentAllocation::where('company_id', $this->companyId())
+            ->when((int) auth()->user()?->store_id > 0, fn ($query) => $query->whereHas('invoice', fn ($invoice) => $invoice->where('store_id', (int) auth()->user()->store_id)))
+            ->findOrFail($id);
         try { app(CustomerPaymentAllocationService::class)->void($allocation->id, $data['void_reason']); }
         catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         app(AuditService::class)->record('customer_payment_allocation.voided', $allocation->fresh(), null, ['void_reason' => $data['void_reason']]);

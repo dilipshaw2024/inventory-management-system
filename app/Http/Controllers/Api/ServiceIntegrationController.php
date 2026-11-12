@@ -28,6 +28,8 @@ use App\Models\InvoiceDetail;
 use App\Models\ServiceContract;
 use App\Models\InventorySerial;
 use App\Models\ServiceAssetSerialHandoff;
+use App\Models\HrEmployee;
+use App\Models\HrLeaveRequest;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -535,16 +537,83 @@ class ServiceIntegrationController extends Controller
 
     public function orders(Request $request): JsonResponse
     {
+        $data = $request->validate([
+            'status' => ['nullable', 'string', 'max:40'],
+            'updated_since' => ['nullable', 'date'],
+            'scheduled_from' => ['nullable', 'date'],
+            'scheduled_to' => ['nullable', 'date', 'after_or_equal:scheduled_from'],
+        ]);
         $rows = $this->companyScope(MaintenanceOrder::with(['asset', 'serviceRequest', 'assignee', 'serviceInvoice.invoice_details.product', 'parts.product', 'parts.location', 'parts.batch', 'parts.returns']))
-            ->when($request->input('status'), fn ($query, $status) => $query->where('status', $status))
-            ->when($request->has('updated_since'), fn ($query) => $query->where('updated_at', '>=', $request->date('updated_since')))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['updated_since'] ?? null, fn ($query, $updatedSince) => $query->where('updated_at', '>=', $updatedSince))
+            ->when($data['scheduled_from'] ?? null, fn ($query, $scheduledFrom) => $query->where('scheduled_start_at', '>=', $scheduledFrom))
+            ->when($data['scheduled_to'] ?? null, fn ($query, $scheduledTo) => $query->where('scheduled_start_at', '<=', $scheduledTo))
             ->orderBy('updated_at')->orderBy('id');
         return app(IntegrationCursorService::class)->paginate($rows, $request, 'service.orders', (int) $request->input('per_page', 50));
     }
 
+    public function dispatchCalendar(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'start_date' => ['nullable', 'date'],
+            'end_date' => ['nullable', 'date', 'after_or_equal:start_date'],
+        ]);
+        $start = Carbon::parse($data['start_date'] ?? now()->toDateString())->startOfDay();
+        $end = Carbon::parse($data['end_date'] ?? $start->copy()->addDays(6)->toDateString())->endOfDay();
+        if ($start->diffInDays($end) > 30) {
+            return response()->json(['message' => 'The dispatch calendar range cannot exceed 31 days.'], 422);
+        }
+
+        $orders = $this->companyScope(MaintenanceOrder::with(['asset:id,asset_no,name', 'assignee:id,name']))
+            ->whereNotNull('scheduled_start_at')->whereBetween('scheduled_start_at', [$start, $end])
+            ->orderBy('scheduled_start_at')->orderBy('id')->get();
+        $technicians = $this->companyScope(ServiceTechnician::with('user:id,name'))
+            ->orderBy('employee_code')->get();
+        $orderData = $orders->map(fn (MaintenanceOrder $order): array => [
+            'id' => $order->id, 'order_no' => $order->order_no, 'status' => $order->status,
+            'scheduled_start_at' => optional($order->scheduled_start_at)->toISOString(),
+            'scheduled_end_at' => optional($order->scheduled_end_at)->toISOString(),
+            'estimated_hours' => $order->estimated_hours !== null ? (float) $order->estimated_hours : null,
+            'assigned_to' => $order->assigned_to, 'technician' => optional($order->assignee)->name,
+            'asset' => $order->asset ? ['id' => $order->asset->id, 'asset_no' => $order->asset->asset_no, 'name' => $order->asset->name] : null,
+            'required_skills' => $order->required_skills ?? [],
+        ])->values();
+        $days = collect(range(0, $start->diffInDays($end)))->map(function (int $offset) use ($start, $orderData): array {
+            $date = $start->copy()->addDays($offset);
+            return ['date' => $date->toDateString(), 'orders' => $orderData->filter(fn (array $order): bool => str_starts_with((string) $order['scheduled_start_at'], $date->toDateString()))->values()];
+        })->values();
+        $workload = $technicians->map(function (ServiceTechnician $technician) use ($orders, $start, $end): array {
+            $assigned = $orders->where('assigned_to', $technician->user_id);
+            $calendar = is_array($technician->working_calendar) ? $technician->working_calendar : [];
+            $weekends = array_map('intval', $calendar['weekend_days'] ?? [0, 6]);
+            $holidays = array_map('strval', $calendar['holidays'] ?? []);
+            $shiftStart = (string) ($calendar['shift_start'] ?? '08:00');
+            $shiftEnd = (string) ($calendar['shift_end'] ?? '17:00');
+            $capacityHours = 0.0;
+            $daily = [];
+            for ($day = $start->copy()->startOfDay(); $day->lte($end); $day->addDay()) {
+                $date = $day->toDateString();
+                $dayOrders = $assigned->filter(fn (MaintenanceOrder $order): bool => optional($order->scheduled_start_at)->toDateString() === $date);
+                $dayCapacity = 0.0;
+                if (!in_array($day->dayOfWeek, $weekends, true) && !in_array($date, $holidays, true)) {
+                    $capacityStart = Carbon::parse($date.' '.$shiftStart);
+                    $capacityEnd = Carbon::parse($date.' '.$shiftEnd);
+                    if ($capacityEnd->greaterThan($capacityStart)) $dayCapacity = $capacityStart->diffInMinutes($capacityEnd) / 60;
+                }
+                $dayHours = round((float) $dayOrders->sum(fn (MaintenanceOrder $order): float => (float) ($order->estimated_hours ?? 0)), 2);
+                $capacityHours += $dayCapacity;
+                $daily[] = ['date' => $date, 'order_count' => $dayOrders->count(), 'estimated_hours' => $dayHours, 'capacity_hours' => round($dayCapacity, 2), 'utilization_percent' => $dayCapacity > 0 ? round(($dayHours / $dayCapacity) * 100, 2) : null];
+            }
+            $estimatedHours = round((float) $assigned->sum(fn (MaintenanceOrder $order): float => (float) ($order->estimated_hours ?? 0)), 2);
+            return ['technician_id' => $technician->id, 'user_id' => $technician->user_id, 'name' => optional($technician->user)->name, 'order_count' => $assigned->count(), 'estimated_hours' => $estimatedHours, 'capacity_hours' => round($capacityHours, 2), 'utilization_percent' => $capacityHours > 0 ? round(($estimatedHours / $capacityHours) * 100, 2) : null, 'daily' => $daily];
+        })->values();
+
+        return response()->json(['data' => ['start_date' => $start->toDateString(), 'end_date' => $end->toDateString(), 'days' => $days, 'technicians' => $workload, 'unassigned_order_count' => $orders->whereNull('assigned_to')->count()]]);
+    }
+
     public function storeOrder(Request $request): JsonResponse
     {
-        $data = $request->validate(['order_no' => ['nullable', 'string', 'max:80', $this->companyUnique('maintenance_orders', 'order_no')], 'external_reference' => ['nullable', 'string', 'max:150'], 'asset_id' => ['required', 'integer', $this->companyExists('service_assets')], 'service_request_id' => ['nullable', 'integer', $this->companyExists('service_requests')], 'maintenance_type' => ['required', 'in:preventive,corrective,inspection'], 'scheduled_date' => ['nullable', 'date'], 'assigned_to' => ['nullable', 'integer', $this->companyExists('users')], 'notes' => ['nullable', 'string', 'max:3000']]);
+        $data = $request->validate(['order_no' => ['nullable', 'string', 'max:80', $this->companyUnique('maintenance_orders', 'order_no')], 'external_reference' => ['nullable', 'string', 'max:150'], 'asset_id' => ['required', 'integer', $this->companyExists('service_assets')], 'service_request_id' => ['nullable', 'integer', $this->companyExists('service_requests')], 'maintenance_type' => ['required', 'in:preventive,corrective,inspection'], 'scheduled_date' => ['nullable', 'date'], 'scheduled_start_at' => ['nullable', 'date'], 'scheduled_end_at' => ['nullable', 'date', 'after:scheduled_start_at'], 'estimated_hours' => ['nullable', 'numeric', 'gt:0'], 'required_skills' => ['nullable', 'array', 'max:30'], 'required_skills.*' => ['string', 'max:100'], 'assigned_to' => ['nullable', 'integer', $this->companyExists('users')], 'notes' => ['nullable', 'string', 'max:3000']]);
         if (!empty($data['external_reference'])) {
             $existing = $this->companyScope(MaintenanceOrder::query())->where('external_reference', $data['external_reference'])->first();
             if ($existing) return response()->json(['data' => $existing->load(['asset', 'serviceRequest', 'assignee']), 'status' => 'duplicate_ignored']);
@@ -555,13 +624,93 @@ class ServiceIntegrationController extends Controller
                 $serviceRequest = !empty($data['service_request_id']) ? $this->companyScope(ServiceRequest::query())->lockForUpdate()->findOrFail($data['service_request_id']) : null;
                 if ($serviceRequest && ((int) $serviceRequest->asset_id !== (int) $asset->id || in_array($serviceRequest->status, ['resolved', 'cancelled'], true))) throw new \RuntimeException('The linked service request is invalid for this asset or already closed.');
                 if (!empty($data['assigned_to']) && !$this->companyScope(ServiceTechnician::query())->where('user_id', $data['assigned_to'])->where('is_available', true)->exists()) throw new \RuntimeException('The assigned user must be an available service technician.');
-                $order = MaintenanceOrder::create(($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id()]) + ['order_no' => $data['order_no'] ?: app(NumberingSequenceService::class)->nextOrFallback('maintenance_order', 'MO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, null)]);
+                $this->assertTechnicianCanWorkWindow($data['assigned_to'] ?? null, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null, $data['required_skills'] ?? []);
+                $this->assertTechnicianWindowAvailable($data['assigned_to'] ?? null, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null);
+                $order = MaintenanceOrder::create(($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id()]) + ['order_no' => ($data['order_no'] ?? null) ?: app(NumberingSequenceService::class)->nextOrFallback('maintenance_order', 'MO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, null)]);
                 if ($serviceRequest) $serviceRequest->update(['status' => 'in_progress', 'assigned_to' => $data['assigned_to'] ?? $serviceRequest->assigned_to]);
                 app(AuditService::class)->record('maintenance_order.created', $order, null, $order->toArray() + ['api' => true]);
                 return $order->load(['asset', 'serviceRequest', 'assignee']);
             });
             return response()->json(['data' => $order, 'status' => 'planned'], 201);
         } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+    }
+
+    public function technicianAvailability(Request $request): JsonResponse
+    {
+        $data = $request->validate(['start_at' => ['required', 'date'], 'end_at' => ['required', 'date', 'after:start_at'], 'required_skills' => ['nullable', 'array', 'max:30'], 'required_skills.*' => ['string', 'max:100']]);
+        $busy = MaintenanceOrder::query()->where('company_id', auth()->user()?->company_id)
+            ->whereNotIn('status', ['completed', 'cancelled'])->whereNotNull('scheduled_start_at')->whereNotNull('scheduled_end_at')
+            ->where('scheduled_start_at', '<', $data['end_at'])->where('scheduled_end_at', '>', $data['start_at'])->pluck('assigned_to');
+        $technicians = $this->companyScope(ServiceTechnician::with('user:id,name,email'))->where('is_available', true)->whereNotIn('user_id', $busy)->get()
+            ->filter(fn (ServiceTechnician $technician): bool => $this->technicianCanWorkWindow($technician, $data['start_at'], $data['end_at'], $data['required_skills'] ?? []))->values();
+        return response()->json(['data' => $technicians, 'window' => ['start_at' => $data['start_at'], 'end_at' => $data['end_at']]]);
+    }
+
+    public function scheduleOrder(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate([
+            'assigned_to' => ['nullable', 'integer', $this->companyExists('users')],
+            'scheduled_date' => ['nullable', 'date'],
+            'scheduled_start_at' => ['nullable', 'date'],
+            'scheduled_end_at' => ['nullable', 'date', 'after:scheduled_start_at'],
+            'estimated_hours' => ['nullable', 'numeric', 'gt:0'],
+            'required_skills' => ['sometimes', 'array', 'max:30'], 'required_skills.*' => ['string', 'max:100'],
+        ]);
+        try {
+            $order = DB::transaction(function () use ($data, $id): MaintenanceOrder {
+                $order = $this->companyScope(MaintenanceOrder::query())->lockForUpdate()->findOrFail($id);
+                if (in_array($order->status, ['completed', 'cancelled'], true)) throw new \RuntimeException('Closed maintenance orders cannot be rescheduled.');
+                if (!empty($data['assigned_to']) && !$this->companyScope(ServiceTechnician::query())->where('user_id', $data['assigned_to'])->where('is_available', true)->exists()) throw new \RuntimeException('The assigned user must be an available service technician.');
+                $this->assertTechnicianCanWorkWindow($data['assigned_to'] ?? null, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null, $data['required_skills'] ?? ($order->required_skills ?? []));
+                $this->assertTechnicianWindowAvailable($data['assigned_to'] ?? null, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null, $order->id);
+                $updates = array_filter($data, static fn ($value) => $value !== null);
+                foreach (['assigned_to', 'scheduled_date', 'scheduled_start_at', 'scheduled_end_at', 'estimated_hours'] as $field) {
+                    if (array_key_exists($field, $data) && $data[$field] === null) $updates[$field] = null;
+                }
+                $before = $order->only(array_keys($updates));
+                $order->update($updates);
+                app(AuditService::class)->record('maintenance_order.scheduled', $order, $before, $order->fresh()->only(array_keys($updates)) + ['api' => true]);
+                return $order->fresh()->load(['asset', 'serviceRequest', 'assignee']);
+            });
+            return response()->json(['data' => $order, 'status' => 'scheduled']);
+        } catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
+    }
+
+    private function assertTechnicianWindowAvailable(?int $userId, ?string $startAt, ?string $endAt, ?int $ignoreOrderId = null): void
+    {
+        if (!$userId || !$startAt || !$endAt) return;
+        $query = $this->companyScope(MaintenanceOrder::query())->where('assigned_to', $userId)->whereNotIn('status', ['completed', 'cancelled'])
+            ->whereNotNull('scheduled_start_at')->whereNotNull('scheduled_end_at')->where('scheduled_start_at', '<', $endAt)->where('scheduled_end_at', '>', $startAt);
+        if ($ignoreOrderId) $query->where('id', '!=', $ignoreOrderId);
+        if ($query->exists()) throw new \RuntimeException('The technician is already assigned to an overlapping maintenance window.');
+    }
+
+    private function assertTechnicianCanWorkWindow(?int $userId, ?string $startAt, ?string $endAt, array $requiredSkills = []): void
+    {
+        if (!$userId || !$startAt || !$endAt) return;
+        $technician = $this->companyScope(ServiceTechnician::query())->where('user_id', $userId)->firstOrFail();
+        if (!$this->technicianCanWorkWindow($technician, $startAt, $endAt, $requiredSkills)) {
+            throw new \RuntimeException($requiredSkills
+                ? 'The technician is unavailable for this window or does not have the required skills.'
+                : 'The technician is outside working hours, on a non-working day, or on approved leave for this window.');
+        }
+    }
+
+    private function technicianCanWorkWindow(ServiceTechnician $technician, string $startAt, string $endAt, array $requiredSkills = []): bool
+    {
+        $start = Carbon::parse($startAt);
+        $end = Carbon::parse($endAt);
+        if ($end->lessThanOrEqualTo($start) || !$start->isSameDay($end)) return false;
+        foreach ($requiredSkills as $skill) if (!$technician->hasSkill((string) $skill, $start)) return false;
+        $calendar = is_array($technician->working_calendar) ? $technician->working_calendar : [];
+        $weekends = collect($calendar['weekend_days'] ?? [0, 6])->map(fn ($day): int => (int) $day)->all();
+        $holidays = collect($calendar['holidays'] ?? [])->map(fn ($day): string => (string) $day)->all();
+        if (in_array($start->dayOfWeek, $weekends, true) || in_array($start->toDateString(), $holidays, true)) return false;
+        $shiftStart = Carbon::parse($start->toDateString().' '.($calendar['shift_start'] ?? '08:00'));
+        $shiftEnd = Carbon::parse($start->toDateString().' '.($calendar['shift_end'] ?? '17:00'));
+        if ($start->lessThan($shiftStart) || $end->greaterThan($shiftEnd)) return false;
+        $employee = HrEmployee::where('company_id', $technician->company_id)->where('user_id', $technician->user_id)->first();
+        return !$employee || !HrLeaveRequest::where('company_id', $technician->company_id)->where('employee_id', $employee->id)->where('status', 'approved')->whereDate('starts_on', '<=', $start->toDateString())->whereDate('ends_on', '>=', $start->toDateString())->exists();
     }
 
     public function updateOrderStatus(Request $request, int $id): JsonResponse
@@ -616,7 +765,8 @@ class ServiceIntegrationController extends Controller
         $currency = strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD'));
         $exchangeRate = $data['exchange_rate'] ?? app(CurrencyConversionService::class)->rate($currency, strtoupper($request->user()?->company?->base_currency ?? 'USD'), $data['date']);
         $taxMode = $data['tax_mode'] ?? app(\App\Services\ErpSettingService::class)->get('default_tax_mode', 'exclusive');
-        $taxRate = $customer->tax_exempt ? 0.0 : (float) ($product->tax_rate ?? 0);
+        $taxExempt = $customer->taxExemptionIsActive(\Carbon\Carbon::parse($data['date']));
+        $taxRate = $taxExempt ? 0.0 : (float) ($product->tax_rate ?? 0);
         $taxResult = $taxMode === 'inclusive'
             ? app(TaxCalculationService::class)->inclusive((float) $data['amount'], $taxRate)
             : ['net' => (float) $data['amount'], 'tax' => app(TaxCalculationService::class)->exclusive((float) $data['amount'], $taxRate)];
@@ -628,7 +778,7 @@ class ServiceIntegrationController extends Controller
                 'customer_id' => $customer->id, 'date' => $data['date'],
                 'due_date' => $data['due_date'] ?? \Carbon\CarbonImmutable::parse($data['date'])->addDays((int) ($customer->credit_days ?? 0))->toDateString(),
                 'currency_code' => $currency, 'exchange_rate' => $exchangeRate, 'tax_mode' => $taxMode,
-                'tax_exempt' => (bool) $customer->tax_exempt, 'tax_exemption_number' => $customer->tax_exempt ? $customer->tax_exemption_number : null,
+                'tax_exempt' => $taxExempt, 'tax_exemption_number' => $taxExempt ? $customer->tax_exemption_number : null,
                 'description' => $data['description'] ?? 'Maintenance service for '.$order->order_no, 'status' => 0, 'created_by' => $request->user()?->id,
             ]);
             InvoiceDetail::create([
@@ -789,6 +939,31 @@ class ServiceIntegrationController extends Controller
         return app(IntegrationCursorService::class)->paginate($rows, $request, 'service.technicians', (int) ($data['per_page'] ?? 50));
     }
 
+    public function technicianCertifications(Request $request): JsonResponse
+    {
+        $data = $request->validate(['skill' => ['nullable', 'string', 'max:100'], 'expires_before' => ['nullable', 'date_format:Y-m-d'], 'include_expired' => ['nullable', 'boolean'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $cutoff = $data['expires_before'] ?? now()->addDays(90)->toDateString();
+        $skill = strtolower(trim((string) ($data['skill'] ?? '')));
+        $includeExpired = (bool) ($data['include_expired'] ?? true);
+        $rows = [];
+        $technicians = $this->companyScope(ServiceTechnician::with('user:id,name,email'))->get();
+        foreach ($technicians as $technician) {
+            foreach ((array) ($technician->skill_certifications ?? []) as $certification) {
+                if (!is_array($certification) || trim((string) ($certification['skill'] ?? '')) === '') continue;
+                $certSkill = strtolower(trim((string) $certification['skill']));
+                if ($skill !== '' && $certSkill !== $skill) continue;
+                $expiresOn = $certification['expires_on'] ?? null;
+                $expired = $expiresOn !== null && (string) $expiresOn < now()->toDateString();
+                if (!$includeExpired && $expired) continue;
+                if ($expiresOn !== null && (string) $expiresOn > $cutoff) continue;
+                $rows[] = ['technician_id' => $technician->id, 'employee_code' => $technician->employee_code, 'user' => $technician->user, 'skill' => $certSkill, 'certificate_no' => $certification['certificate_no'] ?? null, 'expires_on' => $expiresOn, 'is_expired' => $expired, 'days_until_expiry' => $expiresOn === null ? null : now()->startOfDay()->diffInDays(Carbon::parse($expiresOn)->startOfDay(), false)];
+            }
+        }
+        usort($rows, fn (array $left, array $right): int => [$left['expires_on'] ?? '9999-12-31', $left['employee_code']] <=> [$right['expires_on'] ?? '9999-12-31', $right['employee_code']]);
+        $perPage = (int) ($data['per_page'] ?? 50);
+        return response()->json(['data' => array_slice($rows, 0, $perPage), 'meta' => ['total' => count($rows), 'per_page' => $perPage, 'expires_before' => $cutoff, 'include_expired' => $includeExpired]]);
+    }
+
     public function warrantyClaims(Request $request): JsonResponse
     {
         $data = $request->validate(['status' => ['nullable', 'in:submitted,under_review,approved,rejected,resolved'], 'contract_id' => ['nullable', 'integer', $this->companyExists('service_contracts')], 'coverage_status' => ['nullable', 'in:unknown,in_warranty,expired,contract_covered'], 'settlement_status' => ['nullable', 'in:unsettled,settled'], 'accounting_status' => ['nullable', 'in:not_posted,missing_mapping,posted'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
@@ -892,8 +1067,9 @@ class ServiceIntegrationController extends Controller
             'external_reference' => ['nullable', 'string', 'max:150', $this->companyUnique('service_technicians', 'external_reference')],
             'user_id' => ['required', 'integer', $this->companyExists('users'), Rule::unique('service_technicians', 'user_id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'employee_code' => ['required', 'string', 'max:50', $this->companyUnique('service_technicians', 'employee_code')],
-            'skills' => ['nullable', 'array'], 'skills.*' => ['string', 'max:100'], 'hourly_rate' => ['nullable', 'numeric', 'min:0'], 'phone' => ['nullable', 'string', 'max:30'], 'is_available' => ['nullable', 'boolean'],
+            'skills' => ['nullable', 'array'], 'skills.*' => ['string', 'max:100'], 'skill_certifications' => ['nullable', 'array', 'max:50'], 'skill_certifications.*.skill' => ['required_with:skill_certifications', 'string', 'max:100'], 'skill_certifications.*.certificate_no' => ['nullable', 'string', 'max:100'], 'skill_certifications.*.expires_on' => ['nullable', 'date_format:Y-m-d'], 'working_calendar' => ['nullable', 'array'], 'working_calendar.weekend_days' => ['nullable', 'array'], 'working_calendar.weekend_days.*' => ['integer', 'between:0,6'], 'working_calendar.holidays' => ['nullable', 'array'], 'working_calendar.holidays.*' => ['date_format:Y-m-d'], 'working_calendar.shift_start' => ['nullable', 'date_format:H:i'], 'working_calendar.shift_end' => ['nullable', 'date_format:H:i'], 'hourly_rate' => ['nullable', 'numeric', 'min:0'], 'phone' => ['nullable', 'string', 'max:30'], 'is_available' => ['nullable', 'boolean'],
         ]);
+        if (array_key_exists('skill_certifications', $data)) $data['skill_certifications'] = $this->normalizeSkillCertifications($data['skill_certifications']);
         if (!empty($data['external_reference']) && ($existing = $this->companyScope(ServiceTechnician::query())->where('external_reference', $data['external_reference'])->first())) return response()->json(['data' => $existing->load('user:id,name,email'), 'status' => 'duplicate_ignored']);
         $technician = ServiceTechnician::create($data + ['company_id' => $companyId, 'skills' => $data['skills'] ?? [], 'hourly_rate' => $data['hourly_rate'] ?? 0, 'is_available' => $data['is_available'] ?? true]);
         app(AuditService::class)->record('service_technician.created', $technician, null, $technician->toArray() + ['api' => true]);
@@ -903,11 +1079,19 @@ class ServiceIntegrationController extends Controller
     public function updateTechnician(Request $request, int $id): JsonResponse
     {
         $technician = $this->companyScope(ServiceTechnician::query())->findOrFail($id);
-        $data = $request->validate(['external_reference' => ['sometimes', 'nullable', 'string', 'max:150', Rule::unique('service_technicians', 'external_reference')->ignore($technician->id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'employee_code' => ['sometimes', 'string', 'max:50', Rule::unique('service_technicians', 'employee_code')->ignore($technician->id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'skills' => ['sometimes', 'array'], 'skills.*' => ['string', 'max:100'], 'hourly_rate' => ['sometimes', 'numeric', 'min:0'], 'phone' => ['sometimes', 'nullable', 'string', 'max:30'], 'is_available' => ['sometimes', 'boolean']]);
+        $data = $request->validate(['external_reference' => ['sometimes', 'nullable', 'string', 'max:150', Rule::unique('service_technicians', 'external_reference')->ignore($technician->id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'employee_code' => ['sometimes', 'string', 'max:50', Rule::unique('service_technicians', 'employee_code')->ignore($technician->id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'skills' => ['sometimes', 'array'], 'skills.*' => ['string', 'max:100'], 'skill_certifications' => ['sometimes', 'nullable', 'array', 'max:50'], 'skill_certifications.*.skill' => ['required_with:skill_certifications', 'string', 'max:100'], 'skill_certifications.*.certificate_no' => ['nullable', 'string', 'max:100'], 'skill_certifications.*.expires_on' => ['nullable', 'date_format:Y-m-d'], 'working_calendar' => ['sometimes', 'nullable', 'array'], 'working_calendar.weekend_days' => ['nullable', 'array'], 'working_calendar.weekend_days.*' => ['integer', 'between:0,6'], 'working_calendar.holidays' => ['nullable', 'array'], 'working_calendar.shift_start' => ['nullable', 'date_format:H:i'], 'working_calendar.shift_end' => ['nullable', 'date_format:H:i'], 'hourly_rate' => ['sometimes', 'numeric', 'min:0'], 'phone' => ['sometimes', 'nullable', 'string', 'max:30'], 'is_available' => ['sometimes', 'boolean']]);
+        if (array_key_exists('skill_certifications', $data)) $data['skill_certifications'] = $this->normalizeSkillCertifications($data['skill_certifications']);
         $before = $technician->only(array_keys($data));
         $technician->update($data);
         app(AuditService::class)->record('service_technician.updated', $technician, $before, $technician->fresh()->only(array_keys($data)) + ['api' => true]);
         return response()->json(['data' => $technician->fresh()->load('user:id,name,email'), 'status' => 'updated']);
+    }
+
+    private function normalizeSkillCertifications(array $certifications): array
+    {
+        return collect($certifications)->map(function (array $certification): array {
+            return ['skill' => strtolower(trim((string) $certification['skill'])), 'certificate_no' => isset($certification['certificate_no']) ? trim((string) $certification['certificate_no']) : null, 'expires_on' => $certification['expires_on'] ?? null];
+        })->filter(fn (array $certification): bool => $certification['skill'] !== '')->unique(fn (array $certification): string => $certification['skill'])->values()->all();
     }
 
     public function storeSchedule(Request $request): JsonResponse

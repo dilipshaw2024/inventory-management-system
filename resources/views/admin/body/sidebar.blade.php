@@ -24,6 +24,7 @@
                             <li><a href="{{ route('erp.accounting.cost-centers.report') }}" class="waves-effect"><i class="ri-pie-chart-line"></i><span>Cost Center Report</span></a></li>
                             <li><a href="{{ route('erp.accounting.reconciliation') }}" class="waves-effect"><i class="ri-scales-3-line"></i><span>Reconciliation</span></a></li>
                             <li><a href="{{ route('erp.accounting.tax-report') }}" class="waves-effect"><i class="ri-file-list-3-line"></i><span>Tax Report</span></a></li>
+                            <li><a href="{{ route('erp.accounting.tax-exemption-certificates') }}" class="waves-effect"><i class="ri-shield-check-line"></i><span>Tax Certificates</span></a></li>
                             <li><a href="{{ route('erp.accounting.tax-filings') }}" class="waves-effect"><i class="ri-file-shield-2-line"></i><span>Tax Filings</span></a></li>
                             <li><a href="{{ route('erp.accounting.trial-balance') }}" class="waves-effect"><i class="ri-scales-2-line"></i><span>Trial Balance</span></a></li>
                             <li><a href="{{ route('erp.accounting.financial-statements') }}" class="waves-effect"><i class="ri-bar-chart-grouped-line"></i><span>Financial Statements</span></a></li>

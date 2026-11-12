@@ -283,4 +283,49 @@ class ProductionSchedulingTest extends TestCase
         $this->artisan('erp:planning:auto-release-production-orders', ['--company' => $company->id, '--dry-run' => true])->assertExitCode(0);
         $this->assertSame('draft', $order->fresh()->status);
     }
+
+    public function test_routing_integration_api_manages_setup_groups_and_preserves_referenced_history(): void
+    {
+        $company = Company::create(['name' => 'Routing API Co', 'code' => 'ROUTING-API']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Routing Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Routing Each', 'code' => 'EA-ROUTING', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Routing Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Routing Product', 'status' => 1]);
+        $component = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Routing Component', 'status' => 1]);
+        $bom = BillOfMaterial::create(['company_id' => $company->id, 'product_id' => $product->id, 'code' => 'BOM-ROUTING-API', 'name' => 'Routing BOM', 'output_quantity' => 1, 'is_active' => true, 'approval_status' => 'approved']);
+        $bom->lines()->create(['company_id' => $company->id, 'component_product_id' => $component->id, 'quantity' => 1]);
+        $center = WorkCenter::create(['company_id' => $company->id, 'code' => 'WC-ROUTING-API', 'name' => 'Routing Center', 'capacity_hours_per_day' => 8, 'is_active' => true]);
+
+        Sanctum::actingAs($user, ['manufacturing:read', 'manufacturing:write']);
+        $created = $this->postJson('/api/manufacturing/routings', [
+            'bom_id' => $bom->id, 'code' => 'RT-ROUTING-API', 'name' => 'API Routing',
+            'operations' => [['work_center_id' => $center->id, 'operation' => 'Setup', 'setup_group' => 'metal-blue', 'setup_minutes' => 10, 'run_minutes' => 20]],
+        ])->assertCreated()->assertJsonPath('status', 'created')->assertJsonPath('data.operations.0.setup_group', 'metal-blue');
+        $routingId = $created->json('data.id');
+        $this->getJson('/api/manufacturing/routings?bom_id='.$bom->id)->assertOk()->assertJsonPath('data.0.id', $routingId);
+
+        $this->patchJson('/api/manufacturing/routings/'.$routingId, ['name' => 'Updated API Routing', 'operations' => [['work_center_id' => $center->id, 'operation' => 'Setup', 'setup_group' => 'metal-red', 'setup_minutes' => 15, 'run_minutes' => 20]]])
+            ->assertOk()->assertJsonPath('data.name', 'Updated API Routing')->assertJsonPath('data.operations.0.setup_group', 'metal-red');
+        $this->postJson('/api/manufacturing/routings/'.$routingId.'/deactivate')->assertOk()->assertJsonPath('status', 'deactivated');
+        $this->assertDatabaseHas('routings', ['id' => $routingId, 'is_active' => false]);
+    }
+
+    public function test_batch_production_release_reports_partial_results_without_cross_tenant_access(): void
+    {
+        $company = Company::create(['name' => 'Batch Release Co', 'code' => 'BATCH-RELEASE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Batch Release Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'Batch Release Each', 'code' => 'EA-BATCH-RELEASE', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'Batch Release Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Batch release product', 'status' => 1]);
+        $bom = BillOfMaterial::create(['company_id' => $company->id, 'product_id' => $product->id, 'code' => 'BOM-BATCH-RELEASE', 'name' => 'Batch release BOM', 'output_quantity' => 1, 'is_active' => true, 'approval_status' => 'approved']);
+        $draft = ProductionOrder::create(['company_id' => $company->id, 'bom_id' => $bom->id, 'product_id' => $product->id, 'planned_quantity' => 1, 'planned_date' => now()->toDateString(), 'status' => 'draft', 'order_no' => 'MO-BATCH-RELEASE-1']);
+        $alreadyReleased = ProductionOrder::create(['company_id' => $company->id, 'bom_id' => $bom->id, 'product_id' => $product->id, 'planned_quantity' => 1, 'planned_date' => now()->toDateString(), 'status' => 'released', 'order_no' => 'MO-BATCH-RELEASE-2']);
+
+        Sanctum::actingAs($user, ['manufacturing:write']);
+        $this->postJson('/api/manufacturing/orders/release-batch', ['order_ids' => [$draft->id, $alreadyReleased->id]])
+            ->assertStatus(207)->assertJsonPath('status', 'partial')->assertJsonPath('summary.released', 1)->assertJsonPath('summary.failed', 1);
+        $this->assertSame('released', $draft->fresh()->status);
+    }
 }

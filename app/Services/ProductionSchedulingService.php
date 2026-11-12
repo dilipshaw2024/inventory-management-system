@@ -13,7 +13,7 @@ class ProductionSchedulingService
 {
     public function scheduleMany(iterable $orders, CarbonImmutable|string|null $start = null, string $dispatchRule = 'planned_date'): Collection
     {
-        if (!in_array($dispatchRule, ['planned_date', 'shortest_processing_time', 'critical_ratio'], true)) {
+        if (!in_array($dispatchRule, ['planned_date', 'shortest_processing_time', 'critical_ratio', 'setup_optimized'], true)) {
             throw new \InvalidArgumentException('Unsupported production dispatch rule.');
         }
         return DB::transaction(function () use ($orders, $start, $dispatchRule): Collection {
@@ -31,11 +31,12 @@ class ProductionSchedulingService
                 $date = $order->planned_date?->toDateString() ?? '9999-12-31';
                 $duration = max(0.000001, $order->operations->sum(fn ($operation): float => $this->durationMinutes($operation)));
                 $priority = match ($dispatchRule) {
-                    'shortest_processing_time' => $duration,
-                    'critical_ratio' => max(0.0, $base->diffInMinutes(CarbonImmutable::parse($date), false)) / $duration,
-                    default => 0.0,
+                    'shortest_processing_time' => [$duration, $date],
+                    'critical_ratio' => [max(0.0, $base->diffInMinutes(CarbonImmutable::parse($date), false)) / $duration, $date],
+                    'setup_optimized' => [$date, (string) ($order->operations->map(fn ($operation) => trim((string) ($operation->routingOperation?->setup_group ?? '')))->filter()->first() ?: 'bom:'.$order->bom_id), $duration],
+                    default => [$date],
                 };
-                return [$priority, $date, str_pad((string) $order->id, 12, '0', STR_PAD_LEFT)];
+                return array_merge($priority, [str_pad((string) $order->id, 12, '0', STR_PAD_LEFT)]);
             })->values();
             return $ordered->map(fn (ProductionOrder $order): ProductionOrder => $this->schedule($order, $base))->values();
         });

@@ -19,4 +19,5 @@ class SalesOrder extends Model
     public function deliveries() { return $this->hasMany(Delivery::class); }
     public function promotion() { return $this->belongsTo(Promotion::class); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }
+    public function salesperson() { return $this->belongsTo(User::class, 'salesperson_id'); }
 }

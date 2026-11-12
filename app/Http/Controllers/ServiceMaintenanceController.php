@@ -15,6 +15,8 @@ use App\Models\WarrantyClaim;
 use App\Models\AssetSparePart;
 use App\Models\Supplier;
 use App\Models\ServiceContract;
+use App\Models\HrEmployee;
+use App\Models\HrLeaveRequest;
 use App\Services\InventoryLedgerService;
 use App\Services\AuditService;
 use App\Services\NumberingSequenceService;
@@ -24,6 +26,7 @@ use App\Services\MaintenancePartReturnService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
 
 class ServiceMaintenanceController extends Controller
 {
@@ -53,6 +56,27 @@ class ServiceMaintenanceController extends Controller
     {
         $products = Product::orderBy('name')->get(); $customers = Customer::orderBy('name')->get(); $assets = ServiceAsset::where('status', '!=', 'retired')->orderBy('name')->get(); $technicians = ServiceTechnician::with('user')->where('is_available', true)->latest()->get(); $contracts = ServiceContract::where('status', 'active')->whereDate('starts_on', '<=', now())->whereDate('ends_on', '>=', now())->with(['customer', 'asset'])->orderBy('ends_on')->get();
         return view('admin.erp.service_maintenance_create', compact('products', 'customers', 'assets', 'technicians', 'contracts'));
+    }
+
+    public function dispatchBoard(Request $request)
+    {
+        $center = Carbon::parse($request->input('date', now()->toDateString()))->startOfDay();
+        $from = $center->copy()->subDays(3);
+        $to = $center->copy()->addDays(4)->endOfDay();
+        $orders = MaintenanceOrder::where('company_id', auth()->user()?->company_id)
+            ->whereNotNull('scheduled_start_at')->whereBetween('scheduled_start_at', [$from, $to])
+            ->with(['asset', 'assignee:id,name'])->orderBy('scheduled_start_at')->get();
+        $technicians = ServiceTechnician::with('user:id,name')->where('company_id', auth()->user()?->company_id)->orderBy('employee_code')->get();
+        $calendarDays = collect(range(0, 6))->map(function (int $offset) use ($from, $orders): array {
+            $date = $from->copy()->addDays($offset);
+
+            return [
+                'date' => $date,
+                'orders' => $orders->filter(fn ($order): bool => optional($order->scheduled_start_at)->isSameDay($date))->values(),
+            ];
+        });
+
+        return view('admin.erp.service_dispatch', compact('orders', 'technicians', 'center', 'from', 'to', 'calendarDays'));
     }
 
     public function warrantyClaims()
@@ -191,10 +215,47 @@ class ServiceMaintenanceController extends Controller
 
     public function technician(Request $request)
     {
-        $data = $request->validate(['user_id' => ['required', $this->companyExists('users'), 'unique:service_technicians,user_id'], 'employee_code' => ['required', 'string', 'max:50', $this->companyUnique('service_technicians', 'employee_code')], 'skills' => ['nullable', 'string', 'max:1000'], 'hourly_rate' => ['nullable', 'numeric', 'min:0'], 'phone' => ['nullable', 'string', 'max:30']]);
-        $technician = ServiceTechnician::create(['company_id' => auth()->user()?->company_id, 'user_id' => $data['user_id'], 'employee_code' => $data['employee_code'], 'skills' => !empty($data['skills']) ? array_values(array_filter(array_map('trim', explode(',', $data['skills'])))) : [], 'hourly_rate' => $data['hourly_rate'] ?? 0, 'phone' => $data['phone'] ?? null, 'is_available' => true]);
+        $data = $request->validate(['user_id' => ['required', $this->companyExists('users'), 'unique:service_technicians,user_id'], 'employee_code' => ['required', 'string', 'max:50', $this->companyUnique('service_technicians', 'employee_code')], 'skills' => ['nullable', 'string', 'max:1000'], 'skill_certifications' => ['nullable', 'string', 'max:5000'], 'weekend_days' => ['nullable', 'array'], 'weekend_days.*' => ['integer', 'between:0,6'], 'holidays' => ['nullable', 'string', 'max:2000'], 'shift_start' => ['nullable', 'date_format:H:i'], 'shift_end' => ['nullable', 'date_format:H:i'], 'hourly_rate' => ['nullable', 'numeric', 'min:0'], 'phone' => ['nullable', 'string', 'max:30']]);
+        $data['working_calendar'] = ['weekend_days' => array_values(array_unique(array_map('intval', $data['weekend_days'] ?? [0, 6]))), 'holidays' => array_values(array_filter(array_map('trim', explode(',', (string) ($data['holidays'] ?? ''))))), 'shift_start' => $data['shift_start'] ?? '08:00', 'shift_end' => $data['shift_end'] ?? '17:00'];
+        $technician = ServiceTechnician::create(['company_id' => auth()->user()?->company_id, 'user_id' => $data['user_id'], 'employee_code' => $data['employee_code'], 'skills' => !empty($data['skills']) ? array_values(array_filter(array_map('trim', explode(',', $data['skills'])))) : [], 'skill_certifications' => $this->normalizeBrowserSkillCertifications($data['skill_certifications'] ?? null), 'working_calendar' => $data['working_calendar'], 'hourly_rate' => $data['hourly_rate'] ?? 0, 'phone' => $data['phone'] ?? null, 'is_available' => true]);
         app(AuditService::class)->record('service_technician.created', $technician, null, $technician->toArray());
         return back()->with(['message' => 'Service technician created.', 'alert-type' => 'success']);
+    }
+
+    public function editTechnician(int $id)
+    {
+        $technician = ServiceTechnician::where('company_id', auth()->user()?->company_id)->with('user')->findOrFail($id);
+        return view('admin.erp.service_technician_edit', compact('technician'));
+    }
+
+    public function updateTechnician(Request $request, int $id)
+    {
+        $data = $request->validate(['employee_code' => ['sometimes', 'string', 'max:50', Rule::unique('service_technicians', 'employee_code')->ignore($id)->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id)->orWhereNull('company_id'))], 'skills' => ['nullable', 'string', 'max:1000'], 'skill_certifications' => ['nullable', 'string', 'max:5000'], 'weekend_days' => ['nullable', 'array'], 'weekend_days.*' => ['integer', 'between:0,6'], 'holidays' => ['nullable', 'string', 'max:2000'], 'shift_start' => ['nullable', 'date_format:H:i'], 'shift_end' => ['nullable', 'date_format:H:i'], 'hourly_rate' => ['nullable', 'numeric', 'min:0'], 'phone' => ['nullable', 'string', 'max:30'], 'is_available' => ['sometimes', 'boolean']]);
+        $technician = ServiceTechnician::where('company_id', auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+        $before = $technician->only(['employee_code', 'skills', 'skill_certifications', 'working_calendar', 'hourly_rate', 'phone', 'is_available']);
+        if (array_key_exists('skills', $data)) $data['skills'] = !empty($data['skills']) ? array_values(array_filter(array_map('trim', explode(',', $data['skills'])))) : [];
+        if (array_key_exists('skill_certifications', $data)) $data['skill_certifications'] = $this->normalizeBrowserSkillCertifications($data['skill_certifications']);
+        if (array_key_exists('weekend_days', $data) || array_key_exists('holidays', $data) || array_key_exists('shift_start', $data) || array_key_exists('shift_end', $data)) {
+            $current = is_array($technician->working_calendar) ? $technician->working_calendar : [];
+            $data['working_calendar'] = [
+                'weekend_days' => array_values(array_unique(array_map('intval', $data['weekend_days'] ?? ($current['weekend_days'] ?? [0, 6])))),
+                'holidays' => array_values(array_filter(array_map('trim', explode(',', (string) ($data['holidays'] ?? implode(', ', $current['holidays'] ?? [])))))),
+                'shift_start' => $data['shift_start'] ?? ($current['shift_start'] ?? '08:00'),
+                'shift_end' => $data['shift_end'] ?? ($current['shift_end'] ?? '17:00'),
+            ];
+        }
+        $technician->update($data);
+        app(AuditService::class)->record('service_technician.updated', $technician, $before, $technician->fresh()->only(array_keys($before)));
+        return redirect()->route('erp.service.dispatch')->with(['message' => 'Service technician profile updated.', 'alert-type' => 'success']);
+    }
+
+    private function normalizeBrowserSkillCertifications(?string $value): array
+    {
+        return collect(preg_split('/\r?\n/', (string) $value) ?: [])->map(function (string $line): ?array {
+            $parts = array_map('trim', explode('|', $line));
+            if (($parts[0] ?? '') === '') return null;
+            return ['skill' => strtolower($parts[0]), 'certificate_no' => ($parts[1] ?? '') !== '' ? $parts[1] : null, 'expires_on' => ($parts[2] ?? '') !== '' ? $parts[2] : null];
+        })->filter()->unique(fn (array $certification): string => $certification['skill'])->values()->all();
     }
 
     public function schedule(Request $request)
@@ -221,7 +282,12 @@ class ServiceMaintenanceController extends Controller
 
     public function order(Request $request)
     {
-        $data = $request->validate(['order_no' => ['nullable', 'string', 'max:80', $this->companyUnique('maintenance_orders', 'order_no')], 'asset_id' => ['required', $this->companyExists('service_assets')], 'service_request_id' => ['nullable', $this->companyExists('service_requests')], 'maintenance_type' => ['required', 'in:preventive,corrective,inspection'], 'scheduled_date' => ['nullable', 'date'], 'assigned_to' => ['nullable', $this->companyExists('users')], 'notes' => ['nullable', 'string', 'max:3000']]);
+        $data = $request->validate(['order_no' => ['nullable', 'string', 'max:80', $this->companyUnique('maintenance_orders', 'order_no')], 'asset_id' => ['required', $this->companyExists('service_assets')], 'service_request_id' => ['nullable', $this->companyExists('service_requests')], 'maintenance_type' => ['required', 'in:preventive,corrective,inspection'], 'scheduled_date' => ['nullable', 'date'], 'scheduled_start_at' => ['nullable', 'date'], 'scheduled_end_at' => ['nullable', 'date', 'after:scheduled_start_at'], 'estimated_hours' => ['nullable', 'numeric', 'gt:0'], 'required_skills' => ['nullable', 'string', 'max:1000'], 'assigned_to' => ['nullable', $this->companyExists('users')], 'notes' => ['nullable', 'string', 'max:3000']]);
+        if ($request->has('required_skills')) {
+            $data['required_skills'] = !empty($data['required_skills']) ? array_values(array_filter(array_map(fn ($skill): string => strtolower(trim($skill)), explode(',', $data['required_skills'])))) : [];
+        } else {
+            $data['required_skills'] = [];
+        }
         $data['order_no'] = $data['order_no'] ?: app(NumberingSequenceService::class)->nextOrFallback('maintenance_order', 'MO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id);
         try {
             $order = DB::transaction(function () use ($data): MaintenanceOrder {
@@ -234,6 +300,9 @@ class ServiceMaintenanceController extends Controller
                 if (!empty($data['assigned_to'])) {
                     $technician = ServiceTechnician::where('user_id', $data['assigned_to'])->first();
                     if (!$technician || !$technician->is_available) throw new \RuntimeException('The assigned user must be an available service technician.');
+                    foreach ($data['required_skills'] as $skill) if (!$technician->hasSkill($skill, !empty($data['scheduled_start_at']) ? Carbon::parse($data['scheduled_start_at']) : now())) throw new \RuntimeException('The assigned technician does not have all required skills or a required certification is expired.');
+                    $this->assertTechnicianCanWorkWindow($technician, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null);
+                    $this->assertTechnicianWindowAvailable($technician->user_id, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null);
                 }
                 $order = MaintenanceOrder::create($data + ['company_id' => auth()->user()?->company_id, 'created_by' => auth()->id()]);
                 if ($serviceRequest) $serviceRequest->update(['status' => 'in_progress', 'assigned_to' => $data['assigned_to'] ?? $serviceRequest->assigned_to]);
@@ -242,6 +311,74 @@ class ServiceMaintenanceController extends Controller
             });
             return back()->with(['message' => 'Maintenance order created.', 'alert-type' => 'success']);
         } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
+    }
+
+    public function scheduleOrder(Request $request, int $id)
+    {
+        $data = $request->validate(['assigned_to' => ['nullable', $this->companyExists('users')], 'scheduled_date' => ['nullable', 'date'], 'scheduled_start_at' => ['nullable', 'date'], 'scheduled_end_at' => ['nullable', 'date', 'after:scheduled_start_at'], 'estimated_hours' => ['nullable', 'numeric', 'gt:0'], 'required_skills' => ['nullable', 'string', 'max:1000']]);
+        if ($request->has('required_skills')) {
+            $data['required_skills'] = !empty($data['required_skills']) ? array_values(array_filter(array_map(fn ($skill): string => strtolower(trim($skill)), explode(',', $data['required_skills'])))) : [];
+        } else {
+            unset($data['required_skills']);
+        }
+        try {
+            DB::transaction(function () use ($data, $id): void {
+                $order = MaintenanceOrder::where('company_id', auth()->user()?->company_id)->lockForUpdate()->findOrFail($id);
+                if (in_array($order->status, ['completed', 'cancelled'], true)) throw new \RuntimeException('Closed maintenance orders cannot be rescheduled.');
+                $effectiveUserId = array_key_exists('assigned_to', $data) ? $data['assigned_to'] : $order->assigned_to;
+                if (!empty($effectiveUserId)) {
+                    $technician = ServiceTechnician::where('company_id', auth()->user()?->company_id)->where('user_id', $effectiveUserId)->first();
+                    if (!$technician || !$technician->is_available) throw new \RuntimeException('The assigned user must be an available service technician.');
+                    $requiredSkills = array_key_exists('required_skills', $data) ? $data['required_skills'] : ($order->required_skills ?? []);
+                    foreach ($requiredSkills as $skill) if (!$technician->hasSkill($skill, !empty($data['scheduled_start_at']) ? Carbon::parse($data['scheduled_start_at']) : now())) throw new \RuntimeException('The assigned technician does not have all required skills or a required certification is expired.');
+                    $this->assertTechnicianCanWorkWindow($technician, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null);
+                    $this->assertTechnicianWindowAvailable($technician->user_id, $data['scheduled_start_at'] ?? null, $data['scheduled_end_at'] ?? null, $order->id);
+                }
+                $updates = array_filter($data, static fn ($value) => $value !== null);
+                foreach (['assigned_to', 'scheduled_date', 'scheduled_start_at', 'scheduled_end_at', 'estimated_hours', 'required_skills'] as $field) {
+                    if (array_key_exists($field, $data) && $data[$field] === null) $updates[$field] = null;
+                }
+                $before = $order->only(array_keys($updates));
+                $order->update($updates);
+                app(AuditService::class)->record('maintenance_order.scheduled', $order, $before, $order->fresh()->only(array_keys($updates)));
+            });
+        } catch (\RuntimeException $exception) {
+            return back()->withInput()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']);
+        }
+        return back()->with(['message' => 'Maintenance order schedule updated.', 'alert-type' => 'success']);
+    }
+
+    private function assertTechnicianWindowAvailable(int $userId, ?string $startAt, ?string $endAt, ?int $ignoreOrderId = null): void
+    {
+        if (!$startAt || !$endAt) return;
+        $overlap = MaintenanceOrder::where('company_id', auth()->user()?->company_id)
+            ->where('assigned_to', $userId)->whereNotIn('status', ['completed', 'cancelled'])
+            ->whereNotNull('scheduled_start_at')->whereNotNull('scheduled_end_at')
+            ->where('scheduled_start_at', '<', $endAt)->where('scheduled_end_at', '>', $startAt)->exists();
+        if ($ignoreOrderId) {
+            $overlap = MaintenanceOrder::where('company_id', auth()->user()?->company_id)
+                ->where('assigned_to', $userId)->where('id', '!=', $ignoreOrderId)->whereNotIn('status', ['completed', 'cancelled'])
+                ->whereNotNull('scheduled_start_at')->whereNotNull('scheduled_end_at')
+                ->where('scheduled_start_at', '<', $endAt)->where('scheduled_end_at', '>', $startAt)->exists();
+        }
+        if ($overlap) throw new \RuntimeException('The technician is already assigned to an overlapping maintenance window.');
+    }
+
+    private function assertTechnicianCanWorkWindow(ServiceTechnician $technician, ?string $startAt, ?string $endAt): void
+    {
+        if (!$startAt || !$endAt) return;
+        $start = Carbon::parse($startAt);
+        $end = Carbon::parse($endAt);
+        if (!$start->isSameDay($end) || $end->lessThanOrEqualTo($start)) throw new \RuntimeException('The maintenance window must start and end on the same day.');
+        $calendar = is_array($technician->working_calendar) ? $technician->working_calendar : [];
+        $weekends = collect($calendar['weekend_days'] ?? [0, 6])->map(fn ($day): int => (int) $day)->all();
+        $holidays = collect($calendar['holidays'] ?? [])->map(fn ($day): string => (string) $day)->all();
+        if (in_array($start->dayOfWeek, $weekends, true) || in_array($start->toDateString(), $holidays, true)) throw new \RuntimeException('The technician is not working on the selected day.');
+        $shiftStart = Carbon::parse($start->toDateString().' '.($calendar['shift_start'] ?? '08:00'));
+        $shiftEnd = Carbon::parse($start->toDateString().' '.($calendar['shift_end'] ?? '17:00'));
+        if ($start->lessThan($shiftStart) || $end->greaterThan($shiftEnd)) throw new \RuntimeException('The maintenance window is outside the technician working hours.');
+        $employee = HrEmployee::where('company_id', $technician->company_id)->where('user_id', $technician->user_id)->first();
+        if ($employee && HrLeaveRequest::where('company_id', $technician->company_id)->where('employee_id', $employee->id)->where('status', 'approved')->whereDate('starts_on', '<=', $start->toDateString())->whereDate('ends_on', '>=', $start->toDateString())->exists()) throw new \RuntimeException('The technician is on approved leave for the selected day.');
     }
 
     public function parts(int $id)

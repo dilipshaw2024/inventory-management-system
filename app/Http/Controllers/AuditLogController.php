@@ -11,10 +11,12 @@ use App\Models\Product;
 use App\Models\Supplier;
 use App\Models\Customer;
 use App\Services\RevisionRestoreService;
+use App\Services\ProductSpreadsheetService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Symfony\Component\HttpFoundation\Response;
 
 class AuditLogController extends Controller
 {
@@ -40,18 +42,28 @@ class AuditLogController extends Controller
         return view('admin.erp.user_activity', compact('activities', 'users'));
     }
 
-    public function activityExport(Request $request)
+    public function activityExport(Request $request, ProductSpreadsheetService $spreadsheet): Response
     {
-        $data = $request->validate(['action' => ['nullable', 'string', 'max:80'], 'user_id' => ['nullable', 'exists:users,id'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from']]);
+        $data = $request->validate(['action' => ['nullable', 'string', 'max:80'], 'user_id' => ['nullable', 'exists:users,id'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'format' => ['nullable', 'in:csv,xlsx']]);
         $activities = DB::table('user_activity_logs')->leftJoin('users', 'users.id', '=', 'user_activity_logs.user_id')->select('user_activity_logs.*', 'users.name as user_name')->when(auth()->user()?->company_id, fn ($query, $companyId) => $query->where(fn ($scope) => $scope->where('user_activity_logs.company_id', $companyId)->orWhereNull('user_activity_logs.company_id')))->when($data['action'] ?? null, fn ($query, $action) => $query->where('user_activity_logs.action', 'like', '%'.$action.'%'))->when($data['user_id'] ?? null, fn ($query, $userId) => $query->where('user_activity_logs.user_id', $userId))->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('user_activity_logs.created_at', '>=', $date))->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('user_activity_logs.created_at', '<=', $date))->orderBy('user_activity_logs.id')->cursor();
-        return response()->streamDownload(function () use ($activities): void { $handle = fopen('php://output', 'w'); fputcsv($handle, ['ID', 'Timestamp', 'User', 'Email', 'Action', 'Route', 'IP', 'User agent', 'Metadata']); foreach ($activities as $activity) fputcsv($handle, [$activity->id, $activity->created_at, $activity->user_name ?? 'Guest', $activity->email, $activity->action, $activity->route, $activity->ip_address, $activity->user_agent, $activity->metadata]); fclose($handle); }, 'user-activity-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
+        $headers = ['ID', 'Timestamp', 'User', 'Email', 'Action', 'Route', 'IP', 'User agent', 'Metadata'];
+        if (($data['format'] ?? null) === 'xlsx') {
+            $values = $activities->map(fn ($activity): array => [$activity->id, $activity->created_at, $activity->user_name ?? 'Guest', $activity->email, $activity->action, $activity->route, $activity->ip_address, $activity->user_agent, $activity->metadata])->all();
+            return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="user-activity-'.now()->format('Ymd-His').'.xlsx"']);
+        }
+        return response()->streamDownload(function () use ($activities, $headers): void { $handle = fopen('php://output', 'w'); fputcsv($handle, $headers); foreach ($activities as $activity) fputcsv($handle, [$activity->id, $activity->created_at, $activity->user_name ?? 'Guest', $activity->email, $activity->action, $activity->route, $activity->ip_address, $activity->user_agent, $activity->metadata]); fclose($handle); }, 'user-activity-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
     }
 
-    public function export(Request $request)
+    public function export(Request $request, ProductSpreadsheetService $spreadsheet): Response
     {
-        $data = $request->validate(['action' => ['nullable', 'string', 'max:150'], 'user_id' => ['nullable', 'exists:users,id'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from']]);
+        $data = $request->validate(['action' => ['nullable', 'string', 'max:150'], 'user_id' => ['nullable', 'exists:users,id'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'format' => ['nullable', 'in:csv,xlsx']]);
         $logs = DB::table('audit_logs')->leftJoin('users', 'users.id', '=', 'audit_logs.user_id')->select('audit_logs.*', 'users.name as user_name')->when(auth()->user()?->company_id, fn ($query, $companyId) => $query->where(fn ($scope) => $scope->where('audit_logs.company_id', $companyId)->orWhereNull('audit_logs.company_id')))->when($data['action'] ?? null, fn ($query, $action) => $query->where('audit_logs.action', 'like', '%'.$action.'%'))->when($data['user_id'] ?? null, fn ($query, $userId) => $query->where('audit_logs.user_id', $userId))->when($data['from'] ?? null, fn ($query, $date) => $query->whereDate('audit_logs.created_at', '>=', $date))->when($data['to'] ?? null, fn ($query, $date) => $query->whereDate('audit_logs.created_at', '<=', $date))->orderBy('audit_logs.id')->cursor();
-        return response()->streamDownload(function () use ($logs): void { $handle = fopen('php://output', 'w'); fputcsv($handle, ['ID', 'Timestamp', 'User', 'Action', 'Auditable type', 'Auditable ID', 'IP', 'Old values', 'New values', 'Previous hash', 'Integrity hash']); foreach ($logs as $log) fputcsv($handle, [$log->id, $log->created_at, $log->user_name ?? 'System', $log->action, $log->auditable_type, $log->auditable_id, $log->ip_address, $log->old_values, $log->new_values, $log->previous_hash, $log->integrity_hash]); fclose($handle); }, 'audit-log-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
+        $headers = ['ID', 'Timestamp', 'User', 'Action', 'Auditable type', 'Auditable ID', 'IP', 'Old values', 'New values', 'Previous hash', 'Integrity hash'];
+        if (($data['format'] ?? null) === 'xlsx') {
+            $values = $logs->map(fn ($log): array => [$log->id, $log->created_at, $log->user_name ?? 'System', $log->action, $log->auditable_type, $log->auditable_id, $log->ip_address, $log->old_values, $log->new_values, $log->previous_hash, $log->integrity_hash])->all();
+            return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="audit-log-'.now()->format('Ymd-His').'.xlsx"']);
+        }
+        return response()->streamDownload(function () use ($logs, $headers): void { $handle = fopen('php://output', 'w'); fputcsv($handle, $headers); foreach ($logs as $log) fputcsv($handle, [$log->id, $log->created_at, $log->user_name ?? 'System', $log->action, $log->auditable_type, $log->auditable_id, $log->ip_address, $log->old_values, $log->new_values, $log->previous_hash, $log->integrity_hash]); fclose($handle); }, 'audit-log-'.now()->format('Ymd-His').'.csv', ['Content-Type' => 'text/csv']);
     }
 
     public function statusHistory(Request $request)

@@ -37,6 +37,8 @@ class SalesQuotationController extends Controller
         $data = $request->validate([
             'quote_no' => ['nullable', 'string', 'max:100', 'unique:sales_quotations,quote_no'],
             'customer_id' => ['required', $this->companyExists('customers')],
+            'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'],
+            'salesperson_id' => ['nullable', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', auth()->user()?->company_id))],
             'quote_date' => ['required', 'date'],
             'valid_until' => ['nullable', 'date', 'after_or_equal:quote_date'],
             'description' => ['nullable', 'string', 'max:2000'],
@@ -52,7 +54,7 @@ class SalesQuotationController extends Controller
         $quotation = SalesQuotation::create([
             'company_id' => auth()->user()?->company_id,
             'quote_no' => $data['quote_no'] ?: app(NumberingSequenceService::class)->nextOrFallback('sales_quotation', 'QT-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id),
-            'customer_id' => $data['customer_id'], 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
+            'customer_id' => $data['customer_id'], 'sales_channel' => $data['sales_channel'] ?? null, 'delivery_method' => $data['delivery_method'] ?? null, 'salesperson_id' => $data['salesperson_id'] ?? auth()->id(), 'quote_date' => $data['quote_date'], 'valid_until' => $data['valid_until'] ?? null,
             'description' => $data['description'] ?? null, 'created_by' => auth()->id(), 'status' => 'submitted',
         ]);
         foreach ($data['product_id'] as $index => $productId) {
@@ -99,7 +101,7 @@ class SalesQuotationController extends Controller
             $order = SalesOrder::create([
                 'company_id' => $quotation->company_id ?: auth()->user()?->company_id,
                 'order_no' => app(NumberingSequenceService::class)->nextOrFallback('sales_order', 'SO-'.now()->format('YmdHis').'-'.random_int(100, 999), auth()->user()?->company_id, auth()->user()?->branch_id),
-                'customer_id' => $quotation->customer_id, 'date' => now()->toDateString(), 'requested_date' => $quotation->valid_until,
+                'customer_id' => $quotation->customer_id, 'sales_channel' => $quotation->sales_channel ?: $quotation->customer?->sales_channel, 'delivery_method' => $quotation->delivery_method, 'salesperson_id' => $quotation->salesperson_id ?: $quotation->created_by, 'date' => now()->toDateString(), 'requested_date' => $quotation->valid_until,
                 'description' => 'Converted from quotation '.$quotation->quote_no, 'status' => 'submitted', 'created_by' => auth()->id(),
             ]);
             foreach ($quotation->lines as $line) SalesOrderLine::create(['sales_order_id' => $order->id, 'product_id' => $line->product_id, 'ordered_qty' => $line->quantity, 'unit_price' => $line->unit_price, 'discount_amount' => $line->discount_amount]);

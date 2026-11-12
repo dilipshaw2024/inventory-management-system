@@ -113,6 +113,7 @@ class ProcurementIntegrationController extends Controller
         $trend = [];
         if ($request->boolean('include_trend')) {
             $trendOrders = $orders->groupBy(fn ($order): string => $order->date->format('Y-m'));
+            $trendInvoices = $invoices->flatten(1);
             $period = CarbonPeriod::create(Carbon::parse($from)->startOfMonth(), '1 month', Carbon::parse($to)->startOfMonth());
             foreach ($period as $month) {
                 $monthKey = $month->format('Y-m');
@@ -125,13 +126,20 @@ class ProcurementIntegrationController extends Controller
                 $failed = $inspected->where('inspection_status', 'failed');
                 $rejected = (float) $failed->sum(fn ($receipt) => $receipt->lines->sum('received_qty'));
                 $orderedValue = (float) $monthOrders->sum(fn ($order) => $order->lines->sum(fn ($line) => (float) $line->ordered_qty * (float) $line->unit_price));
+                $monthInvoices = $trendInvoices->filter(fn ($invoice): bool => $invoice->invoice_date?->format('Y-m') === $monthKey);
+                $invoicedQuantity = (float) $monthInvoices->sum(fn ($invoice) => $invoice->lines->sum('quantity'));
+                $invoicedValue = (float) $monthInvoices->sum(fn ($invoice) => $invoice->lines->sum(fn ($line) => (float) $line->quantity * (float) $line->unit_price));
+                $orderedUnitCost = $ordered > 0 ? $orderedValue / $ordered : 0;
+                $invoicedUnitCost = $invoicedQuantity > 0 ? $invoicedValue / $invoicedQuantity : 0;
                 $trend[] = [
                     'month' => $monthKey, 'orders' => $monthOrders->count(), 'ordered' => $ordered, 'received' => $received,
                     'fill_rate' => $ordered > 0 ? round(($received / $ordered) * 100, 6) : 0,
                     'receipts' => $monthReceipts->count(), 'on_time_rate' => $monthReceipts->count() > 0 ? round(($onTime / $monthReceipts->count()) * 100, 6) : null,
                     'inspected_receipts' => $inspected->count(), 'failed_receipts' => $failed->count(),
                     'quality_rejection_rate' => $received > 0 ? round(($rejected / $received) * 100, 6) : 0,
-                    'ordered_value' => $orderedValue,
+                    'ordered_value' => $orderedValue, 'invoiced_quantity' => $invoicedQuantity, 'invoiced_value' => $invoicedValue,
+                    'price_variance' => $orderedUnitCost > 0 && $invoicedQuantity > 0 ? round((($invoicedUnitCost - $orderedUnitCost) / $orderedUnitCost) * 100, 6) : 0,
+                    'price_variance_amount' => $orderedUnitCost > 0 && $invoicedQuantity > 0 ? round(($invoicedUnitCost - $orderedUnitCost) * $invoicedQuantity, 6) : 0,
                 ];
             }
         }
@@ -254,7 +262,7 @@ class ProcurementIntegrationController extends Controller
         $supplier = $order->supplier;
         $currency = strtoupper($data['currency_code'] ?? ($order->currency_code ?: ($request->user()?->company?->base_currency ?? 'USD')));
         $exchangeRate = $data['exchange_rate'] ?? app(CurrencyConversionService::class)->rate($currency, strtoupper($request->user()?->company?->base_currency ?? 'USD'), $data['invoice_date']);
-        $taxExempt = (bool) $supplier->tax_exempt;
+        $taxExempt = $supplier->taxExemptionIsActive(\Carbon\Carbon::parse($data['invoice_date']));
         $invoice = DB::transaction(function () use ($data, $companyId, $order, $supplier, $currency, $exchangeRate, $taxExempt, $request): PurchaseInvoice {
             $taxMode = $data['tax_mode'] ?? app(\App\Services\ErpSettingService::class)->get('default_tax_mode', 'exclusive');
             $invoice = PurchaseInvoice::create([
@@ -278,10 +286,10 @@ class ProcurementIntegrationController extends Controller
                 $quantity = (float) $input['quantity']; $unitPrice = (float) $input['unit_price']; $lineSubtotal = $quantity * $unitPrice;
                 $taxDefinition = $taxExempt || isset($input['tax_rate']) ? null : app(TaxRateResolver::class)->taxFor($poLine->product, $data['invoice_date'], $supplier->tax_jurisdiction);
                 $rate = $taxExempt ? 0 : (isset($input['tax_rate']) ? (float) $input['tax_rate'] : (float) ($taxDefinition?->rate ?? $poLine->product?->tax_rate ?? 0));
-                $taxResult = $taxMode === 'inclusive' ? app(TaxCalculationService::class)->inclusive($lineSubtotal, $rate) : ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $rate)]);
+                $taxResult = $taxMode === 'inclusive' ? ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->inclusiveComponents($lineSubtotal, $taxDefinition->components) : app(TaxCalculationService::class)->inclusive($lineSubtotal, $rate)) : ($taxDefinition?->components?->isNotEmpty() ? app(TaxCalculationService::class)->exclusiveComponents($lineSubtotal, $taxDefinition->components) : ['net' => $lineSubtotal, 'tax' => app(TaxCalculationService::class)->exclusive($lineSubtotal, $rate)]);
                 $lineTax = (float) $taxResult['tax']; $subtotal += (float) $taxResult['net']; $tax += $lineTax;
-                PurchaseInvoiceLine::create(['purchase_invoice_id' => $invoice->id, 'purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)]);
-                $auditLines[] = ['purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)];
+                PurchaseInvoiceLine::create(['purchase_invoice_id' => $invoice->id, 'purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'tax_components' => $taxResult['components'] ?? null, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)]);
+                $auditLines[] = ['purchase_order_line_id' => $poLine->id, 'goods_receipt_line_id' => $input['goods_receipt_line_id'] ?? null, 'product_id' => $poLine->product_id, 'quantity' => $quantity, 'unit_price' => $unitPrice, 'tax_rate' => $rate, 'tax_amount' => $lineTax, 'tax_components' => $taxResult['components'] ?? null, 'line_total' => $lineSubtotal + ($taxMode === 'inclusive' ? 0 : $lineTax)];
             }
             $invoice->update(['subtotal_amount' => $subtotal, 'tax_amount' => $tax, 'total_amount' => $subtotal + $tax]);
             app(AuditService::class)->record('purchase_invoice.created', $invoice, null, array_merge($invoice->toArray(), ['lines' => $auditLines]));

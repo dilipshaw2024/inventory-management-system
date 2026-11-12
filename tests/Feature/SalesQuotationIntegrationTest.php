@@ -32,10 +32,10 @@ class SalesQuotationIntegrationTest extends TestCase
         Sanctum::actingAs($creator, ['sales:read', 'sales:write']);
 
         $created = $this->postJson('/api/integration/sales-quotations', [
-            'external_reference' => 'SQ-EXT-1', 'customer_id' => $customer->id, 'quote_date' => now()->toDateString(), 'valid_until' => now()->addDays(7)->toDateString(),
+            'external_reference' => 'SQ-EXT-1', 'customer_id' => $customer->id, 'sales_channel' => 'marketplace', 'delivery_method' => 'shipping', 'salesperson_id' => $creator->id, 'quote_date' => now()->toDateString(), 'valid_until' => now()->addDays(7)->toDateString(),
             'lines' => [['product_id' => $product->id, 'quantity' => 2, 'unit_price' => 50, 'discount_amount' => 5]],
         ]);
-        $created->assertCreated()->assertJsonPath('status', 'submitted')->assertJsonPath('data.lines.0.product_id', $product->id);
+        $created->assertCreated()->assertJsonPath('status', 'submitted')->assertJsonPath('data.lines.0.product_id', $product->id)->assertJsonPath('data.sales_channel', 'marketplace')->assertJsonPath('data.delivery_method', 'shipping')->assertJsonPath('data.salesperson_id', $creator->id);
         $quotationId = $created->json('data.id');
         $creationRevision = DocumentRevision::where('document_type', SalesQuotation::class)->where('document_id', $quotationId)->latest('version')->firstOrFail();
         $this->assertSame($product->id, (int) data_get($creationRevision->new_values, 'lines.0.product_id'));
@@ -89,7 +89,7 @@ class SalesQuotationIntegrationTest extends TestCase
         ])->assertNotFound();
         Sanctum::actingAs($checker, ['sales:read', 'sales:write']);
         $converted = $this->postJson('/api/integration/sales-quotations/'.$quotationId.'/convert');
-        $converted->assertCreated()->assertJsonPath('status', 'sales_order_created')->assertJsonPath('data.customer_id', $customer->id)->assertJsonPath('data.lines.0.discount_amount', '5.000000');
+        $converted->assertCreated()->assertJsonPath('status', 'sales_order_created')->assertJsonPath('data.customer_id', $customer->id)->assertJsonPath('data.sales_channel', 'marketplace')->assertJsonPath('data.delivery_method', 'shipping')->assertJsonPath('data.salesperson_id', $creator->id)->assertJsonPath('data.lines.0.discount_amount', '5.000000');
         $this->assertDatabaseHas('sales_quotations', ['id' => $quotationId, 'status' => 'converted']);
         $this->assertDatabaseHas('audit_logs', ['action' => 'sales_quotation.converted']);
 

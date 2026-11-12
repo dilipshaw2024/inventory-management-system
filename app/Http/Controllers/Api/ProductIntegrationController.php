@@ -324,7 +324,7 @@ class ProductIntegrationController extends Controller
         $barcode = ProductBarcode::with('product')->where('code', $code)->first();
         $product = $barcode?->product;
         if (!$product) {
-            $product = Product::with(['category', 'unit', 'brand', 'barcodes'])
+            $product = Product::with(['category', 'unit', 'brand', 'barcodes', 'taxDefinition.components'])
                 ->where(function ($query) use ($code): void {
                     $query->where('barcode', $code)->orWhere('sku', $code);
                 })->first();
@@ -334,9 +334,12 @@ class ProductIntegrationController extends Controller
         }
 
         $availability = app(InventoryAvailabilityService::class)->available($product, true, $locationId, auth()->user()?->company_id);
+        $taxDefinition = $product->taxDefinition;
+        $productData = $product->only(['id', 'name', 'sku', 'barcode', 'sales_price', 'tax_rate', 'tax_rate_id', 'tracking_type', 'product_type', 'lifecycle_status', 'can_purchase', 'can_sell', 'is_stock_item', 'weight_kg', 'length_m', 'width_m', 'height_m']);
+        $productData['tax_definition'] = $taxDefinition ? $taxDefinition->only(['id', 'code', 'name', 'rate', 'calculation', 'jurisdiction', 'effective_from', 'effective_until', 'is_active']) + ['components' => $taxDefinition->components->values()] : null;
         return response()->json([
             'data' => [
-                'product' => $product->only(['id', 'name', 'sku', 'barcode', 'sales_price', 'tax_rate', 'tax_rate_id', 'tracking_type', 'product_type', 'lifecycle_status', 'can_purchase', 'can_sell', 'is_stock_item', 'weight_kg', 'length_m', 'width_m', 'height_m']),
+                'product' => $productData,
                 'barcode_type' => $barcode?->type ?? ($product->sku === $code ? 'sku' : 'barcode'),
                 'matched_code' => $code,
                 'location_id' => $locationId,

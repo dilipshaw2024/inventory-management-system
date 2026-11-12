@@ -26,6 +26,7 @@ class Kernel extends ConsoleKernel
         $schedule->command('erp:payables:overdue-alerts')->dailyAt('06:45')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:service:generate-due')->dailyAt('05:00')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:service:expire-contracts')->dailyAt('04:45')->withoutOverlapping(60)->onOneServer();
+        $schedule->command('erp:service:certification-alerts')->dailyAt('06:15')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:service:sla-alerts')->dailyAt('06:35')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:sales:delivery-sla-alerts')->dailyAt('06:40')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:logistics:sync-carrier-tracking')->hourly()->withoutOverlapping(55)->onOneServer();

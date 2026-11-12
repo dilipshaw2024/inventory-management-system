@@ -8,6 +8,7 @@ use App\Models\Customer;
 use App\Models\Permission;
 use App\Models\Role;
 use App\Models\Delivery;
+use App\Models\DeliveryPackage;
 use App\Models\SalesOrder;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -49,10 +50,15 @@ class CarrierRateCardTest extends TestCase
             'base_amount' => 50, 'per_kg_amount' => 5, 'currency_code' => 'INR', 'transit_days' => 5,
             'is_active' => true,
         ]);
+        CarrierRateCard::create([
+            'company_id' => $company->id, 'carrier' => 'Universal Carrier', 'service_code' => 'PREMIUM',
+            'base_amount' => 10, 'per_kg_amount' => 1, 'minimum_charge' => 100,
+            'fuel_surcharge_percent' => 10, 'billable_weight_increment_kg' => 2, 'currency_code' => 'INR', 'transit_days' => 10, 'is_active' => true,
+        ]);
         $quote = $this->postJson('/api/integration/logistics/rate-quotes', [
             'carrier' => 'Universal Carrier', 'weight_kg' => 5, 'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S', 'as_of' => '2026-09-29',
         ]);
-        $quote->assertOk()->assertJsonPath('meta.count', 2)->assertJsonPath('data.0.service_code', 'ECONOMY')->assertJsonPath('data.0.total_amount', 75)->assertJsonPath('data.1.total_amount', 200);
+        $quote->assertOk()->assertJsonPath('meta.count', 3)->assertJsonPath('data.0.service_code', 'ECONOMY')->assertJsonPath('data.0.total_amount', 75)->assertJsonPath('data.1.service_code', 'PREMIUM')->assertJsonPath('data.1.total_amount', 110)->assertJsonPath('data.1.minimum_charge', 100)->assertJsonPath('data.1.fuel_surcharge_percent', 10)->assertJsonPath('data.1.billable_weight_kg', 6)->assertJsonPath('data.2.total_amount', 200);
 
         $customer = Customer::create(['company_id' => $company->id, 'name' => 'Rate Quote Customer', 'is_active' => true]);
         $order = SalesOrder::create([
@@ -62,10 +68,20 @@ class CarrierRateCardTest extends TestCase
             'company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-RATE-1', 'date' => '2026-09-29',
             'carrier' => 'Universal Carrier', 'status' => 'approved', 'total_weight' => 5, 'weight_unit' => 'kg',
         ]);
+        CarrierRateCard::create([
+            'company_id' => $company->id, 'carrier' => 'Universal Carrier', 'service_code' => 'DIMENSIONAL',
+            'base_amount' => 300, 'per_kg_amount' => 1, 'dimensional_divisor' => 1,
+            'currency_code' => 'INR', 'transit_days' => 20, 'is_active' => true,
+        ]);
+        DeliveryPackage::create([
+            'company_id' => $company->id, 'delivery_id' => $delivery->id, 'package_no' => 'PKG-RATE-1',
+            'status' => 'packed', 'weight' => 5, 'weight_unit' => 'kg', 'length' => 2, 'width' => 2, 'height' => 2,
+        ]);
         $this->postJson('/api/integration/logistics/rate-quotes', [
             'delivery_id' => $delivery->id, 'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S', 'as_of' => '2026-09-29',
         ])->assertOk()->assertJsonPath('meta.delivery_id', $delivery->id)->assertJsonPath('meta.weight_kg', 5)
-            ->assertJsonPath('data.0.service_code', 'ECONOMY');
+            ->assertJsonPath('data.0.service_code', 'ECONOMY')->assertJsonPath('data.3.service_code', 'DIMENSIONAL')
+            ->assertJsonPath('data.3.dimensional_weight_kg', 8)->assertJsonPath('data.3.total_amount', 308);
 
         $auto = $this->postJson('/api/integration/deliveries/'.$delivery->id.'/carrier-quote/auto', [
             'origin_zone' => 'IN-W', 'destination_zone' => 'IN-S', 'as_of' => '2026-09-29',
@@ -98,7 +114,7 @@ class CarrierRateCardTest extends TestCase
         $this->assertDatabaseHas('audit_logs', ['action' => 'delivery.carrier_quote_auto_selected']);
 
         $this->getJson('/api/integration/logistics/rate-cards?carrier=Universal%20Carrier')
-            ->assertOk()->assertJsonPath('meta.total', 2);
+            ->assertOk()->assertJsonPath('meta.total', 4);
     }
 
     public function test_browser_rate_card_administration_is_permission_protected_and_audited(): void
@@ -119,9 +135,10 @@ class CarrierRateCardTest extends TestCase
         $this->assertDatabaseHas('carrier_rate_cards', ['id' => $card->id, 'currency_code' => 'INR', 'is_active' => 1]);
         $this->actingAs($user)->put('/warehouse/logistics/rate-cards/'.$card->id, [
             'carrier' => 'Browser Carrier Updated', 'service_code' => 'GROUND', 'base_amount' => 30,
-            'per_kg_amount' => 5, 'currency_code' => 'INR',
+            'per_kg_amount' => 5, 'currency_code' => 'INR', 'billable_weight_increment_kg' => 1,
+            'dimensional_divisor' => 5000,
         ])->assertRedirect();
-        $this->assertDatabaseHas('carrier_rate_cards', ['id' => $card->id, 'carrier' => 'Browser Carrier Updated', 'base_amount' => 30]);
+        $this->assertDatabaseHas('carrier_rate_cards', ['id' => $card->id, 'carrier' => 'Browser Carrier Updated', 'base_amount' => 30, 'billable_weight_increment_kg' => 1, 'dimensional_divisor' => 5000]);
         $this->actingAs($user)->post('/warehouse/logistics/rate-cards/'.$card->id.'/deactivate')->assertRedirect();
         $this->assertDatabaseHas('carrier_rate_cards', ['id' => $card->id, 'is_active' => 0]);
     }

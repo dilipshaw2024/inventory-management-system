@@ -7,6 +7,7 @@ use App\Models\Permission;
 use App\Models\Role;
 use App\Models\User;
 use App\Models\Warehouse;
+use App\Models\Store;
 use App\Models\AuditLog;
 use App\Models\ApprovalDelegation;
 use App\Models\ApprovalPolicy;
@@ -135,6 +136,38 @@ class SecurityIntegrationController extends Controller
         $user->update(['warehouse_id' => $warehouse?->id]);
         $user->load(['roles:id,name,code,is_active', 'store:id,name,code,branch_id', 'warehouse:id,name,code,branch_id']);
         app(AuditService::class)->record('security.user_warehouse_scope.updated', $user, $before, $user->toArray());
+
+        return response()->json(['data' => $user, 'status' => 'updated']);
+    }
+
+    public function assignStore(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for store assignment.');
+        abort_if($request->user()?->store_id, 403, 'Store-scoped users cannot assign store scope.');
+
+        $data = $request->validate(['store_id' => ['nullable', 'integer']]);
+        $user = User::where('company_id', $companyId)->findOrFail($id);
+        $store = null;
+        if (!empty($data['store_id'])) {
+            $store = Store::withoutGlobalScopes()
+                ->whereKey($data['store_id'])
+                ->where('is_active', true)
+                ->whereHas('branch', fn ($query) => $query->where('company_id', $companyId))
+                ->with('branch:id,company_id')
+                ->firstOrFail();
+            if ($user->branch_id && (int) $store->branch_id !== (int) $user->branch_id) {
+                return response()->json(['message' => "The store must belong to the user's assigned branch."], 422);
+            }
+            if ($user->warehouse_id && $store->warehouse_id && (int) $store->warehouse_id !== (int) $user->warehouse_id) {
+                return response()->json(['message' => "The store must use the user's assigned warehouse."], 422);
+            }
+        }
+
+        $before = $user->toArray();
+        $user->update(['store_id' => $store?->id]);
+        $user->load(['roles:id,name,code,is_active', 'store:id,name,code,branch_id,warehouse_id', 'warehouse:id,name,code,branch_id']);
+        app(AuditService::class)->record('security.user_store_scope.updated', $user, $before, $user->toArray());
 
         return response()->json(['data' => $user, 'status' => 'updated']);
     }
@@ -552,6 +585,9 @@ class SecurityIntegrationController extends Controller
             'escalation_after_hours' => ['nullable', 'integer', 'min:1', 'max:8760'],
             'escalation_permissions' => ['nullable', 'array', 'max:10'],
             'escalation_permissions.*' => ['string', 'max:100', Rule::exists('permissions', 'code')],
+            'escalation_user_ids' => ['nullable', 'array', 'max:10'],
+            'escalation_user_ids.*' => ['nullable', 'array', 'max:100'],
+            'escalation_user_ids.*.*' => ['integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('is_active', true))],
             'max_escalation_level' => ['nullable', 'integer', 'min:1', 'max:10'],
             'branch_id' => ['nullable', 'integer', Rule::exists('branches', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'category_id' => ['nullable', 'integer', Rule::exists('categories', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],

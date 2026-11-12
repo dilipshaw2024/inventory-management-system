@@ -46,6 +46,23 @@ class StockLedgerExportTenantTest extends TestCase
             ->assertRedirect()->assertSessionHasErrors('product_id');
     }
 
+    public function test_stock_ledger_export_supports_xlsx_without_cross_company_rows(): void
+    {
+        $company = Company::create(['name' => 'Ledger XLSX Co', 'code' => 'LEDGER-XLSX']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $permissions = collect(['reports.view', 'reports.export'])->map(fn (string $code): Permission => Permission::create(['code' => $code, 'name' => $code, 'module' => 'reports']));
+        $role = Role::create(['code' => 'ledger-xlsx-exporter', 'name' => 'Ledger XLSX exporter', 'is_active' => true]);
+        $role->permissions()->attach($permissions->pluck('id')->all());
+        $user->roles()->attach($role->id);
+        $product = $this->product($company, 'XLSX ledger item');
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 3, 'unit_cost' => 12, 'reference_no' => 'XLSX-RECEIPT', 'posted_at' => now()]);
+
+        $response = $this->actingAs($user)->get('/stock/movements/export?format=xlsx');
+        $response->assertOk()->assertHeader('content-type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        $this->assertStringStartsWith('PK', $response->getContent());
+        $this->assertStringContainsString('stock-ledger-', $response->headers->get('content-disposition'));
+    }
+
     public function test_valuation_export_reuses_filters_and_requires_export_permission(): void
     {
         $company = Company::create(['name' => 'Valuation Export Co', 'code' => 'VALUATION-EXPORT']);

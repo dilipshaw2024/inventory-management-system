@@ -16,6 +16,7 @@ class Delivery extends Model
     public function lines() { return $this->hasMany(DeliveryLine::class); }
     public function operations() { return $this->hasMany(DeliveryOperation::class); }
     public function trackingEvents() { return $this->hasMany(DeliveryTrackingEvent::class); }
+    public function proofs() { return $this->hasMany(DeliveryProof::class); }
     public function packages() { return $this->hasMany(DeliveryPackage::class); }
     public function pickWaves() { return $this->belongsToMany(PickWave::class, 'pick_wave_deliveries'); }
     public function dispatchManifests() { return $this->belongsToMany(DispatchManifest::class, 'dispatch_manifest_deliveries'); }

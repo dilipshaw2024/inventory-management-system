@@ -21,6 +21,9 @@ class InvoiceRequest extends FormRequest
         return [
             'invoice_no' => ['required', 'string', 'max:255', Rule::unique('invoices', 'invoice_no')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
             'store_id' => ['nullable', 'integer', $storeScope],
+            'sales_channel' => ['nullable', 'string', 'max:50'],
+            'delivery_method' => ['nullable', 'string', 'max:30'],
+            'salesperson_id' => ['nullable', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'date' => ['required', 'date'],
             'due_date' => ['nullable', 'date', 'after_or_equal:date'],
             'category_id' => ['required', 'array', 'min:1'],

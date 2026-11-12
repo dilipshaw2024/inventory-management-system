@@ -11,10 +11,11 @@ use App\Services\AuditService;
 use App\Services\SupplierPaymentService;
 use App\Services\SupplierPayablesService;
 use App\Services\NumberingSequenceService;
+use App\Services\ProductSpreadsheetService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
-use Symfony\Component\HttpFoundation\StreamedResponse;
+use Symfony\Component\HttpFoundation\Response;
 use Carbon\CarbonImmutable;
 
 class SupplierPaymentController extends Controller
@@ -87,10 +88,21 @@ class SupplierPaymentController extends Controller
         return view('backend.purchase.supplier_aging', ['rows' => $this->agingRows($asOf), 'asOf' => $asOf]);
     }
 
-    public function agingExport(Request $request): StreamedResponse
+    public function agingExport(Request $request, ProductSpreadsheetService $spreadsheet): Response
     {
         $asOf = $this->asOf($request);
         $rows = $this->agingRows($asOf);
+        $headers = ['Invoice', 'Supplier', 'Due date', 'Days overdue', 'Bucket', 'Collection status', 'Outstanding'];
+        $values = $rows->map(fn (array $row): array => [
+            $row['invoice']->invoice_no ?: $row['invoice']->id,
+            $row['invoice']->supplier->name,
+            $row['due_date'],
+            $row['days_overdue'],
+            $row['bucket'],
+            $row['collection_status'],
+            number_format((float) $row['outstanding'], 2, '.', ''),
+        ])->all();
+        if ($request->input('format') === 'xlsx') return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="supplier-aging-'.$asOf.'.xlsx"']);
         return response()->streamDownload(function () use ($rows): void {
             $output = fopen('php://output', 'w');
             fputcsv($output, ['Invoice', 'Supplier', 'Due date', 'Days overdue', 'Bucket', 'Collection status', 'Outstanding']);

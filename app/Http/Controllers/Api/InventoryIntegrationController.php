@@ -188,6 +188,25 @@ class InventoryIntegrationController extends Controller
         return response()->json(['data' => $delivery->load('salesOrder', 'lines.product', 'operations'), 'status' => $delivery->status]);
     }
 
+    public function approveDeliveries(Request $request): JsonResponse
+    {
+        $data = $request->validate(['delivery_ids' => ['required', 'array', 'min:1', 'max:100'], 'delivery_ids.*' => ['integer', 'distinct']]);
+        abort_unless($request->user()?->company_id, 403, 'A company is required for delivery approval.');
+        $results = [];
+        foreach ($data['delivery_ids'] as $id) {
+            try {
+                $response = $this->approveDelivery((int) $id);
+                $payload = json_decode($response->getContent(), true, 512, JSON_THROW_ON_ERROR);
+                if ($response->getStatusCode() >= 400) throw new \RuntimeException($payload['message'] ?? 'Delivery approval failed.');
+                $results[] = ['delivery_id' => (int) $id, 'status' => 'approved', 'data' => $payload['data'] ?? null];
+            } catch (\Illuminate\Database\Eloquent\ModelNotFoundException|\RuntimeException|\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $exception) {
+                $results[] = ['delivery_id' => (int) $id, 'status' => 'failed', 'message' => $exception->getMessage() ?: 'Delivery approval failed.'];
+            }
+        }
+        $approved = collect($results)->where('status', 'approved')->count(); $failed = count($results) - $approved;
+        return response()->json(['data' => $results, 'status' => $failed === 0 ? 'approved' : ($approved > 0 ? 'partial' : 'failed'), 'summary' => ['requested' => count($results), 'approved' => $approved, 'failed' => $failed]], $failed > 0 && $approved > 0 ? 207 : ($failed > 0 ? 422 : 200));
+    }
+
     public function confirmDelivery(Request $request, int $id): JsonResponse
     {
         $data = $request->validate(['proof_of_delivery' => ['nullable', 'string', 'max:255'], 'delivered_at' => ['nullable', 'date']]);
@@ -242,6 +261,28 @@ class InventoryIntegrationController extends Controller
         return response()->json(['data' => $operation->load('delivery'), 'status' => $operation->status]);
     }
 
+    public function completeDeliveryOperations(Request $request): JsonResponse
+    {
+        $data = $request->validate(['type' => ['required', 'in:pick,pack'], 'deliveries' => ['required', 'array', 'min:1', 'max:100'], 'deliveries.*.delivery_id' => ['required', 'integer', 'distinct'], 'deliveries.*.confirmed_quantities' => ['nullable', 'array'], 'deliveries.*.confirmed_quantities.*' => ['numeric', 'min:0']]);
+        $companyId = (int) ($request->user()?->company_id ?? 0); abort_unless($companyId, 403, 'A company is required for fulfillment operations.');
+        $storeId = $request->user()?->store_id ? (int) $request->user()->store_id : null; $results = [];
+        foreach ($data['deliveries'] as $item) {
+            try {
+                $operation = DB::transaction(function () use ($request, $item, $data, $companyId, $storeId): DeliveryOperation {
+                    $delivery = $this->companyScope(Delivery::with(['lines.product', 'operations']), $companyId)->when($storeId !== null, fn ($query) => $query->whereHas('salesOrder', fn ($order) => $order->where('store_id', $storeId)))->lockForUpdate()->findOrFail((int) $item['delivery_id']);
+                    $operation = app(WarehouseFulfillmentService::class)->complete($delivery, $data['type'], $item['confirmed_quantities'] ?? null);
+                    app(AuditService::class)->record('delivery.'.$data['type'].'.completed', $delivery, null, ['operation_id' => $operation->id, 'confirmed_quantities' => $operation->confirmed_quantities, 'batch' => true, 'performed_by' => $request->user()?->id]);
+                    return $operation->fresh();
+                });
+                $results[] = ['delivery_id' => (int) $item['delivery_id'], 'status' => 'completed', 'data' => $operation->load('delivery')];
+            } catch (\Illuminate\Database\Eloquent\ModelNotFoundException|\InvalidArgumentException|\RuntimeException $exception) {
+                $results[] = ['delivery_id' => (int) $item['delivery_id'], 'status' => 'failed', 'message' => $exception instanceof \Illuminate\Database\Eloquent\ModelNotFoundException ? 'Delivery not found for this company or store.' : $exception->getMessage()];
+            }
+        }
+        $completed = collect($results)->where('status', 'completed')->count(); $failed = count($results) - $completed;
+        return response()->json(['data' => $results, 'status' => $failed === 0 ? 'completed' : ($completed > 0 ? 'partial' : 'failed'), 'summary' => ['requested' => count($results), 'completed' => $completed, 'failed' => $failed, 'operation_type' => $data['type']]], $failed > 0 && $completed > 0 ? 207 : ($failed > 0 ? 422 : 200));
+    }
+
     public function createSalesOrder(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -250,7 +291,7 @@ class InventoryIntegrationController extends Controller
         $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
         $data = $request->validate([
             'external_reference' => ['nullable', 'string', 'max:150'],
-            'customer_id' => ['required', 'integer', $owned('customers')], 'store_id' => ['nullable', 'integer', $owned('stores')],
+            'customer_id' => ['required', 'integer', $owned('customers')], 'store_id' => ['nullable', 'integer', $owned('stores')], 'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'], 'salesperson_id' => ['nullable', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
             'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'sales'))],
             'location_id' => ['nullable', 'integer'], 'date' => ['required', 'date'], 'requested_date' => ['nullable', 'date', 'after_or_equal:date'],
             'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'],
@@ -282,7 +323,7 @@ class InventoryIntegrationController extends Controller
             $order = SalesOrder::create([
                 'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null, 'customer_id' => $customer->id,
                 'price_list_id' => $priceList?->id,
-                'store_id' => $store?->id, 'location_id' => $data['location_id'] ?? null, 'date' => $data['date'],
+                'store_id' => $store?->id, 'sales_channel' => $data['sales_channel'] ?? ($customer->sales_channel ?: null), 'delivery_method' => $data['delivery_method'] ?? null, 'salesperson_id' => $data['salesperson_id'] ?? $request->user()?->id, 'location_id' => $data['location_id'] ?? null, 'date' => $data['date'],
                 'requested_date' => $data['requested_date'] ?? null, 'description' => $data['description'] ?? null,
                 'allow_backorders' => $data['allow_backorders'] ?? false, 'fulfillment_priority' => $data['fulfillment_priority'] ?? 50, 'currency_code' => strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD')),
                 'exchange_rate' => $data['exchange_rate'] ?? 1, 'order_no' => app(NumberingSequenceService::class)->nextOrFallback('sales_order', 'SO-'.now()->format('YmdHis').'-'.random_int(100, 999), $companyId, $request->user()?->branch_id),
@@ -369,7 +410,7 @@ class InventoryIntegrationController extends Controller
         ]);
         $boolean = static fn ($value): bool => (bool) filter_var($value, FILTER_VALIDATE_BOOLEAN);
         $language = isset($data['language_code']) ? \App\Models\ProductTranslation::normalizeLanguageCode($data['language_code']) : null;
-        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes', 'translations' => fn ($query) => $query->where('company_id', $companyId)->when($language, fn ($nested) => $nested->where('language_code', $language)), 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value']), $companyId)
+        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes', 'taxDefinition.components', 'translations' => fn ($query) => $query->where('company_id', $companyId)->when($language, fn ($nested) => $nested->where('language_code', $language)), 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value']), $companyId)
             ->when($data['q'] ?? null, function ($query, string $search): void {
                 $query->where(function ($nested) use ($search): void {
                     $nested->where('name', 'like', "%{$search}%")
@@ -1529,12 +1570,20 @@ class InventoryIntegrationController extends Controller
 
     public function salesOrders(Request $request): JsonResponse
     {
-        $orders = $this->companyScope(SalesOrder::with(['customer', 'promotion', 'lines.product']), $request->user()?->company_id)
+        $data = $request->validate([
+            'status' => ['nullable', 'in:draft,submitted,approved,partially_delivered,delivered,cancelled'],
+            'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'], 'salesperson_id' => ['nullable', 'integer'],
+            'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $orders = $this->companyScope(SalesOrder::with(['customer', 'salesperson', 'promotion', 'lines.product']), $request->user()?->company_id)
             ->when((int) $request->user()->store_id > 0, fn ($query) => $query->where('store_id', (int) $request->user()->store_id))
-            ->when($request->input('status'), fn ($query, $status) => $query->where('status', $status))
-            ->when($request->has('updated_since'), fn ($query) => $query->where('updated_at', '>=', $request->date('updated_since')))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['sales_channel'] ?? null, fn ($query, $channel) => $query->where('sales_channel', $channel))
+            ->when($data['delivery_method'] ?? null, fn ($query, $method) => $query->where('delivery_method', $method))
+            ->when($data['salesperson_id'] ?? null, fn ($query, $salespersonId) => $query->where('salesperson_id', $salespersonId))
+            ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
-        return app(IntegrationCursorService::class)->paginate($orders, $request, 'sales.orders', (int) $request->input('per_page', 50));
+        return app(IntegrationCursorService::class)->paginate($orders, $request, 'sales.orders', (int) ($data['per_page'] ?? 50));
     }
 
     public function purchaseOrders(Request $request): JsonResponse
@@ -1645,7 +1694,7 @@ class InventoryIntegrationController extends Controller
         $currency = strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD'));
         $exchangeRate = $data['exchange_rate'] ?? app(CurrencyConversionService::class)->rate($currency, strtoupper($request->user()?->company?->base_currency ?? 'USD'), $data['date']);
         $taxMode = $data['tax_mode'] ?? app(\App\Services\ErpSettingService::class)->get('default_tax_mode', 'exclusive');
-        $taxExempt = (bool) $customer->tax_exempt;
+        $taxExempt = $customer->taxExemptionIsActive(\Carbon\Carbon::parse($data['date']));
         $promotionCodes = $data['promotion_codes'] ?? (!empty($data['promotion_code']) ? [$data['promotion_code']] : []);
         $invoice = DB::transaction(function () use ($data, $companyId, $customer, $store, $posSession, $currency, $exchangeRate, $taxMode, $taxExempt, $billingAddress, $shippingAddress, $request, $promotionCodes): Invoice {
             $invoice = Invoice::create([
@@ -1665,7 +1714,9 @@ class InventoryIntegrationController extends Controller
                 $taxDefinition = $taxExempt ? null : app(TaxRateResolver::class)->taxFor($product, $data['date'], $customer->tax_jurisdiction);
                 $rate = $taxDefinition?->rate !== null ? (float) $taxDefinition->rate : (float) ($product->tax_rate ?? 0);
                 $taxResult = $taxMode === 'inclusive'
-                    ? app(TaxCalculationService::class)->inclusive($lineTotalValue, $rate)
+                    ? ($taxDefinition?->components?->isNotEmpty()
+                        ? app(TaxCalculationService::class)->inclusiveComponents($lineTotalValue, $taxDefinition->components)
+                        : app(TaxCalculationService::class)->inclusive($lineTotalValue, $rate))
                     : ($taxDefinition?->components?->isNotEmpty()
                         ? app(TaxCalculationService::class)->exclusiveComponents($lineTotalValue, $taxDefinition->components)
                         : ['net' => $lineTotalValue, 'tax' => app(TaxCalculationService::class)->exclusive($lineTotalValue, $rate)]);
@@ -1673,7 +1724,7 @@ class InventoryIntegrationController extends Controller
                 $lineRows[] = [
                     'product_id' => $product->id, 'quantity' => (float) $line['quantity'], 'unit_price' => (float) $line['unit_price'],
                     'discount' => 0.0, 'category_id' => $product->category_id, 'batch_no' => $line['batch_no'] ?? null,
-                    'serial_numbers' => $line['serial_numbers'] ?? null, 'tax_rate' => $rate, 'tax_amount' => (float) $taxResult['tax'],
+                    'serial_numbers' => $line['serial_numbers'] ?? null, 'tax_rate' => $rate, 'tax_amount' => (float) $taxResult['tax'], 'tax_components' => $taxResult['components'] ?? null,
                 ];
             }
             $discount = (float) ($data['discount_amount'] ?? 0);

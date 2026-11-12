@@ -296,7 +296,7 @@ class PartyIntegrationController extends Controller
             'name' => ['required', 'string', 'max:255'], 'mobile_no' => ['nullable', 'string', 'max:30'],
             'email' => ['nullable', 'email', 'max:255'], 'address' => ['nullable', 'string', 'max:2000'],
             'tax_number' => ['nullable', 'string', 'max:100'], 'tax_jurisdiction' => ['nullable', 'string', 'max:100'], 'tax_exempt' => ['nullable', 'boolean'],
-            'tax_exemption_number' => ['required_if:tax_exempt,1', 'nullable', 'string', 'max:100'],
+            'tax_exemption_number' => ['required_if:tax_exempt,1', 'nullable', 'string', 'max:100'], 'tax_exemption_expires_at' => ['nullable', 'date'],
             'is_active' => ['nullable', 'boolean'], 'status' => ['nullable', 'boolean'],
         ];
     }

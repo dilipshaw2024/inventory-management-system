@@ -9,7 +9,7 @@ class MaintenanceOrder extends Model
 {
     use BelongsToCompany;
     protected $guarded = [];
-    protected $casts = ['scheduled_date' => 'date', 'started_at' => 'datetime', 'completed_at' => 'datetime', 'actual_hours' => 'decimal:4', 'labor_cost' => 'decimal:6'];
+    protected $casts = ['scheduled_date' => 'date', 'scheduled_start_at' => 'datetime', 'scheduled_end_at' => 'datetime', 'required_skills' => 'array', 'started_at' => 'datetime', 'completed_at' => 'datetime', 'actual_hours' => 'decimal:4', 'estimated_hours' => 'decimal:2', 'labor_cost' => 'decimal:6'];
     public function asset() { return $this->belongsTo(ServiceAsset::class, 'asset_id'); }
     public function serviceRequest() { return $this->belongsTo(ServiceRequest::class); }
     public function parts() { return $this->hasMany(MaintenancePart::class); }

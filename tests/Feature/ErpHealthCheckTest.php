@@ -15,4 +15,12 @@ class ErpHealthCheckTest extends TestCase
             ->expectsOutputToContain('"status": "healthy"')
             ->assertExitCode(0);
     }
+
+    public function test_http_readiness_endpoint_returns_a_minimal_healthy_payload(): void
+    {
+        $this->getJson('/health/erp')
+            ->assertOk()
+            ->assertJsonPath('status', 'healthy')
+            ->assertJsonStructure(['status', 'checked_at']);
+    }
 }

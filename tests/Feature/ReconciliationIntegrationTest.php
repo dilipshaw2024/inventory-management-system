@@ -9,10 +9,12 @@ use App\Models\JournalEntry;
 use App\Models\InventoryMovement;
 use App\Models\InventoryReturn;
 use App\Models\Invoice;
+use App\Models\Payment;
 use App\Models\Product;
 use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\Category;
+use App\Models\Customer;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Laravel\Sanctum\Sanctum;
@@ -90,5 +92,31 @@ class ReconciliationIntegrationTest extends TestCase
             ->assertJsonPath('summary.expected_net_revenue', 100)->assertJsonPath('summary.journal_net_revenue', 100)
             ->assertJsonPath('summary.variance', 0)->assertJsonPath('data.0.discount', 20)
             ->assertJsonPath('meta.product_id', $product->id);
+    }
+
+    public function test_inventory_profitability_allocates_invoice_discount_and_reports_net_revenue(): void
+    {
+        $company = Company::create(['name' => 'Profitability Analytics Co', 'code' => 'PROFIT-ANALYTICS']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Profit customer', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Profit supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Profit Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Profit category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Profit item', 'quantity' => 0, 'status' => 1, 'sales_price' => 60]);
+        $invoice = Invoice::create(['company_id' => $company->id, 'invoice_no' => 'INV-PROFIT-1', 'customer_id' => $customer->id, 'date' => '2026-09-18', 'status' => 1, 'subtotal_amount' => 120, 'tax_amount' => 0, 'total_amount' => 100]);
+        $invoice->invoice_details()->create(['date' => '2026-09-18', 'product_id' => $product->id, 'selling_qty' => 2, 'unit_price' => 60, 'selling_price' => 120, 'tax_rate' => 0, 'tax_amount' => 0, 'status' => 1]);
+        Payment::create(['company_id' => $company->id, 'invoice_id' => $invoice->id, 'customer_id' => $customer->id, 'discount_amount' => 20, 'total_amount' => 100]);
+
+        $row = app(\App\Services\InventoryAnalyticsService::class)->rowsForCompany($company->id, '2026-09-01', '2026-09-30')->first();
+        $this->assertSame(120.0, (float) $row['gross_revenue']);
+        $this->assertSame(20.0, (float) $row['discount_amount']);
+        $this->assertSame(100.0, (float) $row['revenue']);
+        $customerRow = app(\App\Services\InventoryAnalyticsService::class)->rowsForCompany($company->id, '2026-09-01', '2026-09-30', null, 'revenue', null, $customer->id)->first();
+        $this->assertSame($customer->id, (int) $customerRow['customer']->id);
+        Sanctum::actingAs($user, ['inventory:read']);
+        $this->getJson('/api/inventory/analytics?from=2026-09-01&to=2026-09-30&customer_id='.$customer->id)
+            ->assertOk()->assertJsonPath('meta.customer_id', $customer->id)
+            ->assertJsonPath('summary.gross_revenue', 120)->assertJsonPath('summary.discount_amount', 20)
+            ->assertJsonPath('data.0.customer.id', $customer->id);
     }
 }

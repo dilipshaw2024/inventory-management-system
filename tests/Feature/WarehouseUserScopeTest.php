@@ -7,6 +7,7 @@ use App\Models\Company;
 use App\Models\InventoryLocation;
 use App\Models\User;
 use App\Models\Warehouse;
+use App\Models\Store;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Auth;
 use Tests\TestCase;
@@ -51,5 +52,20 @@ class WarehouseUserScopeTest extends TestCase
 
         $this->expectException(\Illuminate\Auth\Access\AuthorizationException::class);
         InventoryLocation::create(['warehouse_id' => $second->id, 'name' => 'Blocked Bin', 'code' => 'WH-BLOCKED', 'type' => 'bin', 'is_active' => true]);
+    }
+
+    public function test_company_admin_can_assign_store_scope_with_branch_and_warehouse_guards(): void
+    {
+        $company = Company::create(['name' => 'Store Scope Co', 'code' => 'STORE-SCOPE']);
+        $branch = Branch::create(['company_id' => $company->id, 'name' => 'Store Branch', 'code' => 'STORE-BRANCH']);
+        $warehouse = Warehouse::create(['branch_id' => $branch->id, 'name' => 'Store Warehouse', 'code' => 'STORE-WH']);
+        $store = Store::create(['branch_id' => $branch->id, 'warehouse_id' => $warehouse->id, 'name' => 'Store One', 'code' => 'STORE-ONE', 'is_active' => true]);
+        $admin = User::factory()->create(['company_id' => $company->id]);
+        $operator = User::factory()->create(['company_id' => $company->id, 'branch_id' => $branch->id, 'warehouse_id' => $warehouse->id]);
+        $token = $admin->createToken('store-scope-test', ['integration:read', 'integration:write'])->plainTextToken;
+
+        $this->withToken($token)->patchJson('/api/integration/security/users/'.$operator->id.'/store-scope', ['store_id' => $store->id])
+            ->assertOk()->assertJsonPath('data.store_id', $store->id)->assertJsonPath('data.store.code', 'STORE-ONE');
+        $this->assertSame($store->id, $operator->fresh()->store_id);
     }
 }

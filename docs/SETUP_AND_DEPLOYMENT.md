@@ -2,7 +2,9 @@
 
 This guide explains how to run the Inventory Management System locally and how to deploy it to a production Linux server.
 
-Current migration head: `2026_10_05_000436`. The older migration-summary paragraphs below retain historical release notes; apply the complete migration sequence in filename order.
+Current migration head: `2026_11_11_000446`. The older migration-summary paragraphs below retain historical release notes; apply the complete migration sequence in filename order.
+
+The latest migrations are backward-compatible: `2026_11_10_000440` persists tax-component snapshots on sales and purchase invoice lines, `2026_11_10_000441` adds carrier minimum-charge and fuel-surcharge rules, `2026_11_10_000442` adds billable-weight increments, `2026_11_10_000443` adds optional dimensional-weight divisors, `2026_11_11_000444` adds optional invoice sales-channel, delivery-method, and salesperson dimensions, `2026_11_11_000445` adds the same dimensions to sales orders for browser/API fulfillment, and `2026_11_11_000446` adds them to quotations and quotation conversion. Existing rows default to legacy-compatible behavior. Always run `php artisan migrate --force` during a controlled deployment before enabling the corresponding workflows.
 
 Migration `2026_10_05_000435` links tax filings to active company tax registrations and includes the selected registration in the signed filing snapshot. Apply it after `000434` before creating registration-bound filings.
 
@@ -495,7 +497,8 @@ For a guarded release, first verify both the database and private-storage backup
 ERP_DEPLOY_CONFIRM=I_HAVE_A_BACKUP ./bin/erp-deploy
 ```
 
-`bin/erp-deploy` refuses local environments and missing backup confirmation, applies migrations with `--force`, runs the strict ERP health gate, clears and rebuilds configuration cache, and requests a graceful queue restart. Set `ERP_DEPLOY_MIGRATE=0` only when migrations were already applied by a separate controlled step.
+`bin/erp-deploy` refuses local environments and missing backup confirmation, applies migrations with `--force`, runs the strict ERP health gate, clears and rebuilds configuration cache, and requests a graceful queue restart. Set `ERP_DEPLOY_MIGRATE=0` only when migrations were already applied by a separate controlled step. Load balancers and uptime monitors can use `GET /health/erp`; it returns only a minimal status payload and HTTP 503 when readiness fails.
+Before running it, production must have a non-empty `APP_KEY` and `APP_DEBUG=false`; the helper rejects a missing key or production debug mode, then rebuilds configuration, route, and Blade view caches. Staging may retain debug mode for controlled diagnostics, but should still use a real application key and a dedicated database/storage configuration.
 
 ## 7. Nginx example
 
@@ -866,3 +869,22 @@ Demand forecasting now accepts `seasonality=croston` through browser/API forecas
 
 Migration `2026_10_05_000432` adds optional service-contract request entitlements. Service contracts may set `request_limit`; linked service-request creation consumes the quota under a row lock, exposes `requests_used`/`remaining_requests`, and rejects new requests after exhaustion. A null limit preserves unlimited-contract behavior.
 ERP migration `2026_10_05_000433` adds company localization-profile fields for country, locale, timezone, date/number formatting, and tax-registration metadata. Run `php artisan migrate` before using the updated organization settings endpoints. Focused organization coverage passes **2 tests** in **636.10 seconds**.
+
+Current deployment note: the authoritative migration head is `2026_11_11_000453`. It includes sales transaction dimensions (`000444–000446`), maintenance dispatch windows (`000447`), technician calendars (`000448`), maintenance required skills (`000449`), the tenant-scoped HR statutory-remittance submission ledger (`000450`), encrypted tenant/provider gateway settings (`000451`), optional technician skill-certification expiry governance (`000452`), and routing setup groups for setup-aware manufacturing dispatch (`000453`). Browser service operations are available at `/erp/service/dispatch`, including audited technician profile editing and guarded rescheduling; apply the complete migration sequence through `000453` before enabling these workflows.
+
+The scheduler also runs `erp:service:certification-alerts` daily at 06:15 UTC. Ensure the Laravel scheduler is running in production so certification expiry notifications are delivered.
+Latest deployment update: migration 2026_11_11_000454 adds optional customer and supplier tax-exemption certificate expiry dates. Apply migrations through 000454 before using expiry-aware tax compliance behavior; older party records without an expiry remain backward-compatible.
+
+Latest compliance integration update: `GET /api/accounting/tax-exemption-certificates` provides tenant-scoped active, expired, and expiring certificate monitoring with configurable expiry horizon/cutoff and page metadata. It requires the existing accounting read ability.
+
+The same monitoring is available to authorized browser accounting users at `/erp/accounting/tax-exemption-certificates`; Blade templates are compiled as part of deployment verification.
+
+The browser certificate report also supports CSV/XLSX export through the existing `reports.export` permission.
+
+ERP health diagnostics now identify the configured database connection name and non-secret host/port target when connectivity fails, while preserving the controlled migration/schema skip messages.
+
+Manufacturing clients can use `POST /api/manufacturing/orders/release-batch` with a `manufacturing:write` token to release multiple production orders. Each order remains transactionally guarded; mixed outcomes return HTTP 207 with per-order results.
+
+Warehouse clients can use `POST /api/integration/deliveries/operations/complete-batch` with `type=pick` or `type=pack` to process multiple deliveries. The route preserves tenant/store isolation and returns HTTP 207 for mixed outcomes.
+
+Sales integration clients can use `POST /api/integration/deliveries/approve-batch` with a `sales:write` token to approve multiple ready deliveries. Each item invokes the existing guarded stock-posting transaction; mixed outcomes return HTTP 207.

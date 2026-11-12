@@ -22,6 +22,7 @@ class CustomerRequest extends FormRequest
             'tax_jurisdiction' => ['nullable', 'string', 'max:100'],
             'tax_exempt' => ['nullable', 'boolean'],
             'tax_exemption_number' => ['required_if:tax_exempt,1', 'nullable', 'string', 'max:100'],
+            'tax_exemption_expires_at' => ['nullable', 'date'],
             'customer_group' => ['nullable', 'string', 'max:100'],
             'sales_channel' => ['nullable', 'string', 'max:50'],
             'currency_code' => ['nullable', 'string', 'size:3'],

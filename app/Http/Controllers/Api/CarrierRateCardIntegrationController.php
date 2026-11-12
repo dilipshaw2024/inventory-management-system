@@ -96,16 +96,17 @@ class CarrierRateCardIntegrationController extends Controller
             $card = CarrierRateCard::where('company_id', $companyId)->where('is_active', true)->findOrFail((int) $data['rate_card_id']);
             if ($delivery->carrier && $delivery->carrier !== $card->carrier) abort(422, 'The selected rate card carrier does not match the delivery carrier.');
             $weight = array_key_exists('weight_kg', $data) && $data['weight_kg'] !== null ? (float) $data['weight_kg'] : $this->deliveryWeightKg($delivery);
+            $dimensionalWeight = $this->deliveryDimensionalWeight($delivery);
             if ($weight === null || $weight <= 0) abort(422, 'A delivery must have a positive total or package weight before a carrier quote can be selected.');
-            if (!$this->rateCardMatches($card, $weight, $data['origin_zone'] ?? null, $data['destination_zone'] ?? null, $asOf)) abort(422, 'The selected carrier rate card is not valid for this delivery weight, zone, or date.');
+            if (!$this->rateCardMatches($card, $weight, $data['origin_zone'] ?? null, $data['destination_zone'] ?? null, $asOf, $dimensionalWeight)) abort(422, 'The selected carrier rate card is not valid for this delivery weight, zone, or date.');
             $before = $delivery->only(['carrier', 'carrier_rate_card_id', 'carrier_service_code', 'carrier_quote_amount', 'carrier_quote_currency', 'carrier_quote_weight_kg', 'carrier_quote_origin_zone', 'carrier_quote_destination_zone', 'carrier_quote_at', 'carrier_quote_external_reference']);
             $delivery->update([
                 'carrier' => $card->carrier,
                 'carrier_rate_card_id' => $card->id,
                 'carrier_service_code' => $card->service_code,
-                'carrier_quote_amount' => round((float) $card->base_amount + ($weight * (float) $card->per_kg_amount), 6),
+                'carrier_quote_amount' => $this->rateCardAmount($card, $weight, $dimensionalWeight),
                 'carrier_quote_currency' => $card->currency_code,
-                'carrier_quote_weight_kg' => $weight,
+                'carrier_quote_weight_kg' => $this->billableWeight($card, $weight, $dimensionalWeight),
                 'carrier_quote_origin_zone' => $data['origin_zone'] ?? null,
                 'carrier_quote_destination_zone' => $data['destination_zone'] ?? null,
                 'carrier_quote_at' => now(),
@@ -147,24 +148,24 @@ class CarrierRateCardIntegrationController extends Controller
                 abort(422, 'Only an approved, not-yet-completed delivery can receive a carrier quote.');
             }
             $weight = $this->deliveryWeightKg($delivery);
+            $dimensionalWeight = $this->deliveryDimensionalWeight($delivery);
             if ($weight === null || $weight <= 0) abort(422, 'A delivery must have a positive total or package weight before a carrier quote can be selected.');
             $carrier = $data['carrier'] ?? $delivery->carrier;
             $cards = CarrierRateCard::where('company_id', $companyId)->where('is_active', true)
                 ->when($carrier, fn ($q, $value) => $q->where('carrier', $value))
                 ->where(fn ($q) => $q->whereNull('origin_zone')->orWhere('origin_zone', $data['origin_zone'] ?? null))
                 ->where(fn ($q) => $q->whereNull('destination_zone')->orWhere('destination_zone', $data['destination_zone'] ?? null))
-                ->where(fn ($q) => $q->whereNull('min_weight_kg')->orWhere('min_weight_kg', '<=', $weight))
-                ->where(fn ($q) => $q->whereNull('max_weight_kg')->orWhere('max_weight_kg', '>=', $weight))
                 ->where(fn ($q) => $q->whereNull('valid_from')->orWhereDate('valid_from', '<=', $asOf))
                 ->where(fn ($q) => $q->whereNull('valid_until')->orWhereDate('valid_until', '>=', $asOf));
+            $cards = $cards->get()->filter(fn (CarrierRateCard $candidate): bool => $this->rateCardMatches($candidate, $weight, $data['origin_zone'] ?? null, $data['destination_zone'] ?? null, $asOf, $dimensionalWeight));
             if ($strategy === 'fastest') {
-                $cards->orderByRaw('transit_days IS NULL')->orderBy('transit_days')->orderBy('base_amount')->orderBy('per_kg_amount')->orderBy('id');
+                $card = $cards->sortBy(fn (CarrierRateCard $candidate): array => [$candidate->transit_days === null ? 1 : 0, $candidate->transit_days ?? PHP_INT_MAX, (int) $candidate->id])->first();
             } else {
-                $cards->orderByRaw('(base_amount + (per_kg_amount * ?))', [$weight])->orderBy('transit_days')->orderBy('id');
+                $card = $cards->sortBy(fn (CarrierRateCard $candidate): float => $this->rateCardAmount($candidate, $weight, $dimensionalWeight))
+                    ->first();
             }
-            $card = $cards->first();
             if (!$card) abort(422, 'No active carrier rate card matches this delivery weight, zone, carrier, and date.');
-            $amount = round((float) $card->base_amount + ((float) $card->per_kg_amount * $weight), 6);
+            $amount = $this->rateCardAmount($card, $weight, $dimensionalWeight);
             $before = $delivery->only(['carrier', 'carrier_rate_card_id', 'carrier_service_code', 'carrier_quote_amount', 'carrier_quote_currency', 'carrier_quote_weight_kg', 'carrier_quote_origin_zone', 'carrier_quote_destination_zone', 'carrier_quote_at', 'carrier_quote_external_reference']);
             $delivery->update([
                 'carrier' => $card->carrier,
@@ -172,7 +173,7 @@ class CarrierRateCardIntegrationController extends Controller
                 'carrier_service_code' => $card->service_code,
                 'carrier_quote_amount' => $amount,
                 'carrier_quote_currency' => $card->currency_code,
-                'carrier_quote_weight_kg' => $weight,
+                'carrier_quote_weight_kg' => $this->billableWeight($card, $weight, $dimensionalWeight),
                 'carrier_quote_origin_zone' => $data['origin_zone'] ?? null,
                 'carrier_quote_destination_zone' => $data['destination_zone'] ?? null,
                 'carrier_quote_at' => now(),
@@ -204,18 +205,20 @@ class CarrierRateCardIntegrationController extends Controller
         $weight = array_key_exists('weight_kg', $data) && $data['weight_kg'] !== null
             ? (float) $data['weight_kg']
             : $this->deliveryWeightKg($delivery);
+        $dimensionalWeight = $this->deliveryDimensionalWeight($delivery);
         if ($weight === null) return response()->json(['message' => 'A delivery must have a positive total or package weight before it can be quoted.'], 422);
         $cards = CarrierRateCard::where('company_id', $companyId)->where('is_active', true)
             ->when($carrier, fn ($q, $value) => $q->where('carrier', $value))
             ->when($data['service_code'] ?? null, fn ($q, $value) => $q->where('service_code', $value))
             ->where(fn ($q) => $q->whereNull('origin_zone')->orWhere('origin_zone', $data['origin_zone'] ?? null))
             ->where(fn ($q) => $q->whereNull('destination_zone')->orWhere('destination_zone', $data['destination_zone'] ?? null))
-            ->where(fn ($q) => $q->whereNull('min_weight_kg')->orWhere('min_weight_kg', '<=', $weight))
-            ->where(fn ($q) => $q->whereNull('max_weight_kg')->orWhere('max_weight_kg', '>=', $weight))
             ->where(fn ($q) => $q->whereNull('valid_from')->orWhereDate('valid_from', '<=', $asOf))
             ->where(fn ($q) => $q->whereNull('valid_until')->orWhereDate('valid_until', '>=', $asOf))
-            ->orderBy('base_amount')->orderBy('per_kg_amount')->orderBy('transit_days')->orderBy('id')
-            ->get();
+            ->orderBy('transit_days')->orderBy('id')
+            ->get()
+            ->filter(fn (CarrierRateCard $card): bool => $this->rateCardMatches($card, $weight, $data['origin_zone'] ?? null, $data['destination_zone'] ?? null, $asOf, $dimensionalWeight))
+            ->sortBy(fn (CarrierRateCard $card): float => $this->rateCardAmount($card, $weight, $dimensionalWeight))
+            ->values();
         $quotes = $cards->map(fn (CarrierRateCard $card): array => [
             'rate_card_id' => (int) $card->id,
             'carrier' => $card->carrier,
@@ -224,21 +227,52 @@ class CarrierRateCardIntegrationController extends Controller
             'weight_kg' => $weight,
             'base_amount' => (float) $card->base_amount,
             'per_kg_amount' => (float) $card->per_kg_amount,
-            'total_amount' => round((float) $card->base_amount + ($weight * (float) $card->per_kg_amount), 6),
+            'total_amount' => $this->rateCardAmount($card, $weight, $dimensionalWeight),
+            'minimum_charge' => (float) $card->minimum_charge,
+            'fuel_surcharge_percent' => (float) $card->fuel_surcharge_percent,
+            'billable_weight_kg' => $this->billableWeight($card, $weight, $dimensionalWeight),
+            'dimensional_weight_kg' => ((float) $card->dimensional_divisor > 0 && $dimensionalWeight !== null) ? round($dimensionalWeight / (float) $card->dimensional_divisor, 6) : null,
             'transit_days' => $card->transit_days,
         ])->values();
         return response()->json(['data' => $quotes, 'meta' => ['as_of' => $asOf, 'weight_kg' => $weight, 'delivery_id' => $delivery?->id, 'count' => $quotes->count()]]);
     }
 
-    private function rateCardMatches(CarrierRateCard $card, float $weight, ?string $originZone, ?string $destinationZone, string $asOf): bool
+    private function rateCardMatches(CarrierRateCard $card, float $weight, ?string $originZone, ?string $destinationZone, string $asOf, ?float $dimensionalWeight = null): bool
     {
         if ($card->origin_zone !== null && $card->origin_zone !== $originZone) return false;
         if ($card->destination_zone !== null && $card->destination_zone !== $destinationZone) return false;
-        if ($card->min_weight_kg !== null && (float) $card->min_weight_kg > $weight) return false;
-        if ($card->max_weight_kg !== null && (float) $card->max_weight_kg < $weight) return false;
+        $billableWeight = $this->billableWeight($card, $weight, $dimensionalWeight);
+        if ($card->min_weight_kg !== null && (float) $card->min_weight_kg > $billableWeight) return false;
+        if ($card->max_weight_kg !== null && (float) $card->max_weight_kg < $billableWeight) return false;
         if ($card->valid_from !== null && $card->valid_from->toDateString() > $asOf) return false;
         if ($card->valid_until !== null && $card->valid_until->toDateString() < $asOf) return false;
         return true;
+    }
+
+    private function rateCardAmount(CarrierRateCard $card, float $weight, ?float $dimensionalWeight = null): float
+    {
+        $weight = $this->billableWeight($card, $weight, $dimensionalWeight);
+        $variable = (float) $card->base_amount + ($weight * (float) $card->per_kg_amount);
+        $preSurcharge = max($variable, (float) ($card->minimum_charge ?? 0));
+        return round($preSurcharge * (1 + ((float) ($card->fuel_surcharge_percent ?? 0) / 100)), 6);
+    }
+
+    private function billableWeight(CarrierRateCard $card, float $weight, ?float $dimensionalWeight = null): float
+    {
+        if (($card->dimensional_divisor ?? 0) > 0 && $dimensionalWeight !== null) $weight = max($weight, $dimensionalWeight / (float) $card->dimensional_divisor);
+        $increment = (float) ($card->billable_weight_increment_kg ?? 0);
+        if ($increment <= 0 || $weight <= 0) return round($weight, 6);
+        return round(ceil(($weight / $increment) - 0.000000001) * $increment, 6);
+    }
+
+    private function deliveryDimensionalWeight(?Delivery $delivery): ?float
+    {
+        if (!$delivery || !$delivery->relationLoaded('packages')) return null;
+        $volume = (float) $delivery->packages->sum(function ($package): float {
+            if ($package->length === null || $package->width === null || $package->height === null) return 0.0;
+            return (float) $package->length * (float) $package->width * (float) $package->height;
+        });
+        return $volume > 0 ? $volume : null;
     }
 
     private function deliveryQuotePayload(Delivery $delivery): array
@@ -292,6 +326,10 @@ class CarrierRateCardIntegrationController extends Controller
             'max_weight_kg' => ['sometimes', 'nullable', 'numeric', 'gte:min_weight_kg'],
             'base_amount' => [$required, 'numeric', 'gte:0'],
             'per_kg_amount' => [$required, 'numeric', 'gte:0'],
+            'minimum_charge' => ['sometimes', 'numeric', 'gte:0'],
+            'fuel_surcharge_percent' => ['sometimes', 'numeric', 'gte:0', 'lte:100'],
+            'billable_weight_increment_kg' => ['sometimes', 'numeric', 'gte:0'],
+            'dimensional_divisor' => ['sometimes', 'numeric', 'gte:0'],
             'currency_code' => [$required, 'string', 'size:3'],
             'transit_days' => ['sometimes', 'nullable', 'integer', 'min:0', 'max:365'],
             'valid_from' => ['sometimes', 'nullable', 'date'],

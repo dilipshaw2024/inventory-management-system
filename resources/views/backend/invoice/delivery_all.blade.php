@@ -2,13 +2,14 @@
 @section('admin')
 <div class="page-content"><div class="container-fluid">
     <div class="page-title-box d-sm-flex align-items-center justify-content-between"><div><h4>Deliveries</h4><p class="text-muted">Complete picking and packing before dispatch approval.</p></div><a href="{{ route('fulfillment.deliveries.create') }}" class="btn btn-primary">New delivery</a></div>
-    <div class="card"><div class="card-body"><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>Delivery</th><th>Sales order</th><th>Customer</th><th>Date</th><th>Operations</th><th>Status / action</th></tr></thead><tbody>
+    <div class="card"><div class="card-body"><div class="table-responsive"><table class="table table-bordered"><thead><tr><th>Delivery</th><th>Sales order</th><th>Customer</th><th>Date</th><th>Proof of delivery</th><th>Operations</th><th>Status / action</th></tr></thead><tbody>
     @forelse($deliveries as $delivery)
         @php($pick = $delivery->operations->firstWhere('operation_type', 'pick'))
         @php($pack = $delivery->operations->firstWhere('operation_type', 'pack'))
         @php($cancelled = $delivery->fulfillment_status === 'cancelled')
         <tr>
             <td>{{ $delivery->delivery_no }}</td><td>{{ data_get($delivery, 'salesOrder.order_no', 'N/A') }}</td><td>{{ data_get($delivery, 'salesOrder.customer.name', 'N/A') }}</td><td>{{ optional($delivery->date)->format('d-m-Y') }}</td>
+            <td>@if($delivery->proofs->isNotEmpty()) @php($proof = $delivery->proofs->first())<span class="badge bg-success">{{ $delivery->proofs->count() }} structured</span><small class="d-block">{{ $proof->proof_type }}{{ $proof->recipient_name ? ' — '.$proof->recipient_name : '' }}</small><small class="d-block text-muted">{{ optional($proof->delivered_at)->format('d-m-Y H:i') }}</small>@elseif($delivery->proof_of_delivery)<span class="badge bg-secondary">{{ $delivery->proof_of_delivery }}</span>@else<span class="text-muted">Not captured</span>@endif</td>
             <td>
                 @if($cancelled)<span class="text-muted">No operations</span>
                 @else
@@ -25,7 +26,7 @@
             </td>
         </tr>
     @empty
-        <tr><td colspan="6" class="text-center">No deliveries found.</td></tr>
+        <tr><td colspan="7" class="text-center">No deliveries found.</td></tr>
     @endforelse
     </tbody></table></div>{{ $deliveries->links() }}</div></div>
 </div></div>

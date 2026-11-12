@@ -10,6 +10,9 @@ use App\Models\HrPayrollRule;
 use App\Models\HrLeaveRequest;
 use App\Models\HrLeaveType;
 use App\Models\HrAttendance;
+use App\Models\Company;
+use App\Models\HrStatutoryRemittanceSubmission;
+use App\Models\HrStatutoryRemittanceProviderSetting;
 use App\Services\AuditService;
 use App\Services\HrPayrollService;
 use App\Services\HrLeaveService;
@@ -17,6 +20,7 @@ use App\Services\HrAttendanceService;
 use App\Services\HrPayrollAccountingService;
 use App\Services\HrPayrollSettlementService;
 use App\Services\IntegrationCursorService;
+use App\Services\Integrations\StatutoryRemittanceProviderRegistry;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -29,6 +33,26 @@ class HrIntegrationController extends Controller
         $id = (int) ($request->user()?->company_id ?? 0);
         abort_unless($id, 403, 'A company is required for HR operations.');
         return $id;
+    }
+
+    private function statutoryPackage(Request $request, array $summary): array
+    {
+        $company = Company::whereKey($this->companyId($request))->firstOrFail();
+        return [
+            'schema' => 'erp.hr.statutory-remittance.v1',
+            'company_id' => (int) $company->id,
+            'company_context' => [
+                'country_code' => $company->country_code,
+                'locale' => $company->locale,
+                'timezone' => $company->timezone,
+                'base_currency' => $company->base_currency,
+                'tax_registration_scheme' => $company->tax_registration_scheme,
+                'tax_registration_number' => $company->tax_registration_number,
+            ],
+            'filters' => ['from' => $summary['meta']['from'] ?? null, 'to' => $summary['meta']['to'] ?? null, 'authority' => $request->input('authority'), 'mapping_key' => $request->input('mapping_key')],
+            'data' => $summary['data'] ?? [],
+            'summary' => $summary['summary'] ?? [],
+        ];
     }
 
     public function employees(Request $request): JsonResponse
@@ -186,13 +210,7 @@ class HrIntegrationController extends Controller
     {
         $format = $request->validate(['format' => ['nullable', 'in:json,csv']])['format'] ?? 'json';
         $summary = $this->statutoryRemittances($request)->getData(true);
-        $package = [
-            'schema' => 'erp.hr.statutory-remittance.v1',
-            'company_id' => $this->companyId($request),
-            'filters' => ['from' => $summary['meta']['from'] ?? null, 'to' => $summary['meta']['to'] ?? null, 'authority' => $request->input('authority'), 'mapping_key' => $request->input('mapping_key')],
-            'data' => $summary['data'] ?? [],
-            'summary' => $summary['summary'] ?? [],
-        ];
+        $package = $this->statutoryPackage($request, $summary);
         $hash = hash('sha256', json_encode($package, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION) ?: '');
         if ($format === 'json') return response()->json(['data' => $package, 'integrity_hash' => $hash, 'status' => 'exported']);
         return response()->streamDownload(function () use ($package, $hash): void {
@@ -202,6 +220,90 @@ class HrIntegrationController extends Controller
             foreach ($package['data'] as $row) fputcsv($handle, [$row['pay_run_id'] ?? null, $row['run_no'] ?? null, $row['period_from'] ?? null, $row['period_to'] ?? null, $row['pay_date'] ?? null, $row['status'] ?? null, $row['authority'] ?? null, $row['mapping_key'] ?? null, $row['employee_withheld'] ?? 0, $row['employer_contribution'] ?? 0, $row['total_remittance'] ?? 0, $row['employee_count'] ?? 0]);
             fclose($handle);
         }, 'statutory-remittances.csv', ['Content-Type' => 'text/csv; charset=UTF-8', 'X-Package-SHA256' => $hash]);
+    }
+
+    public function statutoryRemittanceProviders(Request $request, StatutoryRemittanceProviderRegistry $providers): JsonResponse
+    {
+        $tenantHttp = HrStatutoryRemittanceProviderSetting::where('company_id', $this->companyId($request))->where('provider', 'http')->where('is_active', true)->first();
+        $tenantEndpoint = is_array($tenantHttp?->connection_config) ? trim((string) ($tenantHttp->connection_config['endpoint'] ?? '')) : '';
+        $endpointReady = $tenantEndpoint !== '' || trim((string) config('integrations.statutory_remittance_http_endpoint')) !== '';
+        return response()->json(['data' => array_map(fn (string $key): array => [
+            'key' => $key,
+            'supports_submission' => true,
+            'ready' => $key !== 'http' || $endpointReady,
+        ], $providers->keys())]);
+    }
+
+    public function statutoryRemittanceProviderSettings(Request $request): JsonResponse
+    {
+        $settings = HrStatutoryRemittanceProviderSetting::where('company_id', $this->companyId($request))->orderBy('provider')->get();
+        return response()->json(['data' => $settings->map(fn (HrStatutoryRemittanceProviderSetting $setting): array => $this->maskedRemittanceProviderSetting($setting))->values(), 'meta' => ['total' => $settings->count()]]);
+    }
+
+    public function storeStatutoryRemittanceProviderSetting(Request $request): JsonResponse
+    {
+        $companyId = $this->companyId($request);
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80', 'alpha_dash'], 'connection_config' => ['required', 'array'], 'connection_config.endpoint' => ['nullable', 'url', 'max:2000'], 'connection_config.token' => ['nullable', 'string', 'max:500'], 'connection_config.timeout' => ['nullable', 'integer', 'min:1', 'max:300'], 'connection_config.retries' => ['nullable', 'integer', 'min:0', 'max:5']]);
+        $provider = strtolower(trim($data['provider']));
+        $existing = HrStatutoryRemittanceProviderSetting::where('company_id', $companyId)->where('provider', $provider)->first();
+        $connectionConfig = $data['connection_config'];
+        $oldConfig = is_array($existing?->connection_config) ? $existing->connection_config : [];
+        foreach (['token', 'secret', 'password', 'client_secret'] as $key) {
+            if (($connectionConfig[$key] ?? null) === '********' && array_key_exists($key, $oldConfig)) $connectionConfig[$key] = $oldConfig[$key];
+        }
+        $setting = HrStatutoryRemittanceProviderSetting::updateOrCreate(['company_id' => $companyId, 'provider' => $provider], ['connection_config' => $connectionConfig, 'is_active' => true]);
+        app(AuditService::class)->record('hr_statutory_remittance_provider.updated', $setting, null, ['provider' => $provider, 'is_active' => true]);
+        return response()->json(['data' => $this->maskedRemittanceProviderSetting($setting), 'status' => 'saved'], 201);
+    }
+
+    public function deactivateStatutoryRemittanceProviderSetting(Request $request, int $id): JsonResponse
+    {
+        $setting = HrStatutoryRemittanceProviderSetting::where('company_id', $this->companyId($request))->findOrFail($id);
+        $setting->update(['is_active' => false]);
+        app(AuditService::class)->record('hr_statutory_remittance_provider.deactivated', $setting, null, ['provider' => $setting->provider, 'is_active' => false]);
+        return response()->json(['data' => $this->maskedRemittanceProviderSetting($setting->fresh()), 'status' => 'deactivated']);
+    }
+
+    private function maskedRemittanceProviderSetting(HrStatutoryRemittanceProviderSetting $setting): array
+    {
+        $config = is_array($setting->connection_config) ? $setting->connection_config : [];
+        foreach (['token', 'secret', 'password', 'client_secret'] as $key) if (array_key_exists($key, $config)) $config[$key] = '********';
+        return ['id' => $setting->id, 'provider' => $setting->provider, 'connection_config' => $config, 'is_active' => (bool) $setting->is_active, 'created_at' => $setting->created_at, 'updated_at' => $setting->updated_at];
+    }
+
+    public function submitStatutoryRemittance(Request $request, StatutoryRemittanceProviderRegistry $providers): JsonResponse
+    {
+        $data = $request->validate(['provider' => ['required', 'string', 'max:80'], 'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'], 'authority' => ['nullable', 'string', 'max:120'], 'mapping_key' => ['nullable', 'string', 'max:80', 'alpha_dash']]);
+        $summary = $this->statutoryRemittances($request)->getData(true);
+        $package = $this->statutoryPackage($request, $summary);
+        $provider = strtolower(trim($data['provider']));
+        $hash = hash('sha256', json_encode($package, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION) ?: '');
+        $existing = HrStatutoryRemittanceSubmission::where('company_id', $this->companyId($request))->where('provider', $provider)->where('package_hash', $hash)->first();
+        if ($existing) return response()->json(['data' => $existing, 'provider' => $provider, 'status' => 'existing']);
+        $result = $providers->resolve($provider)->submit($package);
+        $submission = HrStatutoryRemittanceSubmission::create([
+            'company_id' => $this->companyId($request), 'provider' => $provider, 'package_hash' => $hash,
+            'filters' => $package['filters'], 'summary' => $package['summary'], 'status' => $result['status'] ?? 'submitted',
+            'provider_reference' => $result['reference'] ?? null, 'provider_response' => $result['response'] ?? null,
+            'submitted_by' => $request->user()?->id, 'submitted_at' => now(),
+        ]);
+        app(AuditService::class)->record('hr_statutory_remittance.submitted', $submission, null, $submission->toArray());
+        return response()->json(['data' => $submission, 'provider' => $provider, 'status' => $submission->status], 201);
+    }
+
+    public function statutoryRemittanceSubmissions(Request $request): JsonResponse
+    {
+        $companyId = $this->companyId($request);
+        $data = $request->validate(['provider' => ['nullable', 'string', 'max:80'], 'status' => ['nullable', 'in:submitted,accepted,rejected'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);
+        $query = HrStatutoryRemittanceSubmission::where('company_id', $companyId)
+            ->when($data['provider'] ?? null, fn ($query, $provider) => $query->where('provider', strtolower($provider)))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status));
+        $perPage = (int) ($data['per_page'] ?? 50);
+        if ($request->boolean('cursor_mode') || $request->filled('cursor')) {
+            return app(IntegrationCursorService::class)->paginate($query->orderBy('updated_at')->orderBy('id'), $request, 'hr.statutory-remittance-submissions', $perPage);
+        }
+        $query->orderByDesc('submitted_at')->orderByDesc('id');
+        return response()->json(['data' => $query->limit($perPage)->get(), 'meta' => ['total' => (clone $query)->count(), 'per_page' => $perPage]]);
     }
 
     public function payrollRules(Request $request): JsonResponse

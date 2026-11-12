@@ -20,6 +20,7 @@ class ApprovalPolicy extends Model
         'category_id' => 'integer',
         'is_active' => 'boolean',
         'escalation_permissions' => 'array',
+        'escalation_user_ids' => 'array',
         'max_escalation_level' => 'integer',
     ];
 

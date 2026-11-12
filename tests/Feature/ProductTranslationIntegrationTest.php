@@ -6,6 +6,8 @@ use App\Models\Category;
 use App\Models\Company;
 use App\Models\Product;
 use App\Models\ProductTranslation;
+use App\Models\TaxRate;
+use App\Models\TaxRateComponent;
 use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\User;
@@ -42,11 +44,15 @@ class ProductTranslationIntegrationTest extends TestCase
         $company = Company::create(['name' => 'Translation Feed Co', 'code' => 'TRANSLATION-FEED']);
         $user = User::factory()->create(['company_id' => $company->id]);
         $product = $this->product($company, 'Base product');
+        $taxRate = TaxRate::create(['company_id' => $company->id, 'code' => 'VAT18', 'name' => 'VAT 18', 'rate' => 18, 'calculation' => 'exclusive', 'jurisdiction' => 'DOMESTIC', 'effective_from' => '2026-01-01', 'is_active' => true]);
+        TaxRateComponent::create(['company_id' => $company->id, 'tax_rate_id' => $taxRate->id, 'code' => 'VAT', 'name' => 'VAT', 'rate' => 18, 'component_type' => 'central', 'sequence' => 1, 'is_active' => true]);
+        $product->update(['tax_rate_id' => $taxRate->id, 'tax_rate' => 18]);
         ProductTranslation::create(['company_id' => $company->id, 'product_id' => $product->id, 'language_code' => 'fr-FR', 'name' => 'Produit français', 'is_active' => true]);
         Sanctum::actingAs($user, ['inventory:read']);
 
         $this->getJson('/api/inventory/products?language_code=fr_fr')->assertOk()
-            ->assertJsonPath('data.0.translations.0.language_code', 'fr-FR')->assertJsonPath('data.0.translations.0.name', 'Produit français');
+            ->assertJsonPath('data.0.translations.0.language_code', 'fr-FR')->assertJsonPath('data.0.translations.0.name', 'Produit français')
+            ->assertJsonPath('data.0.tax_definition.code', 'VAT18')->assertJsonPath('data.0.tax_definition.components.0.code', 'VAT');
         $this->assertSame('Produit français', $product->fresh()->localizedName('fr-FR', $company->id));
         $this->assertSame('Base product', $product->fresh()->localizedName('de-DE', $company->id));
     }

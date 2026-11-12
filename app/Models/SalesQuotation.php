@@ -14,4 +14,5 @@ class SalesQuotation extends Model
     public function customer() { return $this->belongsTo(Customer::class); }
     public function lines() { return $this->hasMany(SalesQuotationLine::class); }
     public function creator() { return $this->belongsTo(User::class, 'created_by'); }
+    public function salesperson() { return $this->belongsTo(User::class, 'salesperson_id'); }
 }
