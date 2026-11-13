@@ -263,6 +263,14 @@ class ProductController extends Controller
         return response($spreadsheet->write(ProductSpreadsheetService::HEADERS, $rows), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="products-'.now()->format('Ymd-His').'.xlsx"']);
     }
 
+    public function ProductImportTemplate(Request $request, ProductSpreadsheetService $spreadsheet): Response
+    {
+        $format = strtolower((string) $request->query('format', 'xlsx'));
+        abort_unless(in_array($format, ['csv', 'xlsx'], true), 422, 'The import template format must be csv or xlsx.');
+        if ($format === 'csv') return response($spreadsheet->template('csv'), 200, ['Content-Type' => 'text/csv; charset=UTF-8', 'Content-Disposition' => 'attachment; filename="product-import-template.csv"']);
+        return response($spreadsheet->template('xlsx'), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="product-import-template.xlsx"']);
+    }
+
     public function ProductImport(Request $request)
     {
         $request->validate(['file' => ['required', 'file', 'mimes:csv,txt,xlsx', 'max:10240'], 'dry_run' => ['nullable', 'boolean']]);

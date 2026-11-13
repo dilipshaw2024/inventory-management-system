@@ -40,6 +40,9 @@
                         <div class="text-center flex-fill" title="{{ number_format($trend['sales'], 2) }}"><div class="bg-primary rounded-top" style="height: {{ max(4, round(($trend['sales'] / $maxTrend) * 120)) }}px"></div><small class="text-muted d-block mt-2">{{ substr($trend['month'], 5) }}</small></div>
                     @endforeach
                 </div>
+                @if($showFinance)
+                <div class="border-top mt-3 pt-3"><div class="inventory-section-heading"><div><span class="inventory-eyebrow text-success">PURCHASING TREND</span><h5 class="card-title mb-0">Approved purchases by month</h5></div><span class="inventory-section-caption">Last {{ count($purchaseTrend) }} months</span></div><div class="d-flex align-items-end gap-2 mt-3" style="height: 90px">@php($maxPurchaseTrend = max(1, collect($purchaseTrend)->max('purchases'))) @foreach($purchaseTrend as $trend)<div class="text-center flex-fill" title="{{ number_format($trend['purchases'], 2) }}"><div class="bg-success rounded-top" style="height: {{ max(3, round(($trend['purchases'] / $maxPurchaseTrend) * 70)) }}px"></div><small class="text-muted d-block mt-1">{{ substr($trend['month'], 5) }}</small></div>@endforeach</div></div>
+                @endif
             </div></div></div>
             <div class="col-xl-5"><div class="card h-100"><div class="card-body">
                 <div class="inventory-section-heading"><div><span class="inventory-eyebrow text-warning">EXCEPTIONS</span><h4 class="card-title mb-0">Inventory attention</h4></div><a href="{{ route('planning.dashboard') }}" class="small">View planning</a></div>

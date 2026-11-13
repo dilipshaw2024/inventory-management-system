@@ -66,7 +66,7 @@ class SystemSettingsController extends Controller
             'branch_sla_calendars' => ['sometimes', 'array'],
             'branch_sla_calendars.*' => ['array'],
             'dashboard_widgets' => ['sometimes', 'array', 'min:1', 'max:20'],
-            'dashboard_widgets.*' => ['string', 'in:month_sales,total_products,low_stock,pending_approvals,receivables,open_service_requests,breached_service_requests,active_maintenance_orders,sales_trend,exception_drilldowns'],
+            'dashboard_widgets.*' => ['string', 'in:month_sales,total_products,low_stock,pending_approvals,receivables,purchase_trend,warehouse_utilization,open_service_requests,breached_service_requests,active_maintenance_orders,aging_stock_value,aged_stock_value,sales_trend,exception_drilldowns'],
             'default_inventory_costing_method' => ['sometimes', 'in:fifo,weighted_average,moving_average,standard'],
             'default_standard_cost' => ['sometimes', 'nullable', 'numeric', 'min:0'],
             'password_expiry_days' => ['sometimes', 'integer', 'min:0', 'max:3650'],

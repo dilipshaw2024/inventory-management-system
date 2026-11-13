@@ -29,7 +29,7 @@ class DashboardMetricsTest extends TestCase
 
         $response = $this->getJson('/api/inventory/dashboard?months=3');
 
-        $response->assertOk()->assertJsonPath('meta.months', 3)->assertJsonPath('meta.cached', true)->assertJsonCount(3, 'data.sales_trend')->assertJsonStructure(['data' => ['exception_drilldowns' => ['low_stock', 'excess_stock']]]);
+        $response->assertOk()->assertJsonPath('meta.months', 3)->assertJsonPath('meta.cached', true)->assertJsonCount(3, 'data.sales_trend')->assertJsonCount(3, 'data.purchase_trend')->assertJsonStructure(['data' => ['exception_drilldowns' => ['low_stock', 'excess_stock'], 'aging_stock_value', 'aged_stock_value', 'purchase_trend', 'warehouse_utilization']]);
         $this->assertSame('DASH-LOW', $response->json('data.exception_drilldowns.low_stock.0.sku'));
     }
 
@@ -44,7 +44,7 @@ class DashboardMetricsTest extends TestCase
         $response = $this->getJson('/api/inventory/dashboard?months=3');
 
         $response->assertOk()->assertJsonPath('meta.visibility.finance', false)->assertJsonPath('meta.visibility.service', false)->assertJsonPath('data.month_sales', null)->assertJsonPath('data.receivables', null)->assertJsonPath('data.sales_trend', [])->assertJsonPath('data.open_service_requests', null);
-        $response->assertJsonPath('meta.visibility.inventory', false)->assertJsonPath('data.total_products', null)->assertJsonPath('data.low_stock', null)->assertJsonPath('data.exception_drilldowns.low_stock', [])->assertJsonPath('data.pending_approvals', null);
+        $response->assertJsonPath('meta.visibility.inventory', false)->assertJsonPath('data.total_products', null)->assertJsonPath('data.low_stock', null)->assertJsonPath('data.aging_stock_value', null)->assertJsonPath('data.aged_stock_value', null)->assertJsonPath('data.warehouse_utilization', null)->assertJsonPath('data.exception_drilldowns.low_stock', [])->assertJsonPath('data.pending_approvals', null);
     }
     public function test_company_can_select_dashboard_widgets_without_removing_legacy_fields(): void
     {
@@ -53,15 +53,22 @@ class DashboardMetricsTest extends TestCase
         Sanctum::actingAs($user, ['integration:write', 'inventory:read']);
 
         $this->patchJson('/api/accounting/settings', [
-            'dashboard_widgets' => ['month_sales', 'low_stock'],
-        ])->assertOk()->assertJsonPath('data.dashboard_widgets.0', 'month_sales');
+            'dashboard_widgets' => ['month_sales', 'low_stock', 'aging_stock_value', 'aged_stock_value', 'purchase_trend', 'warehouse_utilization'],
+        ])->assertOk()->assertJsonPath('data.dashboard_widgets.0', 'month_sales')->assertJsonPath('data.dashboard_widgets.2', 'aging_stock_value')->assertJsonPath('data.dashboard_widgets.3', 'aged_stock_value')->assertJsonPath('data.dashboard_widgets.4', 'purchase_trend')->assertJsonPath('data.dashboard_widgets.5', 'warehouse_utilization');
 
         $response = $this->getJson('/api/inventory/dashboard?months=3');
         $response->assertOk()
             ->assertJsonPath('data.enabled_widgets.0', 'month_sales')
             ->assertJsonPath('data.enabled_widgets.1', 'low_stock')
+            ->assertJsonPath('data.enabled_widgets.2', 'aging_stock_value')
+            ->assertJsonPath('data.enabled_widgets.3', 'aged_stock_value')
+            ->assertJsonPath('data.enabled_widgets.4', 'purchase_trend')
             ->assertJsonPath('data.widgets.month_sales', 0)
             ->assertJsonPath('data.widgets.low_stock', 0)
+            ->assertJsonPath('data.widgets.aging_stock_value', 0)
+            ->assertJsonPath('data.widgets.aged_stock_value', 0)
+            ->assertJsonPath('data.widgets.purchase_trend.0.purchases', 0)
+            ->assertJsonPath('data.widgets.warehouse_utilization', null)
             ->assertJsonPath('data.open_service_requests', 0);
     }
 

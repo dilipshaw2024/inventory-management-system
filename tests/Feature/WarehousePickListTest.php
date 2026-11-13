@@ -54,6 +54,7 @@ class WarehousePickListTest extends TestCase
 
         $response = $this->getJson('/api/integration/warehouse/pick-list?warehouse_id='.$warehouse->id);
         $response->assertOk()->assertJsonPath('meta.total', 1)->assertJsonPath('meta.total_lines', 1)->assertJsonPath('meta.total_quantity', 2)->assertJsonPath('data.0.delivery_no', 'DN-PICK-1')->assertJsonPath('data.0.location', 'A-01')->assertJsonPath('data.0.lines.0.product', 'Z Product')->assertJsonPath('data.0.pick_sequence', 1);
+        $this->getJson('/api/integration/warehouse/pick-list?warehouse_id='.$warehouse->id.'&sort_by=route')->assertOk()->assertJsonPath('meta.route_optimized', true)->assertJsonPath('meta.route_basis', 'location_hierarchy')->assertJsonPath('data.0.route_key', 'A-01');
         $this->getJson('/api/integration/warehouse/pick-list?location_id='.$secondLocation->id)->assertOk()->assertJsonPath('meta.total', 0);
     }
 

@@ -188,7 +188,7 @@ class DeliveryIntegrationTest extends TestCase
 
     public function test_provider_discovery_exposes_carrier_polling_readiness(): void
     {
-        $company = Company::create(['name' => 'Provider Discovery Co', 'code' => 'PROVIDER-DISCOVERY']);
+        $company = Company::create(['name' => 'Provider Discovery Co', 'code' => 'PROVIDER-DISCOVERY', 'country_code' => 'IN', 'tax_registration_scheme' => 'GSTIN', 'tax_registration_number' => '27ABCDE1234F1Z5']);
         $user = User::factory()->create(['company_id' => $company->id]);
         Config::set('integrations.carrier_tracking_http_endpoint', 'https://carrier.test/track/{tracking_number}');
         Sanctum::actingAs($user, ['integration:read']);
@@ -198,7 +198,18 @@ class DeliveryIntegrationTest extends TestCase
             ->assertJsonPath('data.carrier_tracking.providers.0.supports_polling', false)
             ->assertJsonPath('data.carrier_tracking.providers.1.key', 'http')
             ->assertJsonPath('data.carrier_tracking.providers.1.supports_polling', true)
-            ->assertJsonPath('data.carrier_tracking.providers.1.ready', true);
+            ->assertJsonPath('data.carrier_tracking.providers.1.ready', true)
+            ->assertJsonPath('data.regional_compliance.selected_pack', 'india_gst')
+            ->assertJsonPath('data.regional_compliance.packs.1.key', 'india_gst')
+            ->assertJsonPath('data.regional_compliance.packs.2.key', 'eu_vat')
+            ->assertJsonPath('data.regional_compliance.packs.3.key', 'uk_vat')
+            ->assertJsonPath('data.regional_compliance.packs.4.key', 'canada_gst_hst');
+
+        $this->getJson('/api/integration/compliance')->assertOk()
+            ->assertJsonPath('data.pack', 'india_gst')
+            ->assertJsonPath('data.valid', true)
+            ->assertJsonPath('data.context.rules.tax_identifier', 'GSTIN')
+            ->assertJsonPath('meta.company_id', $company->id);
     }
 
     public function test_carrier_delivered_event_synchronizes_dispatched_delivery(): void

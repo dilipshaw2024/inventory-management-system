@@ -177,6 +177,7 @@ Route::controller(ProductController::class)->middleware('permission:inventory.po
     Route::post('/product/update', 'ProductUpdate')->name('product.update');
     Route::post('/product/delete/{id}', 'ProductDelete')->name('product.delete');
     Route::get('/product/export', 'ProductExport')->name('product.export')->middleware('permission:reports.export');
+    Route::get('/product/import/template', 'ProductImportTemplate')->name('product.import.template')->middleware('permission:inventory.view');
     Route::post('/product/import', 'ProductImport')->name('product.import')->middleware('permission:inventory.post');
     Route::get('/product/import/errors', 'ProductImportErrors')->name('product.import.errors')->middleware('permission:inventory.view');
      
@@ -195,6 +196,7 @@ Route::controller(PurchaseController::class)->middleware('permission:purchasing.
 
     Route::get('/daily/purchase/report', 'DailyPurchaseReport')->name('daily.purchase.report');
     Route::get('/daily/purchase/pdf', 'DailyPurchasePdf')->name('daily.purchase.pdf');
+    Route::get('/daily/purchase/export', 'DailyPurchaseExport')->name('daily.purchase.export')->middleware('permission:reports.export');
      
 });
 
@@ -232,6 +234,8 @@ Route::controller(StockController::class)->middleware('permission:reports.view')
     Route::get('/stock/valuation', 'ValuationReport')->name('stock.valuation');
     Route::get('/stock/valuation/export', 'ValuationReport')->name('stock.valuation.export')->middleware('permission:reports.export');
     Route::get('/stock/valuation/pdf', 'ValuationReport')->name('stock.valuation.pdf')->middleware('permission:reports.export');
+    Route::get('/stock/aging', 'AgingReport')->name('stock.aging');
+    Route::get('/stock/aging/export', 'AgingReport')->name('stock.aging.export')->middleware('permission:reports.export');
     Route::get('/stock/location-stock', 'LocationStockReport')->name('stock.location.stock');
     Route::get('/stock/expiry', 'ExpiryReport')->name('stock.expiry');
     Route::get('/stock/batch-stock', 'BatchStockReport')->name('stock.batch.stock');

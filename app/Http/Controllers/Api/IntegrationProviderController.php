@@ -10,6 +10,7 @@ use App\Services\Integrations\CarrierTrackingPoller;
 use App\Services\Integrations\EInvoiceProviderRegistry;
 use App\Services\Integrations\ExchangeRateProviderRegistry;
 use App\Services\Integrations\StatutoryRemittanceProviderRegistry;
+use App\Services\Integrations\RegionalCompliancePackRegistry;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use App\Models\EInvoiceProviderSetting;
@@ -18,6 +19,30 @@ use App\Models\HrStatutoryRemittanceProviderSetting;
 
 class IntegrationProviderController extends Controller
 {
+    public function compliance(Request $request, RegionalCompliancePackRegistry $regionalCompliance): JsonResponse
+    {
+        $company = $request->user()?->company;
+        if (!$company) {
+            return response()->json([
+                'data' => ['pack' => 'generic', 'context' => null, 'validation_errors' => [], 'valid' => true],
+                'meta' => ['company_id' => null],
+            ]);
+        }
+
+        $pack = $regionalCompliance->forCompany($company);
+        $errors = $pack->validateCompany($company);
+
+        return response()->json([
+            'data' => [
+                'pack' => $pack->key(),
+                'context' => $pack->context($company),
+                'validation_errors' => $errors,
+                'valid' => $errors === [],
+            ],
+            'meta' => ['company_id' => $company->id],
+        ]);
+    }
+
     public function index(
         Request $request,
         EInvoiceProviderRegistry $eInvoices,
@@ -25,7 +50,9 @@ class IntegrationProviderController extends Controller
         CarrierTrackingAdapterRegistry $carrierTracking,
         ExchangeRateProviderRegistry $exchangeRates,
         StatutoryRemittanceProviderRegistry $statutoryRemittances,
+        RegionalCompliancePackRegistry $regionalCompliance,
     ): JsonResponse {
+        $company = $request->user()?->company;
         $eInvoiceKeys = $eInvoices->keys();
         $tenantHttpSetting = EInvoiceProviderSetting::where('company_id', $request->user()?->company_id)
             ->where('provider', 'http')->where('is_active', true)->first();
@@ -74,6 +101,10 @@ class IntegrationProviderController extends Controller
                     'supports_submission' => true,
                     'ready' => $key !== 'http' || $tenantStatutoryEndpoint !== '' || trim((string) config('integrations.statutory_remittance_http_endpoint')) !== '',
                 ], $statutoryRemittances->keys())],
+                'regional_compliance' => [
+                    'packs' => $regionalCompliance->describe(),
+                    'selected_pack' => $company ? $regionalCompliance->forCompany($company)->key() : 'generic',
+                ],
             ],
         ]);
     }

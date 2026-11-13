@@ -10,6 +10,7 @@ use App\Models\Invoice;
 use App\Models\InventoryReturn;
 use App\Models\Product;
 use App\Models\Customer;
+use App\Services\InventoryAgingService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -69,5 +70,44 @@ class AnalyticsIntegrationController extends Controller
         $aThreshold = (float) app(\App\Services\ErpSettingService::class)->get('abc_a_threshold_percent', 80, (int) $companyId);
         $bThreshold = (float) app(\App\Services\ErpSettingService::class)->get('abc_b_threshold_percent', 95, (int) $companyId);
         return response()->json(['data' => $paged, 'summary' => $summary, 'category_summary' => $categorySummary, 'meta' => ['from' => $from, 'to' => $to, 'abc_basis' => $abcBasis, 'abc_a_threshold_percent' => $aThreshold, 'abc_b_threshold_percent' => $bThreshold, 'category_id' => isset($data['category_id']) ? (int) $data['category_id'] : null, 'customer_id' => isset($data['customer_id']) ? (int) $data['customer_id'] : null, 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))]]);
+    }
+
+    public function inventoryAging(Request $request, InventoryAgingService $aging): JsonResponse
+    {
+        $data = $request->validate([
+            'as_of' => ['nullable', 'date'],
+            'product_id' => ['nullable', 'integer'],
+            'category_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for inventory aging.');
+        $asOf = $data['as_of'] ?? now()->toDateString();
+        $rows = $aging->rowsForCompany($companyId, $asOf, $data['product_id'] ?? null, $data['category_id'] ?? null, $data['location_id'] ?? null);
+        $summary = [
+            'quantity' => (float) $rows->sum('quantity'),
+            'value' => (float) $rows->sum('value'),
+            'by_bucket' => collect($aging->buckets())->mapWithKeys(fn (string $bucket): array => [$bucket => [
+                'quantity' => (float) $rows->where('age_bucket', $bucket)->sum('quantity'),
+                'value' => (float) $rows->where('age_bucket', $bucket)->sum('value'),
+            ]])->all(),
+        ];
+        $perPage = (int) ($data['per_page'] ?? 50);
+        $page = max(1, (int) $request->input('page', 1));
+        return response()->json([
+            'data' => $rows->forPage($page, $perPage)->values(),
+            'summary' => $summary,
+            'meta' => [
+                'as_of' => $asOf,
+                'product_id' => $data['product_id'] ?? null,
+                'category_id' => $data['category_id'] ?? null,
+                'location_id' => $data['location_id'] ?? null,
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $rows->count(),
+                'last_page' => max(1, (int) ceil($rows->count() / $perPage)),
+            ],
+        ]);
     }
 }

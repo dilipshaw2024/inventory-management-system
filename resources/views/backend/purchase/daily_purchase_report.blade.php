@@ -24,6 +24,20 @@
             </div>
         </div>
 
+        <div class="col-md-4">
+            <div class="md-3 form-group">
+                <label for="compare_start_date" class="form-label">Compare Start Date (optional)</label>
+                <input class="form-control" name="compare_start_date" type="date" id="compare_start_date">
+            </div>
+        </div>
+
+        <div class="col-md-4">
+            <div class="md-3 form-group">
+                <label for="compare_end_date" class="form-label">Compare End Date (optional)</label>
+                <input class="form-control" name="compare_end_date" type="date" id="compare_end_date">
+            </div>
+        </div>
+
          
         <div class="col-md-4">
             <div class="md-3 form-group">
@@ -36,6 +50,8 @@
             <div class="md-3">
                 <label for="example-text-input" class="form-label" style="margin-top:43px;"> </label>
              <button type="submit" class="btn btn-info">Search</button>
+             <button type="submit" formaction="{{ route('daily.purchase.export') }}" formtarget="_self" name="format" value="csv" class="btn btn-outline-primary">CSV</button>
+             <button type="submit" formaction="{{ route('daily.purchase.export') }}" formtarget="_self" name="format" value="xlsx" class="btn btn-outline-success">XLSX</button>
             </div>
         </div>
   

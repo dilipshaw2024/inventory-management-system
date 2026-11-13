@@ -71,6 +71,18 @@
         </div>
     </div> <!-- end row -->
 
+    <div class="row mb-3">
+        <div class="col-12">
+            <table class="table table-sm table-bordered">
+                <thead><tr><th>Period</th><th>Documents</th><th>Quantity</th><th>Amount</th><th>Average unit price</th>@if($comparison)<th>Amount variance</th><th>Amount variance %</th>@endif</tr></thead>
+                <tbody>
+                    <tr><td>{{ $start_date }} — {{ $end_date }}</td><td>{{ $currentSummary['documents'] }}</td><td>{{ number_format($currentSummary['quantity'], 3) }}</td><td>{{ number_format($currentSummary['amount'], 2) }}</td><td>{{ number_format($currentSummary['average_unit_price'], 2) }}</td>@if($comparison)<td>{{ number_format($comparison['amount_variance'], 2) }}</td><td>{{ $comparison['amount_variance_percent'] === null ? 'N/A' : number_format($comparison['amount_variance_percent'], 2).'%' }}</td>@endif</tr>
+                    @if($comparison)<tr><td>{{ $comparison['start_date'] }} — {{ $comparison['end_date'] }}</td><td>{{ $comparison['documents'] }}</td><td>{{ number_format($comparison['quantity'], 3) }}</td><td>{{ number_format($comparison['amount'], 2) }}</td><td>{{ number_format($comparison['average_unit_price'], 2) }}</td><td colspan="2">Comparison period</td></tr>@endif
+                </tbody>
+            </table>
+        </div>
+    </div>
+
 
 
 

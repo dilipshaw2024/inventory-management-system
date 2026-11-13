@@ -35,6 +35,7 @@ class Kernel extends HttpKernel
             \Illuminate\Session\Middleware\StartSession::class,
             \App\Http\Middleware\TrackUserSession::class,
             \App\Http\Middleware\EnsureMfaVerified::class,
+            \App\Http\Middleware\ApplyCompanyLocalization::class,
             // \Illuminate\Session\Middleware\AuthenticateSession::class,
             \Illuminate\View\Middleware\ShareErrorsFromSession::class,
             \App\Http\Middleware\VerifyCsrfToken::class,
@@ -44,6 +45,7 @@ class Kernel extends HttpKernel
         'api' => [
             // \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
             'throttle:api',
+            \App\Http\Middleware\ApplyCompanyLocalization::class,
             \Illuminate\Routing\Middleware\SubstituteBindings::class,
         ],
     ];

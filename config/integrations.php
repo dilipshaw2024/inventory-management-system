@@ -64,4 +64,8 @@ return [
     'exchange_rate_http_endpoint' => env('ERP_EXCHANGE_RATE_HTTP_ENDPOINT'),
     'exchange_rate_http_token' => env('ERP_EXCHANGE_RATE_HTTP_TOKEN'),
     'exchange_rate_http_timeout' => (int) env('ERP_EXCHANGE_RATE_HTTP_TIMEOUT', 30),
+    'regional_compliance_packs' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) env('ERP_REGIONAL_COMPLIANCE_PACKS', ''))
+    ))),
 ];

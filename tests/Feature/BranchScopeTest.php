@@ -13,7 +13,10 @@ use App\Models\SalesOrder;
 use App\Models\Supplier;
 use App\Models\Unit;
 use App\Models\User;
+use App\Http\Middleware\ApplyCompanyLocalization;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
@@ -50,6 +53,27 @@ class BranchScopeTest extends TestCase
 
         $this->patchJson('/api/integration/organization/company', ['timezone' => 'Not/A_Timezone', 'locale' => 'invalid locale'])->assertStatus(422);
         $this->assertDatabaseMissing('companies', ['id' => $company->id, 'timezone' => 'Not/A_Timezone']);
+    }
+
+    public function test_company_localization_is_applied_during_request_and_restored_afterward(): void
+    {
+        $company = Company::create(['name' => 'Localization Runtime Co', 'code' => 'LOCALIZATION-RUNTIME', 'locale' => 'en_IN', 'timezone' => 'Asia/Kolkata']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Auth::setUser($user);
+        $beforeTimezone = config('app.timezone');
+        $beforeLocale = app()->getLocale();
+
+        $response = app(ApplyCompanyLocalization::class)->handle(Request::create('/localization-runtime', 'GET'), function () {
+            return response()->json(['timezone' => config('app.timezone'), 'locale' => app()->getLocale(), 'offset' => now()->format('P')]);
+        });
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame('Asia/Kolkata', $response->getData(true)['timezone']);
+        $this->assertSame('en-IN', $response->getData(true)['locale']);
+        $this->assertSame('+05:30', $response->getData(true)['offset']);
+        $this->assertSame($beforeTimezone, config('app.timezone'));
+        $this->assertSame($beforeLocale, app()->getLocale());
+        Auth::logout();
     }
 
     public function test_assigned_branch_user_sees_only_locations_in_their_branch(): void

@@ -12,10 +12,12 @@ use App\Models\Category;
 use Auth;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Symfony\Component\HttpFoundation\Response;
 use App\Http\Requests\Pos\PurchaseRequest;
 use App\Services\InventoryLedgerService;
 use App\Services\AuditService;
 use App\Services\ProductLifecycleService;
+use App\Services\ProductSpreadsheetService;
 
 class PurchaseController extends Controller
 {
@@ -178,17 +180,76 @@ class PurchaseController extends Controller
 
     public function DailyPurchasePdf(Request $request){
         abort_unless(auth()->user()?->company_id, 403, 'A company is required for purchase reporting.');
-        $dates = $request->validate(['start_date' => ['required', 'date'], 'end_date' => ['required', 'date', 'after_or_equal:start_date']]);
+        $dates = $request->validate([
+            'start_date' => ['required', 'date'],
+            'end_date' => ['required', 'date', 'after_or_equal:start_date'],
+            'compare_start_date' => ['nullable', 'date', 'required_with:compare_end_date'],
+            'compare_end_date' => ['nullable', 'date', 'required_with:compare_start_date', 'after_or_equal:compare_start_date'],
+        ]);
         $sdate = $dates['start_date'];
         $edate = $dates['end_date'];
         $allData = Purchase::where('company_id', $this->companyId())->whereBetween('date',[$sdate,$edate])->where('status','1')->orderBy('date','desc')->orderBy('id','desc')->get();
+        $summary = static fn ($rows): array => [
+            'documents' => $rows->count(),
+            'quantity' => (float) $rows->sum('buying_qty'),
+            'amount' => (float) $rows->sum('buying_price'),
+            'average_unit_price' => (float) $rows->sum('buying_qty') > 0 ? (float) $rows->sum('buying_price') / (float) $rows->sum('buying_qty') : 0,
+        ];
+        $currentSummary = $summary($allData);
+        $comparison = null;
+        if (!empty($dates['compare_start_date']) && !empty($dates['compare_end_date'])) {
+            $compareData = Purchase::where('company_id', $this->companyId())->whereBetween('date', [$dates['compare_start_date'], $dates['compare_end_date']])->where('status', '1')->get();
+            $comparison = $summary($compareData);
+            foreach (['documents', 'quantity', 'amount', 'average_unit_price'] as $metric) {
+                $comparison[$metric.'_variance'] = $currentSummary[$metric] - $comparison[$metric];
+                $comparison[$metric.'_variance_percent'] = $comparison[$metric] != 0 ? (($currentSummary[$metric] - $comparison[$metric]) / abs($comparison[$metric])) * 100 : null;
+            }
+            $comparison['start_date'] = $dates['compare_start_date'];
+            $comparison['end_date'] = $dates['compare_end_date'];
+        }
 
 
         $start_date = date('Y-m-d',strtotime($request->start_date));
         $end_date = date('Y-m-d',strtotime($request->end_date));
-        return view('backend.pdf.daily_purchase_report_pdf',compact('allData','start_date','end_date'));
+        return view('backend.pdf.daily_purchase_report_pdf', compact('allData', 'start_date', 'end_date', 'currentSummary', 'comparison'));
 
     }// End Method 
+
+    public function DailyPurchaseExport(Request $request, ProductSpreadsheetService $spreadsheet): Response
+    {
+        abort_unless(auth()->user()?->company_id, 403, 'A company is required for purchase reporting.');
+        $dates = $request->validate([
+            'start_date' => ['required', 'date'],
+            'end_date' => ['required', 'date', 'after_or_equal:start_date'],
+            'format' => ['nullable', 'in:csv,xlsx'],
+        ]);
+        $rows = Purchase::with(['product', 'supplier', 'unit'])
+            ->where('company_id', $this->companyId())
+            ->whereBetween('date', [$dates['start_date'], $dates['end_date']])
+            ->where('status', '1')
+            ->orderByDesc('date')->orderByDesc('id')->get();
+        $headers = ['Purchase no', 'Date', 'Supplier', 'Product', 'SKU', 'Unit', 'Quantity', 'Unit price', 'Amount'];
+        $values = $rows->map(fn (Purchase $purchase): array => [
+            $purchase->purchase_no,
+            $purchase->date,
+            $purchase->supplier?->name ?: 'N/A',
+            $purchase->product?->name ?: 'N/A',
+            $purchase->product?->sku ?: '',
+            $purchase->unit?->name ?: '',
+            number_format((float) $purchase->buying_qty, 6, '.', ''),
+            number_format((float) $purchase->unit_price, 6, '.', ''),
+            number_format((float) $purchase->buying_price, 6, '.', ''),
+        ])->all();
+        if (($dates['format'] ?? 'csv') === 'xlsx') {
+            return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="purchase-report-'.now()->toDateString().'.xlsx"']);
+        }
+        return response()->streamDownload(function () use ($headers, $values): void {
+            $output = fopen('php://output', 'w');
+            fputcsv($output, $headers);
+            foreach ($values as $value) fputcsv($output, $value);
+            fclose($output);
+        }, 'purchase-report-'.now()->toDateString().'.csv', ['Content-Type' => 'text/csv']);
+    }
 
 
 

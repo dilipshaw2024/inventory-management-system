@@ -71,6 +71,19 @@ class ProductSpreadsheetService
         $content = file_get_contents($tmp) ?: ''; unlink($tmp); return $content;
     }
 
+    public function template(string $format = 'xlsx'): string
+    {
+        if ($format === 'csv') {
+            $handle = fopen('php://temp', 'w+');
+            fputcsv($handle, self::HEADERS);
+            rewind($handle);
+            $content = stream_get_contents($handle) ?: '';
+            fclose($handle);
+            return $content;
+        }
+        return $this->write(self::HEADERS, []);
+    }
+
     private function columnNumber(string $letters): int { $number = 0; foreach (str_split($letters) as $letter) $number = $number * 26 + ord($letter) - 64; return max(1, $number); }
     private function columnName(int $number): string { $name = ''; while ($number > 0) { $name = chr(65 + (($number - 1) % 26)).$name; $number = intdiv($number - 1, 26); } return $name; }
 }

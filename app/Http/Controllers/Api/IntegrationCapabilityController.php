@@ -26,13 +26,29 @@ class IntegrationCapabilityController extends Controller
 
         $modules = [
             'organization' => ['read_ability' => 'integration:read', 'write_ability' => 'integration:write', 'feed_root' => '/api/integration/organization'],
-            'catalog' => ['read_ability' => 'inventory:read', 'write_ability' => 'inventory:write', 'feed_root' => '/api/integration/products'],
+            'catalog' => [
+                'read_ability' => 'inventory:read',
+                'write_ability' => 'inventory:write',
+                'feed_root' => '/api/integration/products',
+                'endpoints' => ['product_import_template' => '/api/inventory/product-import-template'],
+            ],
             'inventory' => ['read_ability' => 'inventory:read', 'write_ability' => 'inventory:write', 'feed_root' => '/api/inventory'],
+            'reports' => [
+                'read_ability' => 'inventory:read',
+                'write_ability' => null,
+                'feed_root' => '/api/inventory/analytics',
+                'endpoints' => [
+                    'inventory_analytics' => '/api/inventory/analytics',
+                    'inventory_aging' => '/api/inventory/analytics/aging',
+                    'inventory_dashboard' => '/api/inventory/dashboard',
+                    'inventory_traceability' => '/api/inventory/traceability',
+                ],
+            ],
             'warehouse' => ['read_ability' => 'warehouse:read', 'write_ability' => 'warehouse:write', 'feed_root' => '/api/integration/warehouse'],
             'purchasing' => ['read_ability' => 'purchasing:read', 'write_ability' => 'purchasing:write', 'feed_root' => '/api/integration'],
             'sales' => ['read_ability' => 'sales:read', 'write_ability' => 'sales:write', 'feed_root' => '/api/integration'],
             'manufacturing' => ['read_ability' => 'manufacturing:read', 'write_ability' => 'manufacturing:write', 'feed_root' => '/api/integration/manufacturing'],
-            'planning' => ['read_ability' => 'planning:read', 'write_ability' => 'planning:write', 'feed_root' => '/api/integration/planning'],
+            'planning' => ['read_ability' => 'planning:read', 'write_ability' => 'planning:write', 'feed_root' => '/api/integration/planning', 'endpoints' => ['action_queue' => '/api/inventory/planning/action-queue']],
             'service' => ['read_ability' => 'service:read', 'write_ability' => 'service:write', 'feed_root' => '/api/service'],
             'accounting' => ['read_ability' => 'accounting:read', 'write_ability' => 'accounting:write', 'feed_root' => '/api/accounting'],
             'hr' => ['read_ability' => 'hr:read', 'write_ability' => 'hr:write', 'feed_root' => '/api/hr'],

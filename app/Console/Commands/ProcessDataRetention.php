@@ -10,6 +10,7 @@ use App\Models\DataRetentionPurgeRequest;
 use App\Models\DocumentRevision;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Storage;
+use App\Services\RetentionArchiveStorage;
 
 class ProcessDataRetention extends Command
 {
@@ -52,7 +53,12 @@ class ProcessDataRetention extends Command
                     if ($held) continue;
                     if ($policy->archive_enabled) {
                         $payload = $record->toArray();
-                        DataRetentionArchive::firstOrCreate(['company_id' => $policy->company_id, 'record_type' => $policy->record_type, 'record_id' => $record->getKey()], ['payload' => $payload, 'payload_hash' => hash('sha256', json_encode($payload, JSON_UNESCAPED_SLASHES)), 'archived_at' => now()]);
+                        $payloadHash = hash('sha256', json_encode($payload, JSON_UNESCAPED_SLASHES));
+                        $archive = DataRetentionArchive::firstOrCreate(['company_id' => $policy->company_id, 'record_type' => $policy->record_type, 'record_id' => $record->getKey()], ['payload' => $payload, 'payload_hash' => $payloadHash, 'archived_at' => now()]);
+                        if (!$archive->external_path) {
+                            $external = app(RetentionArchiveStorage::class)->store((int) $policy->company_id, $policy->record_type, (int) $record->getKey(), $payload, $payloadHash);
+                            if ($external) $archive->forceFill($external)->save();
+                        }
                         $processed++;
                     }
                     if ($purgeRequest && $policy->purge_enabled && $policy->archive_enabled) {

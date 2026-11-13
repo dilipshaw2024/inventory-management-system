@@ -29,4 +29,17 @@ class ProductSpreadsheetTest extends TestCase
         self::assertContains('lifecycle_status', ProductSpreadsheetService::HEADERS);
         self::assertContains('can_sell', ProductSpreadsheetService::HEADERS);
     }
+
+    public function test_import_templates_are_empty_but_schema_complete_in_csv_and_xlsx(): void
+    {
+        $service = new ProductSpreadsheetService();
+        self::assertStringContainsString('name,sku,barcode', $service->template('csv'));
+        $path = tempnam(sys_get_temp_dir(), 'product-template-');
+        file_put_contents($path, $service->template('xlsx'));
+        try {
+            self::assertSame([], $service->read($path, 'xlsx'));
+        } finally {
+            unlink($path);
+        }
+    }
 }

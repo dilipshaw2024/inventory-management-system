@@ -22,6 +22,7 @@ use App\Services\InventoryLocationCapacityService;
 use App\Services\NumberingSequenceService;
 use App\Services\SerialLifecycleService;
 use App\Services\WarehouseFulfillmentService;
+use App\Services\WarehousePickRouteService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -37,13 +38,13 @@ class WarehouseIntegrationController extends Controller
             'warehouse_id' => ['nullable', 'integer'],
             'location_id' => ['nullable', 'integer'],
             'date' => ['nullable', 'date'],
-            'sort_by' => ['nullable', 'in:location,product,delivery_date'],
+            'sort_by' => ['nullable', 'in:location,product,delivery_date,route'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         $companyId = $request->user()?->company_id;
         abort_unless($companyId, 403, 'A company is required for warehouse picking.');
 
-        $deliveries = Delivery::with(['lines.product', 'salesOrder.customer', 'location.warehouse', 'operations'])
+        $deliveries = Delivery::with(['lines.product', 'salesOrder.customer', 'location.warehouse', 'location.parent.parent.parent.parent', 'operations'])
             ->where('company_id', $companyId)
             ->where('status', 'pending')
             ->where(fn ($query) => $query->whereNull('fulfillment_status')->orWhere('fulfillment_status', 'pending'))
@@ -54,7 +55,8 @@ class WarehouseIntegrationController extends Controller
             ->orderBy('date')->orderBy('id')->get();
 
         $sortBy = $data['sort_by'] ?? 'location';
-        $rows = $deliveries->map(function (Delivery $delivery): array {
+        $routeService = app(WarehousePickRouteService::class);
+        $rows = $deliveries->map(function (Delivery $delivery) use ($routeService): array {
             $lines = $delivery->lines->map(fn ($line): array => [
                 'id' => (int) $line->id,
                 'product_id' => (int) $line->product_id,
@@ -71,6 +73,7 @@ class WarehouseIntegrationController extends Controller
                 'location' => $delivery->location?->code,
                 'warehouse_id' => $delivery->location?->warehouse_id ? (int) $delivery->location->warehouse_id : null,
                 'warehouse' => $delivery->location?->warehouse?->name,
+                'route_key' => $routeService->locationKey($delivery->location),
                 'customer_id' => $delivery->salesOrder?->customer_id ? (int) $delivery->salesOrder->customer_id : null,
                 'customer' => $delivery->salesOrder?->customer?->name,
                 'lines' => $lines,
@@ -84,6 +87,7 @@ class WarehouseIntegrationController extends Controller
             return match ($sortBy) {
                 'product' => [$firstProduct, (string) ($row['location'] ?? ''), $row['date'] ?? '', $row['delivery_id']],
                 'delivery_date' => [$row['date'] ?? '', (string) ($row['location'] ?? ''), $row['delivery_id']],
+                'route' => [$row['warehouse_id'] ?? 0, (string) ($row['route_key'] ?? 'ZZZ'), $row['date'] ?? '', $row['delivery_id']],
                 default => [(string) ($row['location'] ?? 'ZZZ'), $firstProduct, $row['date'] ?? '', $row['delivery_id']],
             };
         })->values()->map(function (array $row, int $index): array {
@@ -102,6 +106,7 @@ class WarehouseIntegrationController extends Controller
                 'sort_by' => $sortBy, 'warehouse_id' => $data['warehouse_id'] ?? null,
                 'location_id' => $data['location_id'] ?? null,
                 'total_lines' => $rows->sum('line_count'), 'total_quantity' => (float) $rows->sum('total_quantity'),
+                'route_optimized' => $sortBy === 'route', 'route_basis' => $sortBy === 'route' ? 'location_hierarchy' : null,
             ],
         ]);
     }
@@ -277,7 +282,7 @@ class WarehouseIntegrationController extends Controller
             'warehouse_id' => ['required', 'integer'],
             'location_id' => ['nullable', 'integer'],
             'date' => ['nullable', 'date'],
-            'sort_by' => ['nullable', 'in:location,product,delivery_date'],
+            'sort_by' => ['nullable', 'in:location,product,delivery_date,route'],
             'max_deliveries' => ['nullable', 'integer', 'min:1', 'max:100'],
             'wave_date' => ['nullable', 'date'],
             'external_reference' => ['nullable', 'string', 'max:150'],
@@ -304,7 +309,7 @@ class WarehouseIntegrationController extends Controller
                     ->firstOrFail();
 
                 $sortBy = $data['sort_by'] ?? 'location';
-                $deliveries = Delivery::with(['lines.product', 'location.warehouse', 'operations'])
+                $deliveries = Delivery::with(['lines.product', 'location.warehouse', 'location.parent.parent.parent.parent', 'operations'])
                     ->where('company_id', $companyId)
                     ->where('status', 'pending')
                     ->where(fn ($query) => $query->whereNull('fulfillment_status')->orWhere('fulfillment_status', 'pending'))
@@ -318,13 +323,15 @@ class WarehouseIntegrationController extends Controller
                     ->get()
                     ->filter(fn (Delivery $delivery): bool => $delivery->lines->isNotEmpty());
 
-                $deliveries = $deliveries->sortBy(function (Delivery $delivery) use ($sortBy): array {
+                $routeService = app(WarehousePickRouteService::class);
+                $deliveries = $deliveries->sortBy(function (Delivery $delivery) use ($sortBy, $routeService): array {
                     $firstProduct = (string) ($delivery->lines->first()?->product?->name ?? '');
                     $location = (string) ($delivery->location?->code ?? '');
                     $date = optional($delivery->date)->toDateString() ?? '';
                     return match ($sortBy) {
                         'product' => [$firstProduct, $location, $date, $delivery->id],
                         'delivery_date' => [$date, $location, $delivery->id],
+                        'route' => $routeService->deliveryKey($delivery),
                         default => [$location ?: 'ZZZ', $firstProduct, $date, $delivery->id],
                     };
                 })->values();

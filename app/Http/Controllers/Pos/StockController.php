@@ -23,6 +23,8 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 use App\Services\ProductSpreadsheetService;
 use App\Models\StockReservation;
 use App\Models\InventoryStatusBalance;
+use App\Services\InventoryAgingService;
+use Illuminate\Pagination\LengthAwarePaginator;
  
 class StockController extends Controller
 {
@@ -229,6 +231,47 @@ class StockController extends Controller
         $fiscalPeriods = FiscalPeriod::where('company_id', $companyId)->orderByDesc('ends_on')->get(['id', 'name', 'starts_on', 'ends_on', 'status']);
 
         return view('backend.stock.valuation_report', compact('valuation', 'products', 'categories', 'locations', 'batches', 'departments', 'costCenters', 'fiscalPeriods', 'periodDrilldown'));
+    }
+
+    public function AgingReport(Request $request, InventoryAgingService $aging, ProductSpreadsheetService $spreadsheet)
+    {
+        $companyId = auth()->user()?->company_id;
+        $validated = $request->validate([
+            'as_of' => ['nullable', 'date'],
+            'product_id' => ['nullable', 'integer', $this->owned('products')],
+            'category_id' => ['nullable', 'integer', $this->owned('categories')],
+            'location_id' => ['nullable', 'integer', \App\Services\InventoryLocationRuleService::existsForCompany($companyId)],
+            'format' => ['nullable', 'in:csv,xlsx'],
+        ]);
+        $asOf = $validated['as_of'] ?? now()->toDateString();
+        $rows = $aging->rowsForCompany($companyId, $asOf, $validated['product_id'] ?? null, $validated['category_id'] ?? null, $validated['location_id'] ?? null);
+        $summary = collect($aging->buckets())->mapWithKeys(fn (string $bucket): array => [$bucket => [
+            'quantity' => (float) $rows->where('age_bucket', $bucket)->sum('quantity'),
+            'value' => (float) $rows->where('age_bucket', $bucket)->sum('value'),
+        ]]);
+
+        if ($request->filled('format')) {
+            $headers = ['Product', 'SKU', 'Category', 'Warehouse', 'Location', 'Batch', 'Received at', 'Age days', 'Age bucket', 'Quantity', 'Unit cost', 'Value'];
+            $values = $rows->map(fn (array $row): array => [$row['product'], $row['sku'], $row['category'] ?: 'Uncategorized', $row['warehouse'], $row['location'], $row['batch'], $row['received_at'], $row['age_days'], $row['age_bucket'], $row['quantity'], $row['unit_cost'], $row['value']])->all();
+            if ($validated['format'] === 'xlsx') {
+                return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="inventory-aging-'.$asOf.'.xlsx"']);
+            }
+            return response()->streamDownload(function () use ($headers, $values): void {
+                $output = fopen('php://output', 'w');
+                fputcsv($output, $headers);
+                foreach ($values as $value) fputcsv($output, $value);
+                fclose($output);
+            }, 'inventory-aging-'.$asOf.'.csv', ['Content-Type' => 'text/csv']);
+        }
+
+        $perPage = 50;
+        $page = max(1, (int) $request->input('page', 1));
+        $paged = new LengthAwarePaginator($rows->forPage($page, $perPage)->values(), $rows->count(), $perPage, $page, ['path' => LengthAwarePaginator::resolveCurrentPath()]);
+        $products = Product::where('status', 1)->orderBy('name')->get(['id', 'name']);
+        $categories = Category::where('is_active', true)->orderBy('name')->get(['id', 'name']);
+        $locations = InventoryLocation::where('is_active', true)->orderBy('code')->get(['id', 'code']);
+        $decimalPrecision = (int) app(\App\Services\ErpSettingService::class)->get('decimal_precision', 6);
+        return view('backend.stock.aging_report', compact('paged', 'summary', 'asOf', 'products', 'categories', 'locations', 'decimalPrecision'));
     }
 
     public function LocationStockReport(Request $request)

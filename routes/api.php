@@ -24,6 +24,9 @@ Route::middleware(['auth:sanctum', 'throttle:api', 'abilities:integration:read']
 Route::middleware(['auth:sanctum', 'throttle:api', 'abilities:integration:read'])
     ->get('/integration/capabilities', [\App\Http\Controllers\Api\IntegrationCapabilityController::class, 'index']);
 
+Route::middleware(['auth:sanctum', 'throttle:api', 'abilities:integration:read'])
+    ->get('/integration/compliance', [\App\Http\Controllers\Api\IntegrationProviderController::class, 'compliance']);
+
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('pos')->group(function (): void {
     Route::get('/registers', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'registers'])->middleware('abilities:sales:read');
     Route::post('/registers', [\App\Http\Controllers\Api\PosSessionIntegrationController::class, 'storeRegister'])->middleware('abilities:sales:write');
@@ -160,6 +163,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
 
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(function (): void {
     Route::get('/products', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'products'])->middleware('abilities:inventory:read');
+    Route::get('/product-import-template', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'importTemplate'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/costing-policies', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'costingPolicies'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/cost-history', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'costHistory'])->middleware('abilities:inventory:read');
     Route::get('/product-import-jobs', [\App\Http\Controllers\Api\ProductImportJobIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
@@ -226,6 +230,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::post('/documents/{id}/inspect', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'inspectDocument'])->middleware('ability:inventory:write,integration:write');
     Route::get('/transfers', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'transfers'])->middleware('abilities:inventory:read');
     Route::get('/replenishment', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'replenishment'])->middleware('abilities:inventory:read');
+    Route::get('/planning/action-queue', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'actionQueue'])->middleware('abilities:inventory:read');
     Route::get('/replenishment/multi-echelon', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'multiEchelonReplenishment'])->middleware('abilities:inventory:read');
     Route::get('/replenishment/time-phased', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'timePhasedReplenishment'])->middleware('abilities:inventory:read');
     Route::get('/replenishment/scenario', [\App\Http\Controllers\Api\PlanningIntegrationController::class, 'replenishmentScenario'])->middleware('abilities:inventory:read');
@@ -246,6 +251,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::get('/mrp', [\App\Http\Controllers\Api\MrpIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
     Route::get('/forecast', [\App\Http\Controllers\Api\ForecastIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
     Route::get('/analytics', [\App\Http\Controllers\Api\AnalyticsIntegrationController::class, 'inventory'])->middleware('abilities:inventory:read');
+    Route::get('/analytics/aging', [\App\Http\Controllers\Api\AnalyticsIntegrationController::class, 'inventoryAging'])->middleware('abilities:inventory:read');
     Route::get('/dashboard', [\App\Http\Controllers\Api\DashboardIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
     Route::get('/traceability', [\App\Http\Controllers\Api\TraceabilityIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
     Route::get('/reconciliation-snapshots', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'reconciliationSnapshots'])->middleware('abilities:inventory:read');

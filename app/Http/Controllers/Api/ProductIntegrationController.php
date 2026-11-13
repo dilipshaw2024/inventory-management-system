@@ -19,6 +19,7 @@ use App\Services\AuditService;
 use App\Services\InventoryAvailabilityService;
 use App\Services\NumberingSequenceService;
 use App\Services\ProductLifecycleService;
+use App\Services\ProductSpreadsheetService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -27,6 +28,14 @@ use Illuminate\Validation\Rule;
 
 class ProductIntegrationController extends Controller
 {
+    public function importTemplate(Request $request, ProductSpreadsheetService $spreadsheet)
+    {
+        $format = strtolower((string) $request->query('format', 'xlsx'));
+        abort_unless(in_array($format, ['csv', 'xlsx'], true), 422, 'The import template format must be csv or xlsx.');
+        if ($format === 'csv') return response($spreadsheet->template('csv'), 200, ['Content-Type' => 'text/csv; charset=UTF-8', 'Content-Disposition' => 'attachment; filename="product-import-template.csv"']);
+        return response($spreadsheet->template('xlsx'), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="product-import-template.xlsx"']);
+    }
+
     public function translations(Request $request, int $id): JsonResponse
     {
         $product = $this->companyScope(Product::query())->findOrFail($id);

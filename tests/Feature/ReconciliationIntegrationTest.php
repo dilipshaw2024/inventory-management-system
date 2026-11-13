@@ -7,6 +7,8 @@ use App\Models\ChartOfAccount;
 use App\Models\Company;
 use App\Models\JournalEntry;
 use App\Models\InventoryMovement;
+use App\Models\InventoryCostLayer;
+use App\Models\InventoryCostConsumption;
 use App\Models\InventoryReturn;
 use App\Models\Invoice;
 use App\Models\Payment;
@@ -118,5 +120,35 @@ class ReconciliationIntegrationTest extends TestCase
             ->assertOk()->assertJsonPath('meta.customer_id', $customer->id)
             ->assertJsonPath('summary.gross_revenue', 120)->assertJsonPath('summary.discount_amount', 20)
             ->assertJsonPath('data.0.customer.id', $customer->id);
+    }
+
+    public function test_inventory_aging_replays_cost_layer_consumption_and_is_company_scoped(): void
+    {
+        $company = Company::create(['name' => 'Aging Analytics Co', 'code' => 'AGING-ANALYTICS']);
+        $otherCompany = Company::create(['name' => 'Other Aging Co', 'code' => 'AGING-OTHER']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Aging supplier', 'is_active' => true]);
+        $otherSupplier = Supplier::create(['company_id' => $otherCompany->id, 'name' => 'Other aging supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Aging Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Aging category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Aging item', 'sku' => 'AGING-1', 'quantity' => 8, 'status' => 1]);
+        $foreignProduct = Product::create(['company_id' => $otherCompany->id, 'supplier_id' => $otherSupplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Foreign aging item', 'sku' => 'AGING-FOREIGN', 'quantity' => 20, 'status' => 1]);
+        $layer = InventoryCostLayer::create(['product_id' => $product->id, 'original_quantity' => 10, 'remaining_quantity' => 8, 'unit_cost' => 5, 'received_at' => '2026-01-01 09:00:00']);
+        $foreignLayer = InventoryCostLayer::create(['product_id' => $foreignProduct->id, 'original_quantity' => 20, 'remaining_quantity' => 20, 'unit_cost' => 7, 'received_at' => '2026-01-01 09:00:00']);
+        $movement = InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'issue', 'quantity' => 2, 'unit_cost' => 5, 'posted_at' => '2026-03-01 10:00:00']);
+        InventoryCostConsumption::create(['cost_layer_id' => $layer->id, 'product_id' => $product->id, 'movement_id' => $movement->id, 'quantity' => 2, 'unit_cost' => 5, 'total_cost' => 10, 'costing_method' => 'fifo']);
+
+        Sanctum::actingAs($user, ['inventory:read']);
+        $this->getJson('/api/inventory/analytics/aging?as_of=2026-12-31')
+            ->assertOk()
+            ->assertJsonPath('summary.quantity', 8)
+            ->assertJsonPath('summary.value', 40)
+            ->assertJsonPath('summary.by_bucket.181-365.quantity', 8)
+            ->assertJsonPath('data.0.product_id', $product->id)
+            ->assertJsonPath('data.0.age_bucket', '181-365')
+            ->assertJsonPath('data.0.quantity', 8)
+            ->assertJsonPath('data.0.value', 40)
+            ->assertJsonMissing(['product_id' => $foreignProduct->id]);
+        $this->assertNotNull($foreignLayer->id);
     }
 }

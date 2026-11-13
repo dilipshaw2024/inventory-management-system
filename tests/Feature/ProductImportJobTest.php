@@ -83,4 +83,17 @@ class ProductImportJobTest extends TestCase
         $this->artisan('erp:products:process-import-jobs')->assertExitCode(0);
         $this->assertDatabaseHas('product_import_jobs', ['id' => $jobId, 'status' => 'failed', 'attempts' => 2]);
     }
+
+    public function test_inventory_integration_can_download_the_product_import_template(): void
+    {
+        $company = Company::create(['name' => 'Import Template Co', 'code' => 'IMPORT-TEMPLATE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['inventory:read']);
+
+        $csv = $this->get('/api/inventory/product-import-template?format=csv');
+        $csv->assertOk()->assertHeader('content-type', 'text/csv; charset=UTF-8')->assertSee('name,sku,barcode', false);
+
+        $xlsx = $this->get('/api/inventory/product-import-template?format=xlsx');
+        $xlsx->assertOk()->assertHeader('content-type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')->assertHeader('content-disposition');
+    }
 }

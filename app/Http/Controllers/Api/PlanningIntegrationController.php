@@ -21,10 +21,19 @@ use App\Services\TransferReplenishmentService;
 use App\Services\ReplenishmentPurchaseOrderService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use App\Services\PlanningActionQueueService;
 use Illuminate\Pagination\LengthAwarePaginator;
 
 class PlanningIntegrationController extends Controller
 {
+    public function actionQueue(Request $request): JsonResponse
+    {
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        abort_unless($companyId, 403, 'A company is required for planning actions.');
+        $items = app(PlanningActionQueueService::class)->forCompany($companyId);
+        return response()->json(['data' => $items, 'summary' => ['action_count' => $items->where('count', '>', 0)->count(), 'item_count' => (int) $items->sum('count'), 'high_priority_count' => $items->where('priority', 'high')->where('count', '>', 0)->count()]])
+            ->header('Cache-Control', 'private, max-age=30');
+    }
     public function exceptions(Request $request): JsonResponse
     {
         $data = $request->validate(['type' => ['required', 'in:low,excess,slow,dead'], 'days' => ['nullable', 'integer', 'min:1', 'max:3650'], 'product_id' => ['nullable', 'integer'], 'location_id' => ['nullable', 'integer'], 'updated_since' => ['nullable', 'date'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100']]);

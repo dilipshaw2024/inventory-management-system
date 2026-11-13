@@ -154,6 +154,28 @@ class ReplenishmentPlanningTest extends TestCase
         $counts = app(DashboardMetricsService::class)->thresholdCounts(collect([$product]), $company->id, [$product->id => 0]);
 
         $this->assertSame(['low' => 1, 'excess' => 0], $counts);
+        $permission = Permission::create(['code' => 'reports.view', 'name' => 'View reports', 'module' => 'reports']);
+        $role = Role::create(['code' => 'planning-dashboard-viewer', 'name' => 'Planning dashboard viewer', 'is_active' => true]);
+        $role->permissions()->attach($permission);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $user->roles()->attach($role);
+        $this->actingAs($user)->get('/planning/dashboard')->assertOk()
+            ->assertViewHas('agingBuckets')
+            ->assertViewHas('actionQueue', fn ($queue): bool => $queue->count() === 5);
+    }
+
+    public function test_planning_action_queue_is_tenant_scoped_and_exposes_approval_metadata(): void
+    {
+        $company = Company::create(['name' => 'Action Queue Co', 'code' => 'ACTION-QUEUE']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        Sanctum::actingAs($user, ['inventory:read']);
+
+        $response = $this->getJson('/api/inventory/planning/action-queue');
+
+        $response->assertOk()
+            ->assertJsonStructure(['data' => [['action_type', 'priority', 'count', 'requires_approval', 'action', 'endpoint', 'browser_route']], 'summary' => ['action_count', 'item_count', 'high_priority_count']])
+            ->assertJsonCount(5, 'data');
+        $this->assertSame(['replenishment', 'production', 'expiry', 'excess_stock', 'dead_stock'], collect($response->json('data'))->pluck('action_type')->all());
     }
 
     public function test_replenishment_scenario_is_read_only_and_applies_daily_demand_override(): void

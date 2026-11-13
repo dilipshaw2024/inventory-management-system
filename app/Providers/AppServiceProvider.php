@@ -14,6 +14,7 @@ use App\Services\Integrations\StatutoryRemittanceProviderRegistry;
 use App\Services\Integrations\HttpStatutoryRemittanceProvider;
 use App\Services\Integrations\ExchangeRateProviderRegistry;
 use App\Services\Integrations\HttpExchangeRateProvider;
+use App\Services\Integrations\RegionalCompliancePackRegistry;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -70,6 +71,13 @@ class AppServiceProvider extends ServiceProvider
             $registry->register($app->make(HttpExchangeRateProvider::class));
             foreach ((array) config('integrations.exchange_rate_adapters', []) as $providerClass) {
                 $registry->register($app->make($providerClass));
+            }
+            return $registry;
+        });
+        $this->app->singleton(RegionalCompliancePackRegistry::class, function ($app): RegionalCompliancePackRegistry {
+            $registry = new RegionalCompliancePackRegistry();
+            foreach ((array) config('integrations.regional_compliance_packs', []) as $packClass) {
+                $registry->register($app->make($packClass));
             }
             return $registry;
         });

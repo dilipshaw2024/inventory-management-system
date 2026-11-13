@@ -25,10 +25,10 @@ class PlanningController extends Controller
         $type = $request->input('type', 'low');
         abort_unless(in_array($type, ['low', 'excess', 'slow', 'dead'], true), 404);
         $validated = $request->validate(['type' => ['nullable', 'in:low,excess,slow,dead'], 'days' => ['nullable', 'integer', 'min:1', 'max:3650'], 'location_id' => ['nullable', 'integer']]);
-        $defaultDays = $type === 'dead' ? app(\App\Services\ErpSettingService::class)->get('dead_stock_days', 180) : app(\App\Services\ErpSettingService::class)->get('slow_moving_days', 90);
+        $companyId = (int) (auth()->user()?->company_id ?? 0);
+        $defaultDays = $type === 'dead' ? app(\App\Services\ErpSettingService::class)->get('dead_stock_days', 180, $companyId) : app(\App\Services\ErpSettingService::class)->get('slow_moving_days', 90, $companyId);
         $days = (int) ($validated['days'] ?? $defaultDays);
         $cutoff = now()->subDays($days);
-        $companyId = (int) (auth()->user()?->company_id ?? 0);
         $locationId = $validated['location_id'] ?? null;
         if ($locationId !== null && !InventoryLocation::whereKey($locationId)->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))->exists()) {
             abort(422, 'Location is not authorized for this company.');
@@ -169,6 +169,8 @@ class PlanningController extends Controller
         $recentlyIssued = InventoryMovement::whereIn('product_id', $dashboardProducts->pluck('id'))->where('movement_type', 'issue')->where('posted_at', '>=', now()->subDays($deadDays))->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->distinct()->pluck('product_id');
         $deadStock = $dashboardProducts->filter(fn (Product $product): bool => ($dashboardAvailability[$product->id] ?? 0) > 0 && !$recentlyIssued->contains($product->id))->count();
         $expiringBatches = InventoryBatch::whereNotNull('expiry_date')->whereDate('expiry_date', '<=', now()->addDays($expiryDays))->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->count();
-        return view('backend.stock.planning_dashboard', compact('lowStock', 'excessStock', 'deadStock', 'expiringBatches', 'deadDays', 'expiryDays'));
+        $actionQueue = app(\App\Services\PlanningActionQueueService::class)->forCompany($companyId);
+        $agingBuckets = app(\App\Services\InventoryAgingService::class)->rowsForCompany($companyId, now()->toDateString())->groupBy('age_bucket')->map(fn ($rows): array => ['quantity' => (float) $rows->sum('quantity'), 'value' => (float) $rows->sum('value')]);
+        return view('backend.stock.planning_dashboard', compact('lowStock', 'excessStock', 'deadStock', 'expiringBatches', 'deadDays', 'expiryDays', 'actionQueue', 'agingBuckets'));
     }
 }

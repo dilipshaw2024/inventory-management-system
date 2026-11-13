@@ -19,6 +19,7 @@ use App\Models\StockCount;
 use App\Models\CustomerPaymentAllocation;
 use App\Models\ServiceRequest;
 use App\Models\MaintenanceOrder;
+use App\Models\InventoryLocation;
 use App\Models\User;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -27,8 +28,8 @@ class DashboardMetricsService
 {
     public const WIDGETS = [
         'month_sales', 'total_products', 'low_stock', 'pending_approvals',
-        'receivables', 'open_service_requests', 'breached_service_requests',
-        'active_maintenance_orders', 'sales_trend', 'exception_drilldowns',
+        'receivables', 'purchase_trend', 'warehouse_utilization', 'open_service_requests', 'breached_service_requests',
+        'active_maintenance_orders', 'aging_stock_value', 'aged_stock_value', 'sales_trend', 'exception_drilldowns',
     ];
 
     public function forCurrentCompany(int $months = 6): array
@@ -60,6 +61,7 @@ class DashboardMetricsService
             $metrics['month_sales'] = null;
             $metrics['receivables'] = null;
             $metrics['sales_trend'] = [];
+            $metrics['purchase_trend'] = [];
         }
         if (!$service) {
             $metrics['open_service_requests'] = null;
@@ -69,6 +71,9 @@ class DashboardMetricsService
         if (!$inventory) {
             $metrics['total_products'] = null;
             $metrics['low_stock'] = null;
+            $metrics['aging_stock_value'] = null;
+            $metrics['aged_stock_value'] = null;
+            $metrics['warehouse_utilization'] = null;
             $metrics['exception_drilldowns'] = ['low_stock' => [], 'excess_stock' => []];
         }
         $metrics['widgets'] = collect($metrics)->only($metrics['enabled_widgets'] ?? self::WIDGETS)->all();
@@ -83,6 +88,10 @@ class DashboardMetricsService
         $monthSales = (float) Invoice::whereIn('status', [1, 'approved'])->whereDate('date', '>=', $monthStart)->sum('total_amount');
         $products = Product::where('status', 1)->get(); $availability = app(InventoryAvailabilityService::class)->availableMany($products, true, null, auth()->user()?->company_id);
         $totalProducts = max(1, $products->count()); $planning = $this->planningMetrics($products, $companyId, $availability); $lowStock = $planning['low'];
+        $agingRows = app(InventoryAgingService::class)->rowsForCompany($companyId, Carbon::now()->toDateString());
+        $agingStockValue = (float) $agingRows->sum('value');
+        $agedStockValue = (float) $agingRows->where('age_bucket', '366+')->sum('value');
+        $warehouseUtilization = $this->warehouseUtilization($companyId);
         $pendingByModule = [
             'inventory' => InventoryAdjustment::where('status', 'pending')->count() + InventoryDocument::where('status', 'pending')->count() + StockCount::where('status', 'submitted')->count(),
             'purchasing' => Purchase::where('status', 0)->count() + PurchaseOrder::where('status', 'submitted')->count() + GoodsReceipt::where('status', 'pending')->count() + PurchaseInvoice::where('status', 'pending')->count(),
@@ -98,8 +107,9 @@ class DashboardMetricsService
             'month_sales' => $monthSales, 'total_products' => $totalProducts, 'low_stock' => $lowStock,
             'pending_approvals' => $pendingApprovals, 'pending_approvals_by_module' => $pendingByModule, 'receivables' => $receivables,
             'open_service_requests' => $openServiceRequests, 'breached_service_requests' => $breachedServiceRequests,
-            'active_maintenance_orders' => $activeMaintenanceOrders,
+            'active_maintenance_orders' => $activeMaintenanceOrders, 'aging_stock_value' => $agingStockValue, 'aged_stock_value' => $agedStockValue, 'warehouse_utilization' => $warehouseUtilization,
             'sales_trend' => $this->salesTrend($months),
+            'purchase_trend' => $this->purchaseTrend($months),
             'exception_drilldowns' => ['low_stock' => $planning['low_rows'], 'excess_stock' => $planning['excess_rows']],
             'planning_windows' => [
                 'slow_moving_days' => (int) $settings->get('slow_moving_days', 90, $companyId),
@@ -121,7 +131,11 @@ class DashboardMetricsService
                 'open_service_requests' => $openServiceRequests,
                 'breached_service_requests' => $breachedServiceRequests,
                 'active_maintenance_orders' => $activeMaintenanceOrders,
+                'aging_stock_value' => $agingStockValue,
+                'aged_stock_value' => $agedStockValue,
                 'sales_trend' => $this->salesTrend($months),
+                'purchase_trend' => $this->purchaseTrend($months),
+                'warehouse_utilization' => $warehouseUtilization,
                 'exception_drilldowns' => ['low_stock' => $planning['low_rows'], 'excess_stock' => $planning['excess_rows']],
             ])->only($enabledWidgets)->all(),
         ];
@@ -131,7 +145,7 @@ class DashboardMetricsService
     {
         $configured = app(ErpSettingService::class)->get('dashboard_widgets', self::WIDGETS, $companyId);
         if (!is_array($configured)) return self::WIDGETS;
-        $widgets = array_values(array_intersect(self::WIDGETS, array_map('strval', $configured)));
+        $widgets = array_values(array_unique(array_filter(array_map('strval', $configured), fn (string $widget): bool => in_array($widget, self::WIDGETS, true))));
         return $widgets ?: self::WIDGETS;
     }
 
@@ -142,6 +156,26 @@ class DashboardMetricsService
             $month = $start->copy()->addMonths($offset);
             return ['month' => $month->format('Y-m'), 'sales' => (float) Invoice::whereIn('status', [1, 'approved'])->whereBetween('date', [$month->toDateString(), $month->copy()->endOfMonth()->toDateString()])->sum('total_amount')];
         })->values()->all();
+    }
+
+    private function purchaseTrend(int $months): array
+    {
+        $start = Carbon::now()->startOfMonth()->subMonths($months - 1);
+        return collect(range(0, $months - 1))->map(function (int $offset) use ($start): array {
+            $month = $start->copy()->addMonths($offset);
+            return ['month' => $month->format('Y-m'), 'purchases' => (float) Purchase::where('status', 1)->whereBetween('date', [$month->toDateString(), $month->copy()->endOfMonth()->toDateString()])->sum('buying_price')];
+        })->values()->all();
+    }
+
+    private function warehouseUtilization(int $companyId): ?float
+    {
+        $locations = InventoryLocation::with(['movements.product:id,weight_kg,length_m,width_m,height_m'])
+            ->whereHas('warehouse.branch', fn ($query) => $query->where('company_id', $companyId))
+            ->whereNotNull('capacity')->get();
+        $capacity = (float) $locations->sum(fn (InventoryLocation $location): float => (float) $location->capacity);
+        if ($capacity <= 0) return null;
+        $occupied = (float) $locations->sum(fn (InventoryLocation $location): float => app(InventoryLocationCapacityService::class)->occupied($location)['quantity']);
+        return round(min(100, max(0, ($occupied / $capacity) * 100)), 2);
     }
 
     private function planningMetrics($products, int $companyId, array $globalAvailability): array
