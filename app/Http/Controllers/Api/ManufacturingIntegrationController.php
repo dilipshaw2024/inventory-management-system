@@ -445,7 +445,8 @@ class ManufacturingIntegrationController extends Controller
     public function wip(Request $request): JsonResponse
     {
         $data = $request->validate(['planned_from' => ['nullable', 'date'], 'planned_to' => ['nullable', 'date', 'after_or_equal:planned_from']]);
-        $orders = $this->companyScope(ProductionOrder::with(['product:id,name,sku', 'bom:id,code,version', 'location:id,code,name', 'operations.workCenter', 'operations.routingOperation']), $request->user()?->company_id)
+        $companyId = (int) ($request->user()?->company_id ?? 0);
+        $orders = $this->companyScope(ProductionOrder::with(['product:id,name,sku', 'bom:id,code,version,output_quantity', 'bom.lines.component:id,name,sku,purchase_price,company_id', 'location:id,code,name', 'operations.workCenter', 'operations.routingOperation']), $companyId)
             ->whereIn('status', ['released', 'in_progress'])
             ->when($data['planned_from'] ?? null, fn ($query, $date) => $query->whereDate('planned_date', '>=', $date))
             ->when($data['planned_to'] ?? null, fn ($query, $date) => $query->whereDate('planned_date', '<=', $date))
@@ -455,7 +456,7 @@ class ManufacturingIntegrationController extends Controller
             ->where('reference_type', (new ProductionOrder())->getMorphClass())->whereIn('reference_id', $orderIds)->where('movement_type', 'issue')->get();
         $consumption = InventoryCostConsumption::whereIn('movement_id', $movements->pluck('id'))->selectRaw('movement_id, SUM(total_cost) AS total_cost')->groupBy('movement_id')->pluck('total_cost', 'movement_id');
         $materialCosts = $movements->groupBy('reference_id')->map(fn ($rows): float => (float) $rows->sum(fn (InventoryMovement $movement): float => $consumption->has($movement->id) ? (float) $consumption->get($movement->id) : (float) $movement->quantity * (float) ($movement->unit_cost ?? 0)));
-        $orders = $orders->map(function (ProductionOrder $order) use ($materialCosts): array {
+        $orders = $orders->map(function (ProductionOrder $order) use ($materialCosts, $companyId): array {
                 $planned = (float) $order->planned_quantity;
                 $completed = (float) $order->completed_quantity;
                 $operations = $order->operations->map(function (ProductionOperation $operation): array {
@@ -470,10 +471,25 @@ class ManufacturingIntegrationController extends Controller
                 })->values();
                 $materialCost = $materialCosts->has($order->id) ? (float) $materialCosts->get($order->id) : (float) $order->material_cost;
                 $materialCostSource = $materialCosts->has($order->id) ? 'cost_layers' : 'production_order';
+                $remainingProductionQuantity = max(0, $planned - $completed);
+                $bomOutput = max(0.000001, (float) ($order->bom?->output_quantity ?? 1));
+                $remainingMaterialRequirements = $order->bom?->lines->map(function ($line) use ($remainingProductionQuantity, $bomOutput): array {
+                    $quantity = ($remainingProductionQuantity / $bomOutput) * (float) $line->quantity * (1 + ((float) $line->scrap_percent / 100));
+                    return ['product_id' => (int) $line->component_product_id, 'product' => $line->component, 'quantity' => round($quantity, 6), 'unit_cost' => (float) ($line->component?->purchase_price ?? 0), 'estimated_cost' => round($quantity * (float) ($line->component?->purchase_price ?? 0), 6)];
+                })->values() ?? collect();
+                $componentProducts = $remainingMaterialRequirements->pluck('product')->filter()->unique('id')->values();
+                $componentAvailability = $componentProducts->isEmpty() ? collect() : app(\App\Services\InventoryAvailabilityService::class)->availableMany($componentProducts, true, $order->location_id, $companyId);
+                $remainingMaterialRequirements = $remainingMaterialRequirements->map(function (array $requirement) use ($componentAvailability): array {
+                    $available = (float) ($componentAvailability[$requirement['product_id']] ?? 0);
+                    $requirement['available_quantity'] = $available;
+                    $requirement['shortage_quantity'] = max(0, round($requirement['quantity'] - $available, 6));
+                    return $requirement;
+                })->values();
                 $actualOperationCost = (float) $operations->sum('actual_cost');
-                return ['id' => $order->id, 'order_no' => $order->order_no, 'status' => $order->status, 'planned_date' => optional($order->planned_date)->toDateString(), 'product' => $order->product, 'bom' => $order->bom, 'location' => $order->location, 'planned_quantity' => $planned, 'completed_quantity' => $completed, 'remaining_quantity' => max(0, $planned - $completed), 'completion_percent' => $planned > 0 ? min(100, ($completed / $planned) * 100) : 0, 'material_cost' => $materialCost, 'material_cost_source' => $materialCostSource, 'material_cost_to_date' => $materialCost, 'operation_cost' => $actualOperationCost, 'planned_operation_cost' => (float) $order->operation_cost, 'byproduct_cost' => (float) $order->byproduct_cost, 'production_cost' => $materialCost + $actualOperationCost - (float) $order->byproduct_cost, 'wip_value' => $materialCost + $actualOperationCost - (float) $order->byproduct_cost, 'estimated_remaining_operation_cost' => (float) $operations->sum('estimated_remaining_cost'), 'operations' => $operations];
+                $remainingMaterialCost = (float) $remainingMaterialRequirements->sum('estimated_cost');
+                return ['id' => $order->id, 'order_no' => $order->order_no, 'status' => $order->status, 'planned_date' => optional($order->planned_date)->toDateString(), 'product' => $order->product, 'bom' => $order->bom, 'location' => $order->location, 'planned_quantity' => $planned, 'completed_quantity' => $completed, 'remaining_quantity' => $remainingProductionQuantity, 'completion_percent' => $planned > 0 ? min(100, ($completed / $planned) * 100) : 0, 'material_cost' => $materialCost, 'material_cost_source' => $materialCostSource, 'material_cost_to_date' => $materialCost, 'remaining_material_requirements' => $remainingMaterialRequirements, 'remaining_material_cost' => $remainingMaterialCost, 'operation_cost' => $actualOperationCost, 'planned_operation_cost' => (float) $order->operation_cost, 'byproduct_cost' => (float) $order->byproduct_cost, 'production_cost' => $materialCost + $actualOperationCost - (float) $order->byproduct_cost, 'wip_value' => $materialCost + $actualOperationCost - (float) $order->byproduct_cost, 'estimated_remaining_operation_cost' => (float) $operations->sum('estimated_remaining_cost'), 'operations' => $operations];
             })->values();
-        return response()->json(['data' => $orders, 'totals' => ['order_count' => $orders->count(), 'planned_quantity' => (float) $orders->sum('planned_quantity'), 'completed_quantity' => (float) $orders->sum('completed_quantity'), 'remaining_quantity' => (float) $orders->sum('remaining_quantity'), 'production_cost' => (float) $orders->sum('production_cost'), 'estimated_remaining_operation_cost' => (float) $orders->sum('estimated_remaining_operation_cost')]]);
+        return response()->json(['data' => $orders, 'totals' => ['order_count' => $orders->count(), 'planned_quantity' => (float) $orders->sum('planned_quantity'), 'completed_quantity' => (float) $orders->sum('completed_quantity'), 'remaining_quantity' => (float) $orders->sum('remaining_quantity'), 'production_cost' => (float) $orders->sum('production_cost'), 'remaining_material_cost' => (float) $orders->sum('remaining_material_cost'), 'estimated_remaining_operation_cost' => (float) $orders->sum('estimated_remaining_operation_cost')]]);
     }
 
     public function boms(Request $request): JsonResponse

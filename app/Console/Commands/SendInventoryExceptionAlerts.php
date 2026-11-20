@@ -47,14 +47,10 @@ class SendInventoryExceptionAlerts extends Command
                 $productCompanyId
             ))));
             $cutoff = Carbon::now()->subDays($days);
-            $recentIssueIds = in_array($type, ['slow', 'dead'], true)
-                ? InventoryMovement::query()
-                    ->where('movement_type', 'issue')
-                    ->whereIn('product_id', $companyProducts->pluck('id'))
-                    ->where('posted_at', '>=', $cutoff)
-                    ->where(fn ($query) => $query->where('company_id', $productCompanyId)->orWhereNull('company_id'))
-                    ->pluck('product_id')->unique()
+            $issueQuantities = in_array($type, ['slow', 'dead'], true)
+                ? app(\App\Services\InventoryMovementMetricsService::class)->issueQuantitiesSince($companyProducts->pluck('id'), $cutoff, $productCompanyId)
                 : collect();
+            $velocityThreshold = (float) app(ErpSettingService::class)->get('slow_moving_velocity_threshold', 0, $productCompanyId);
 
             $users = User::query()
                 ->where('company_id', $productCompanyId)
@@ -66,8 +62,8 @@ class SendInventoryExceptionAlerts extends Command
                 $available = (float) ($availability[$product->id] ?? 0);
                 $matches = match ($type) {
                     'excess' => $product->max_stock !== null && $available > (float) $product->max_stock,
-                    'slow' => !$recentIssueIds->contains($product->id),
-                    'dead' => $available > 0.000001 && !$recentIssueIds->contains($product->id),
+                    'slow' => app(\App\Services\InventoryMovementMetricsService::class)->isSlowMoving((float) ($issueQuantities[$product->id] ?? 0), $days, $velocityThreshold),
+                    'dead' => $available > 0.000001 && (float) ($issueQuantities[$product->id] ?? 0) <= 0.000001,
                 };
                 if (!$matches) continue;
 

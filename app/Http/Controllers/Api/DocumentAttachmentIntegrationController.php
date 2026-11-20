@@ -45,6 +45,10 @@ class DocumentAttachmentIntegrationController extends Controller
             'attachable_type' => ['nullable', Rule::in(array_keys($this->types))],
             'attachable_id' => ['nullable', 'integer', 'min:1'],
             'attachment_type' => ['nullable', 'in:image,document'],
+            'sort_order' => ['nullable', 'integer', 'min:0'],
+            'is_published' => ['nullable', 'boolean'],
+            'publication_channels' => ['nullable', 'array', 'max:20'],
+            'publication_channels.*' => ['string', 'max:50', 'regex:/^[a-z0-9][a-z0-9._-]*$/i'],
             'updated_since' => ['nullable', 'date'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
@@ -59,9 +63,11 @@ class DocumentAttachmentIntegrationController extends Controller
             ->when($data['attachable_type'] ?? null, fn ($query, $type) => $query->where('attachable_type', $this->types[$type]))
             ->when($data['attachable_id'] ?? null, fn ($query, $id) => $query->where('attachable_id', $id))
             ->when($data['attachment_type'] ?? null, fn ($query, $type) => $query->where('attachment_type', $type))
+            ->when(array_key_exists('sort_order', $data), fn ($query) => $query->where('sort_order', $data['sort_order']))
+            ->when(array_key_exists('is_published', $data), fn ($query) => $query->where('is_published', (bool) $data['is_published']))
             ->when($data['updated_since'] ?? null, fn ($query, $date) => $query->where('updated_at', '>=', $date))
             ->orderBy('updated_at')->orderBy('id');
-        $query->select(['id', 'company_id', 'attachable_type', 'attachable_id', 'original_name', 'mime_type', 'size_bytes', 'attachment_type', 'title', 'version', 'is_primary', 'uploaded_by', 'created_at', 'updated_at']);
+        $query->select(['id', 'company_id', 'attachable_type', 'attachable_id', 'original_name', 'mime_type', 'size_bytes', 'attachment_type', 'title', 'alt_text', 'version', 'is_primary', 'sort_order', 'is_published', 'publication_channels', 'uploaded_by', 'created_at', 'updated_at']);
         return app(IntegrationCursorService::class)->paginate($query, $request, 'inventory.attachments', (int) ($data['per_page'] ?? 50));
     }
 
@@ -73,6 +79,11 @@ class DocumentAttachmentIntegrationController extends Controller
             'external_reference' => ['nullable', 'string', 'max:150'],
             'attachment_type' => ['required', 'in:image,document'],
             'title' => ['nullable', 'string', 'max:255'],
+            'alt_text' => ['nullable', 'string', 'max:255'],
+            'sort_order' => ['nullable', 'integer', 'min:0', 'max:2147483647'],
+            'is_published' => ['nullable', 'boolean'],
+            'publication_channels' => ['nullable', 'array', 'max:20'],
+            'publication_channels.*' => ['string', 'max:50', 'regex:/^[a-z0-9][a-z0-9._-]*$/i'],
             'is_primary' => ['nullable', 'boolean'],
             'file' => ['required', 'file', 'max:10240', 'mimes:pdf,jpg,jpeg,png,webp,csv,xls,xlsx,doc,docx'],
         ]);
@@ -92,12 +103,13 @@ class DocumentAttachmentIntegrationController extends Controller
         $version = ((int) DocumentAttachment::where('attachable_type', $morphType)->where('attachable_id', $record->getKey())->where('attachment_type', $data['attachment_type'])->max('version')) + 1;
         $path = $file->store('erp-attachments', 'local');
         if (!empty($data['is_primary'])) DocumentAttachment::where('attachable_type', $morphType)->where('attachable_id', $record->getKey())->where('attachment_type', $data['attachment_type'])->update(['is_primary' => false]);
+        $channels = isset($data['publication_channels']) ? array_values(array_unique(array_map('strtolower', $data['publication_channels']))) : null;
         $attachment = DocumentAttachment::create([
             'company_id' => $companyId, 'external_reference' => $data['external_reference'] ?? null,
             'attachable_type' => $morphType, 'attachable_id' => $record->getKey(), 'original_name' => $file->getClientOriginalName(),
             'stored_path' => $path, 'mime_type' => $file->getMimeType() ?: 'application/octet-stream', 'size_bytes' => $file->getSize(),
             'attachment_type' => $data['attachment_type'], 'title' => $data['title'] ?? null, 'version' => $version,
-            'is_primary' => (bool) ($data['is_primary'] ?? false), 'uploaded_by' => $request->user()?->id,
+            'is_primary' => (bool) ($data['is_primary'] ?? false), 'sort_order' => $data['sort_order'] ?? 0, 'alt_text' => $data['alt_text'] ?? null, 'is_published' => (bool) ($data['is_published'] ?? true), 'publication_channels' => $channels, 'uploaded_by' => $request->user()?->id,
         ]);
         app(AuditService::class)->record('document_attachment.created', $attachment, null, $attachment->toArray() + ['source' => 'integration']);
         return response()->json(['data' => $attachment, 'status' => 'created'], 201);

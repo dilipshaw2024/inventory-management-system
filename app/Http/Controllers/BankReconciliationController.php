@@ -3,12 +3,14 @@
 namespace App\Http\Controllers;
 
 use App\Models\BankAccount;
+use App\Models\BankReconciliation;
 use App\Models\BankStatementLine;
 use App\Models\ChartOfAccount;
 use App\Models\Payment;
 use App\Models\SupplierPayment;
 use App\Services\AuditService;
 use App\Services\BankReconciliationService;
+use App\Services\BankStatementReconciliationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
@@ -20,10 +22,11 @@ class BankReconciliationController extends Controller
     {
         $accounts = BankAccount::with('glAccount')->where('is_active', true)->orderBy('name')->get();
         $lines = BankStatementLine::with('bankAccount')->latest('transaction_date')->latest('id')->paginate(50);
+        $reconciliations = BankReconciliation::with('bankAccount')->latest('statement_date')->latest('id')->limit(50)->get();
         $payments = Payment::where('approval_status', 'approved')->where('is_reversed', false)->where('paid_amount', '>', 0)->latest()->limit(100)->get();
         $supplierPayments = SupplierPayment::where('status', 'approved')->where('is_reversed', false)->latest()->limit(100)->get();
         $glAccounts = ChartOfAccount::where('is_active', true)->orderBy('code')->get();
-        return view('backend.accounting.bank_reconciliation', compact('accounts', 'lines', 'payments', 'supplierPayments', 'glAccounts'));
+        return view('backend.accounting.bank_reconciliation', compact('accounts', 'lines', 'reconciliations', 'payments', 'supplierPayments', 'glAccounts'));
     }
 
     public function storeAccount(Request $request)
@@ -67,6 +70,52 @@ class BankReconciliationController extends Controller
         return back()->with(['message' => "Imported {$created} bank lines; skipped {$skipped} duplicates.".($errors ? ' Errors: '.implode(' | ', array_slice($errors, 0, 3)) : ''), 'alert-type' => $errors ? 'warning' : 'success']);
     }
 
+    public function storeReconciliation(Request $request, BankStatementReconciliationService $service)
+    {
+        $companyId = auth()->user()?->company_id;
+        $data = $request->validate([
+            'bank_account_id' => ['required', 'integer', Rule::exists('bank_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))],
+            'statement_date' => ['required', 'date'],
+            'opening_balance' => ['required', 'numeric'],
+            'closing_balance' => ['required', 'numeric'],
+            'notes' => ['nullable', 'string', 'max:4000'],
+        ]);
+        $account = BankAccount::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($data['bank_account_id']);
+        try {
+            [$reconciliation, $created] = $service->createOrRefresh($account, $data['statement_date'], (float) $data['opening_balance'], (float) $data['closing_balance'], $data['notes'] ?? null);
+        } catch (\RuntimeException $exception) {
+            return back()->withErrors(['statement' => $exception->getMessage()]);
+        }
+        app(AuditService::class)->record('bank_reconciliation.saved_from_browser', $reconciliation, null, $reconciliation->toArray() + ['idempotent' => !$created]);
+        return back()->with(['message' => $created ? 'Bank reconciliation statement created.' : 'Bank reconciliation statement refreshed.', 'alert-type' => 'success']);
+    }
+
+    public function closeReconciliation(Request $request, int $id, BankStatementReconciliationService $service)
+    {
+        $data = $request->validate(['tolerance' => ['nullable', 'numeric', 'min:0', 'max:1000000000']]);
+        $reconciliation = BankReconciliation::where('company_id', auth()->user()?->company_id)->findOrFail($id);
+        try {
+            $closed = $service->close($reconciliation, (float) ($data['tolerance'] ?? 0.01));
+        } catch (\RuntimeException $exception) {
+            return back()->withErrors(['statement' => $exception->getMessage()]);
+        }
+        app(AuditService::class)->record('bank_reconciliation.closed_from_browser', $closed, ['status' => 'draft'], $closed->toArray());
+        return back()->with(['message' => 'Bank reconciliation statement closed.', 'alert-type' => 'success']);
+    }
+
+    public function reopenReconciliation(Request $request, int $id, BankStatementReconciliationService $service)
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        $reconciliation = BankReconciliation::where('company_id', auth()->user()?->company_id)->findOrFail($id);
+        try {
+            $reopened = $service->reopen($reconciliation, $data['reason']);
+        } catch (\InvalidArgumentException $exception) {
+            return back()->withErrors(['statement' => $exception->getMessage()]);
+        }
+        app(AuditService::class)->record('bank_reconciliation.reopened_from_browser', $reopened, ['status' => 'closed'], $reopened->toArray() + ['reason' => $data['reason']]);
+        return back()->with(['message' => 'Bank reconciliation statement reopened.', 'alert-type' => 'success']);
+    }
+
     public function match(Request $request, int $id)
     {
         $data = $request->validate(['target_type' => ['required', 'in:customer_payment,supplier_payment'], 'target_id' => ['required', 'integer', 'min:1']]);
@@ -107,5 +156,31 @@ class BankReconciliationController extends Controller
         }
         app(AuditService::class)->record('bank_statement_line.match_reversed', $line, ['status' => 'matched'], ['status' => 'unmatched', 'reason' => $data['reason']]);
         return back()->with(['message' => 'Bank statement match reversed.', 'alert-type' => 'success']);
+    }
+
+    public function settle(Request $request, int $id)
+    {
+        $companyId = auth()->user()?->company_id;
+        $accountScope = Rule::exists('chart_of_accounts', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $data = $request->validate(['account_id' => ['required', 'integer', $accountScope], 'reason' => ['required', 'string', 'max:2000']]);
+        try {
+            $line = app(BankReconciliationService::class)->settle(BankStatementLine::where('company_id', $companyId)->findOrFail($id), (int) $data['account_id'], $data['reason']);
+        } catch (\InvalidArgumentException|\RuntimeException $exception) {
+            return back()->withErrors(['settlement' => $exception->getMessage()]);
+        }
+        app(AuditService::class)->record('bank_statement_line.settled_from_browser', $line, ['status' => 'unmatched'], $line->toArray());
+        return back()->with(['message' => 'Bank statement line settled to the selected GL account.', 'alert-type' => 'success']);
+    }
+
+    public function reverseSettlement(Request $request, int $id)
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'max:2000']]);
+        try {
+            $line = app(BankReconciliationService::class)->reverseSettlement(BankStatementLine::where('company_id', auth()->user()?->company_id)->findOrFail($id), $data['reason']);
+        } catch (\InvalidArgumentException|\RuntimeException $exception) {
+            return back()->withErrors(['settlement' => $exception->getMessage()]);
+        }
+        app(AuditService::class)->record('bank_statement_line.settlement_reversed_from_browser', $line, ['status' => 'matched'], $line->toArray() + ['reason' => $data['reason']]);
+        return back()->with(['message' => 'Bank settlement reversed and the line is unmatched again.', 'alert-type' => 'success']);
     }
 }

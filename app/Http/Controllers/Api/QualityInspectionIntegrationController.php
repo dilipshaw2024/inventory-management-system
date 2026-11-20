@@ -141,16 +141,108 @@ class QualityInspectionIntegrationController extends Controller
         $data = $request->validate([
             'status' => ['nullable', 'in:pending,in_progress,passed,failed,conditionally_accepted'],
             'product_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
             'inspection_type' => ['nullable', 'in:receiving,in_process,final,return'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         $query = QualityInspection::with(['plan:id,code,name,inspection_type', 'product:id,name,sku', 'batch:id,batch_no', 'serial:id,serial_no', 'results'])
-            ->where('company_id', $companyId)
+            ->where('company_id', $companyId);
+        $this->applyInspectionReadScope($query, $request);
+        $query
             ->when($data['status'] ?? null, fn ($q, $status) => $q->where('status', $status))
             ->when($data['product_id'] ?? null, fn ($q, $id) => $q->where('product_id', $id))
+            ->when($data['location_id'] ?? null, fn ($q, $id) => $q->where('location_id', $id))
             ->when($data['inspection_type'] ?? null, fn ($q, $type) => $q->whereHas('plan', fn ($plan) => $plan->where('inspection_type', $type)))
             ->latest('id');
         return response()->json($query->paginate((int) ($data['per_page'] ?? 50)));
+    }
+
+    public function summary(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        abort_unless($companyId, 403, 'A company is required for quality summaries.');
+        $data = $request->validate([
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'product_id' => ['nullable', 'integer'],
+            'location_id' => ['nullable', 'integer'],
+            'status' => ['nullable', 'in:pending,in_progress,passed,failed,conditionally_accepted'],
+            'inspection_type' => ['nullable', 'in:receiving,in_process,final,return'],
+        ]);
+        $from = $data['from'] ?? now()->subYear()->toDateString();
+        $to = $data['to'] ?? now()->toDateString();
+        $inspectionsQuery = QualityInspection::with(['plan:id,inspection_type', 'product:id,name,sku', 'location:id,code,warehouse_id', 'location.warehouse:id,name,code'])
+            ->where('company_id', $companyId);
+        $this->applyInspectionReadScope($inspectionsQuery, $request);
+        $inspections = $inspectionsQuery
+            ->whereDate('created_at', '>=', $from)
+            ->whereDate('created_at', '<=', $to)
+            ->when($data['product_id'] ?? null, fn ($query, $productId) => $query->where('product_id', $productId))
+            ->when($data['location_id'] ?? null, fn ($query, $locationId) => $query->where('location_id', $locationId))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->when($data['inspection_type'] ?? null, fn ($query, $type) => $query->whereHas('plan', fn ($plan) => $plan->where('inspection_type', $type)))
+            ->orderBy('id')
+            ->get();
+        $completed = $inspections->whereIn('status', ['passed', 'failed', 'conditionally_accepted']);
+        $byType = $inspections->groupBy(fn ($inspection): string => (string) ($inspection->plan?->inspection_type ?: 'unspecified'))
+            ->map(fn ($rows, $type): array => [
+                'inspection_type' => $type,
+                'inspection_count' => $rows->count(),
+                'completed_count' => $rows->whereIn('status', ['passed', 'failed', 'conditionally_accepted'])->count(),
+                'passed_count' => $rows->where('status', 'passed')->count(),
+                'failed_count' => $rows->where('status', 'failed')->count(),
+                'sample_quantity' => (float) $rows->sum('sample_quantity'),
+                'inspected_quantity' => (float) $rows->sum('quantity'),
+            ])->values();
+        $byProduct = $inspections->groupBy('product_id')->map(function ($rows, $productId): array {
+            $product = $rows->first()->product;
+            return [
+                'product_id' => (int) $productId,
+                'product_name' => $product?->name,
+                'sku' => $product?->sku,
+                'inspection_count' => $rows->count(),
+                'passed_count' => $rows->where('status', 'passed')->count(),
+                'failed_count' => $rows->where('status', 'failed')->count(),
+                'sample_quantity' => (float) $rows->sum('sample_quantity'),
+                'inspected_quantity' => (float) $rows->sum('quantity'),
+            ];
+        })->values();
+        $byLocation = $inspections->groupBy(fn ($inspection): string => (string) ($inspection->location_id ?: 'unassigned'))
+            ->map(function ($rows, $locationId): array {
+                $location = $rows->first()->location;
+                $warehouse = $location?->warehouse;
+                return [
+                    'location_id' => $locationId === 'unassigned' ? null : (int) $locationId,
+                    'location_code' => $location?->code,
+                    'warehouse_id' => $warehouse?->id,
+                    'warehouse_code' => $warehouse?->code,
+                    'warehouse_name' => $warehouse?->name,
+                    'inspection_count' => $rows->count(),
+                    'completed_count' => $rows->whereIn('status', ['passed', 'failed', 'conditionally_accepted'])->count(),
+                    'passed_count' => $rows->where('status', 'passed')->count(),
+                    'failed_count' => $rows->where('status', 'failed')->count(),
+                    'sample_quantity' => (float) $rows->sum('sample_quantity'),
+                    'inspected_quantity' => (float) $rows->sum('quantity'),
+                ];
+            })->values();
+        return response()->json([
+            'summary' => [
+                'inspection_count' => $inspections->count(),
+                'pending_count' => $inspections->whereIn('status', ['pending', 'in_progress'])->count(),
+                'completed_count' => $completed->count(),
+                'passed_count' => $inspections->where('status', 'passed')->count(),
+                'failed_count' => $inspections->where('status', 'failed')->count(),
+                'conditionally_accepted_count' => $inspections->where('status', 'conditionally_accepted')->count(),
+                'pass_rate_percent' => $completed->count() > 0 ? round(($inspections->where('status', 'passed')->count() / $completed->count()) * 100, 6) : null,
+                'sample_quantity' => (float) $inspections->sum('sample_quantity'),
+                'inspected_quantity' => (float) $inspections->sum('quantity'),
+                'dispositions' => $inspections->groupBy('disposition')->map->count()->filter(fn ($count, $disposition) => $disposition !== '')->all(),
+            ],
+            'by_type' => $byType,
+            'by_product' => $byProduct,
+            'by_location' => $byLocation,
+            'meta' => ['from' => $from, 'to' => $to, 'product_id' => $data['product_id'] ?? null, 'location_id' => $data['location_id'] ?? null, 'inspection_type' => $data['inspection_type'] ?? null, 'company_id' => (int) $companyId],
+        ]);
     }
 
     public function storeInspection(Request $request): JsonResponse
@@ -331,6 +423,20 @@ class QualityInspectionIntegrationController extends Controller
 
         abort_unless($location, 404, 'The inventory location is not available to this user.');
         return $location;
+    }
+
+    private function applyInspectionReadScope($query, Request $request): void
+    {
+        $user = $request->user();
+        if (!$user?->warehouse_id && !$user?->branch_id) return;
+        $query->whereHas('location', function ($location) use ($user): void {
+            $location->withoutGlobalScopes()
+                ->when($user?->warehouse_id, fn ($q, $warehouseId) => $q->where('warehouse_id', $warehouseId))
+                ->whereHas('warehouse', function ($warehouse) use ($user): void {
+                    $warehouse->withoutGlobalScopes()
+                        ->whereHas('branch', fn ($branch) => $branch->withoutGlobalScopes()->when($user?->branch_id, fn ($q, $branchId) => $q->whereKey($branchId)));
+                });
+        });
     }
 
     private function evaluateResult(QualityInspectionPlanLine $line, array $item): array

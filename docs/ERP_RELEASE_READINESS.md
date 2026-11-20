@@ -4,6 +4,8 @@ This checklist defines the minimum evidence required before promoting the invent
 
 ## 1. Application and schema
 
+Most recent full-suite rerun: **450 tests passed with zero failures in 744.23 seconds**; the fast unit suite passes **129 tests / 356 assertions**. This includes verified browser upload/rendering, ordered gallery metadata, governed catalog-channel lifecycle, channel-scoped publication controls, channel-aware catalog product feeds for private variant-specific media, tenant-safe bundle component presentation in catalog mode, and safe public catalog projections that exclude internal stock/cost fields while retaining default sales price/tax.
+
 Run from the project root:
 
 ```bash
@@ -82,7 +84,9 @@ The repository workflow at `.github/workflows/erp-ci.yml` automates this release
 
 ## Latest repository evidence
 
-The latest authoritative clean isolated Laravel/MySQL regression passes **399 tests** with zero failures in **795.76 seconds** after migration `2026_11_11_000457`, including **96 unit tests** at that time. The current complete fast unit suite passes **99 tests / 212 assertions**, including the regional-pack and inventory-aging coverage added after that baseline. PHP syntax, Blade compilation, route registration, and `git diff --check` also pass. Earlier paragraphs in this section are historical audit entries; this is the current release baseline.
+The latest authoritative clean isolated Laravel/MySQL regression baseline passes **450 tests** with zero failures in **744.23 seconds** after migration `2026_11_19_000463`; the current fast unit suite passes **129 tests / 356 assertions**. This run includes browser bank-reconciliation statement lifecycle, GL settlement and audited settlement reversal, verified browser upload/rendering, ordered gallery metadata, governed catalog-channel lifecycle, channel-scoped publication controls, channel-aware catalog product feeds for private variant-specific media, tenant-safe bundle component presentation in catalog mode, safe public catalog projections that exclude internal stock/cost fields while retaining default sales price/tax, structured browser proof-of-delivery capture with private attachment storage, the regional compliance registry, Norway Modulus-11 organization-number validation, automatic Norway UBL 2.1/Peppol-EHF provider selection, all prior provider packs, e-invoice retry controls, quality workflows/reports, purchase-invoice variance resolution, customer credit enforcement, batch recall controls, and the complete inventory, manufacturing, service, accounting, security, reporting, and integration regression surface. PHP syntax, route/view compilation, deployment checks, and `git diff --check` also pass. Earlier paragraphs in this section are historical audit entries; this is the current release baseline.
+Latest focused health verification passes **2 tests** in **617.81 seconds**, including the strict isolated schema check and HTTP readiness endpoint.
+Focused WIP valuation verification passes **1 test** in **664.48 seconds**, including BOM-derived remaining material quantity, available quantity, shortage quantity, and cost.
 
 The HR statutory-remittance integration now exposes a configurable provider registry and submission gateway. Migration `000450` adds a tenant-scoped submission ledger with package hash, status, provider reference/response, submitter, and replay-safe uniqueness. The default HTTP adapter uses an integrity hash and idempotency headers; custom provider classes are configured with `ERP_STATUTORY_REMITTANCE_ADAPTERS`. Provider readiness is available through `GET /api/hr/statutory-remittance-providers`, submissions through `POST /api/hr/statutory-remittances/submit`, and history through `GET /api/hr/statutory-remittance-submissions`.
 
@@ -104,7 +108,7 @@ Warehouse integration now provides guarded batch pick/pack completion with idemp
 
 Sales integration now provides guarded batch delivery approval by reusing the existing stock/batch/serial/accounting transaction. Database-backed regression coverage is added but remains pending until MySQL connectivity is restored.
 
-Latest isolated verification: the canonical `bin/test-erp` suite passes **390 tests** with zero failures in **672.22 seconds** against disposable MySQL after migrations `000454–000455`. The unit suite passes **93 tests**, the tax-exemption certificate-feed test passes, Blade and route caches compile, the production frontend build succeeds, PHP lint passes for the changed files, and `git diff --check` passes. The current application migration head is `2026_11_11_000455`.
+Historical verification: the canonical `bin/test-erp` suite passed **390 tests** with zero failures in **672.22 seconds** against disposable MySQL after migrations `000454–000455`. The application has since advanced beyond migration `2026_11_11_000455`; use the latest baseline at the top of this document.
 
 Latest dispatch increment: migration `2026_11_11_000456` adds immutable structured proof-of-delivery records and audited, idempotent integration endpoints at `/api/integration/deliveries/{deliveryId}/proofs`. The complete canonical regression passes **390 tests** with zero failures in **702.30 seconds** after this migration. The unit suite, Blade/route cache, PHP lint, frontend build, and `git diff --check` also pass. The root route now uses a cache-safe `Route::view` declaration, so the compiled production route cache is compatible with the test workflow.
 
@@ -196,3 +200,21 @@ Planning exception defaults are now passed explicitly with the authenticated com
 Latest authoritative planning regression passes **9 tests** with zero failures in **757.93 seconds**.
 
 Retention archives now support an optional configured external disk through `ERP_RETENTION_ARCHIVE_DISK`; archive objects are content-addressed and hash-validated before reuse, while the default remains backward-compatible database-only storage. Infrastructure should use an immutable/WORM-capable backend for production retention guarantees.
+
+Focused retention regression passes **3 tests** with zero failures in **665.25 seconds** after the external archive metadata migration.
+
+Retention archive CSV/XLSX exports now include the external storage metadata and content hash for operational auditability.
+
+The retention administration screen now displays external archive status and path alongside each snapshot.
+
+The scheduled `erp:retention:verify-archives` command checks external-object availability and SHA-256 integrity without mutating archives; focused retention verification passes **4 tests** with zero failures in **653.05 seconds**.
+
+Latest complete isolated Laravel/MySQL regression passes **424 tests** with zero failures in **672.00 seconds**, including migration `000459`, the retention migration and verifier, expanded regional compliance, batch recall controls, and the cumulative ERP workflows.
+
+The strict ERP health gate now validates that a configured external retention disk resolves through Laravel’s filesystem configuration; unset configuration is reported as explicit database-only mode. Focused health verification passes **2 tests** with zero failures in **659.03 seconds**.
+
+The guarded deployment script now verifies configured external retention objects before the strict health gate, with an explicit `ERP_DEPLOY_VERIFY_RETENTION=0` exception only for an initial empty archive target.
+Latest batch reporting verification: batch stock and expiry APIs plus the browser expiry report support tenant-safe manufacturing-date range filtering, and `GET /api/inventory/batches/warranty` reports positive-stock warranty status. `SerialStockIntegrationTest` passes **6 tests** in **683.79 seconds**, including stock, expiry, manufacturing-date, and warranty coverage.
+
+Best-before alerting now has a tenant-scoped `best_before_alert_days` setting, separate from the expiry horizon, with the CLI `--days` option retained as an explicit override for scheduled or operational runs.
+Focused `ExpiryAlertTest` verification passes **3 tests** in **672.96 seconds**, including company-specific best-before horizon behavior.

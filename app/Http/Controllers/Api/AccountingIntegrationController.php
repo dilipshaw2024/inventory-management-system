@@ -102,7 +102,7 @@ class AccountingIntegrationController extends Controller
         abort_unless($companyId, 403, 'A company is required for e-invoice submissions.');
         $invoice = Invoice::with(['customer', 'invoice_details.product'])->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($id);
         try {
-            $submission = $service->prepare($invoice, $data['provider'] ?? 'generic', $request->user()?->id);
+            $submission = $service->prepare($invoice, $data['provider'] ?? null, $request->user()?->id);
         } catch (\RuntimeException | \InvalidArgumentException $exception) {
             return response()->json(['message' => $exception->getMessage()], 422);
         }
@@ -453,7 +453,7 @@ class AccountingIntegrationController extends Controller
         $reason = null;
         if ($customer->credit_hold) $reason = 'Customer is on credit hold.';
         elseif ((int) ($customer->credit_hold_after_days ?? 0) > 0 && $assessment['overdue_amount'] > 0.000001 && $assessment['oldest_overdue_days'] >= (int) $customer->credit_hold_after_days) $reason = 'Customer has overdue credit beyond the configured limit.';
-        elseif ((float) $customer->credit_limit > 0 && $assessment['outstanding'] + $orderValue > (float) $customer->credit_limit + 0.000001) $reason = 'Customer credit limit would be exceeded.';
+        elseif ((float) $customer->credit_limit > 0 && $assessment['outstanding'] + $assessment['open_order_exposure'] + $orderValue > (float) $customer->credit_limit + 0.000001) $reason = 'Customer credit limit would be exceeded.';
         return response()->json(['data' => ['customer' => $customer, 'assessment' => $assessment, 'order_value' => $orderValue, 'approval_eligible' => $reason === null, 'approval_block_reason' => $reason], 'meta' => ['as_of' => $data['as_of'] ?? now()->toDateString()]]);
     }
 

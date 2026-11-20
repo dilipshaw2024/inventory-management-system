@@ -12,10 +12,12 @@ class EInvoiceService
 {
     public function __construct(private EInvoiceProviderRegistry $providers) {}
 
-    public function prepare(Invoice $invoice, string $provider, ?int $userId = null): EInvoiceSubmission
+    public function prepare(Invoice $invoice, ?string $provider = null, ?int $userId = null): EInvoiceSubmission
     {
         if ((int) $invoice->status !== 1) throw new \RuntimeException('Only approved sales invoices can be prepared for e-invoicing.');
-        $providerAdapter = $this->providers->resolve($provider);
+        $invoice->loadMissing('company');
+        $providerAdapter = $this->providers->forCompany($invoice->company, $provider);
+        $provider = $providerAdapter->key();
         $companyId = $invoice->company_id;
         return DB::transaction(function () use ($invoice, $provider, $providerAdapter, $userId, $companyId): EInvoiceSubmission {
             $existing = EInvoiceSubmission::where('company_id', $companyId)->where('invoice_id', $invoice->id)->where('provider', $provider)->first();

@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\BillOfMaterial;
+use App\Models\BomLine;
 use App\Models\Category;
 use App\Models\Company;
 use App\Models\ProductionOperation;
@@ -33,7 +34,9 @@ class WipValuationTest extends TestCase
         $unit = Unit::create(['name' => 'WIP Each', 'status' => 1]);
         $category = Category::create(['name' => 'WIP Category', 'status' => 1]);
         $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'WIP Finished', 'status' => 1]);
+        $component = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'WIP Component', 'purchase_price' => 3.25, 'status' => 1]);
         $bom = BillOfMaterial::create(['company_id' => $company->id, 'product_id' => $product->id, 'code' => 'BOM-WIP', 'name' => 'WIP BOM', 'output_quantity' => 1, 'is_active' => true]);
+        BomLine::create(['bom_id' => $bom->id, 'component_product_id' => $component->id, 'quantity' => 4, 'scrap_percent' => 10]);
         $center = WorkCenter::create(['company_id' => $company->id, 'code' => 'WC-WIP', 'name' => 'WIP Center', 'capacity_hours_per_day' => 8, 'labor_rate' => 10, 'machine_rate' => 5, 'is_active' => true]);
         $routing = Routing::create(['company_id' => $company->id, 'bom_id' => $bom->id, 'code' => 'RT-WIP', 'name' => 'WIP Routing', 'is_active' => true]);
         $routingOperation = RoutingOperation::create(['company_id' => $company->id, 'routing_id' => $routing->id, 'work_center_id' => $center->id, 'sequence' => 1, 'operation' => 'Assembly', 'setup_minutes' => 30, 'run_minutes' => 60]);
@@ -51,6 +54,11 @@ class WipValuationTest extends TestCase
             ->assertJsonPath('data.0.estimated_remaining_operation_cost', 22.5)
             ->assertJsonPath('data.0.material_cost_source', 'cost_layers')
             ->assertJsonPath('data.0.material_cost_to_date', 40)
+            ->assertJsonPath('data.0.remaining_material_requirements.0.product_id', $component->id)
+            ->assertJsonPath('data.0.remaining_material_requirements.0.quantity', 8.8)
+            ->assertJsonPath('data.0.remaining_material_requirements.0.available_quantity', 0)
+            ->assertJsonPath('data.0.remaining_material_requirements.0.shortage_quantity', 8.8)
+            ->assertJsonPath('data.0.remaining_material_cost', 28.6)
             ->assertJsonPath('data.0.wip_value', 62.5)
             ->assertJsonPath('totals.estimated_remaining_operation_cost', 22.5);
     }

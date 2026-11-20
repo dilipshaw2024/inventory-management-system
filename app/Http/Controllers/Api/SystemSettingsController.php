@@ -16,7 +16,7 @@ class SystemSettingsController extends Controller
         'stock_count_recount_variance_percent',
         'abc_a_threshold_percent', 'abc_b_threshold_percent', 'allow_expired_batch_issue',
         'allow_past_best_before_issue', 'warehouse_capacity_alert_percent', 'slow_moving_days',
-        'dead_stock_days', 'expiry_alert_days',
+        'dead_stock_days', 'slow_moving_velocity_threshold', 'expiry_alert_days', 'best_before_alert_days',
         'reservation_expiry_days',
         'purchase_over_receipt_tolerance_percent',
         'auto_release_production_orders',
@@ -51,7 +51,9 @@ class SystemSettingsController extends Controller
             'warehouse_capacity_alert_percent' => ['sometimes', 'numeric', 'gt:0', 'lte:100'],
             'slow_moving_days' => ['sometimes', 'integer', 'min:1', 'max:3650'],
             'dead_stock_days' => ['sometimes', 'integer', 'min:1', 'max:3650'],
+            'slow_moving_velocity_threshold' => ['sometimes', 'numeric', 'min:0', 'max:1000000000'],
             'expiry_alert_days' => ['sometimes', 'integer', 'min:1', 'max:3650'],
+            'best_before_alert_days' => ['sometimes', 'integer', 'min:1', 'max:3650'],
             'reservation_expiry_days' => ['sometimes', 'integer', 'min:0', 'max:3650'],
             'purchase_over_receipt_tolerance_percent' => ['sometimes', 'numeric', 'min:0', 'max:100'],
             'allow_expired_batch_issue' => ['sometimes', 'boolean'],
@@ -89,7 +91,7 @@ class SystemSettingsController extends Controller
         $service = app(ErpSettingService::class);
         $before = $this->values((int) $companyId);
         foreach ($data as $key => $value) {
-            $type = in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars', 'dashboard_widgets'], true) ? 'json' : (($key === 'decimal_precision' || $key === 'tax_rounding_precision') || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost'], true) ? 'float' : 'string')));
+            $type = in_array($key, ['allow_expired_batch_issue', 'allow_past_best_before_issue', 'auto_release_production_orders'], true) ? 'bool' : (in_array($key, ['carrier_sla_hours', 'branch_carrier_sla_hours', 'sla_calendar', 'branch_sla_calendars', 'dashboard_widgets'], true) ? 'json' : (($key === 'decimal_precision' || $key === 'tax_rounding_precision') || in_array($key, ['slow_moving_days', 'dead_stock_days', 'expiry_alert_days', 'best_before_alert_days', 'reservation_expiry_days', 'password_expiry_days'], true) ? 'int' : (in_array($key, ['purchase_price_variance_percent', 'purchase_over_receipt_tolerance_percent', 'stock_count_recount_variance_percent', 'max_discount_percent', 'abc_a_threshold_percent', 'abc_b_threshold_percent', 'warehouse_capacity_alert_percent', 'default_standard_cost', 'slow_moving_velocity_threshold'], true) ? 'float' : 'string')));
             $service->put($key, $value, $type, (int) $companyId);
         }
         $after = $this->values((int) $companyId);
@@ -115,7 +117,9 @@ class SystemSettingsController extends Controller
             'warehouse_capacity_alert_percent' => $service->get('warehouse_capacity_alert_percent', 80, $companyId),
             'slow_moving_days' => $service->get('slow_moving_days', 90, $companyId),
             'dead_stock_days' => $service->get('dead_stock_days', 180, $companyId),
+            'slow_moving_velocity_threshold' => $service->get('slow_moving_velocity_threshold', 0, $companyId),
             'expiry_alert_days' => $service->get('expiry_alert_days', 90, $companyId),
+            'best_before_alert_days' => $service->get('best_before_alert_days', 90, $companyId),
             'reservation_expiry_days' => $service->get('reservation_expiry_days', 0, $companyId),
             'purchase_over_receipt_tolerance_percent' => $service->get('purchase_over_receipt_tolerance_percent', 0, $companyId),
             'allow_expired_batch_issue' => $service->get('allow_expired_batch_issue', false, $companyId),

@@ -37,11 +37,12 @@ class PlanningController extends Controller
         $allProducts = Product::with(['supplier', 'unit', 'category'])->get();
         $availability = app(\App\Services\InventoryAvailabilityService::class)->availableMany($allProducts, true, $locationId, $companyId);
         $policies = $locationId === null ? collect() : InventoryReplenishmentPolicy::where('location_id', $locationId)->where('is_active', true)->whereIn('product_id', $allProducts->pluck('id'))->get()->keyBy('product_id');
-        $recentIssueProductIds = in_array($type, ['slow', 'dead'], true)
-            ? InventoryMovement::whereIn('product_id', $allProducts->pluck('id'))->where('movement_type', 'issue')->where('posted_at', '>=', $cutoff)->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->pluck('product_id')->unique()
+        $issueQuantities = in_array($type, ['slow', 'dead'], true)
+            ? app(\App\Services\InventoryMovementMetricsService::class)->issueQuantitiesSince($allProducts->pluck('id'), $cutoff, $companyId, $locationId)
             : collect();
+        $velocityThreshold = (float) app(\App\Services\ErpSettingService::class)->get('slow_moving_velocity_threshold', 0, $companyId);
         $planning = app(ReplenishmentPlanningService::class);
-        $matching = $allProducts->filter(function (Product $product) use ($type, $availability, $recentIssueProductIds, $policies, $planning, $companyId): bool {
+        $matching = $allProducts->filter(function (Product $product) use ($type, $availability, $issueQuantities, $velocityThreshold, $days, $policies, $planning, $companyId): bool {
             $current = (float) ($availability[$product->id] ?? 0);
             $policy = $policies->get($product->id);
             $reorder = $policy ? $planning->effectiveReorderPoint($product, $policy, $companyId) : (float) $product->reorder_level;
@@ -49,8 +50,8 @@ class PlanningController extends Controller
             return match ($type) {
                 'low' => $current <= $reorder,
                 'excess' => $maximum !== null && $current > $maximum,
-                'slow' => !$recentIssueProductIds->contains($product->id),
-                'dead' => !$recentIssueProductIds->contains($product->id) && $current > 0,
+                'slow' => app(\App\Services\InventoryMovementMetricsService::class)->isSlowMoving((float) ($issueQuantities[$product->id] ?? 0), $days, $velocityThreshold),
+                'dead' => (float) ($issueQuantities[$product->id] ?? 0) <= 0.000001 && $current > 0,
             };
         })->map(function (Product $product) use ($availability, $policies, $locationId, $planning, $companyId): Product {
             $current = (float) ($availability[$product->id] ?? 0); $excess = $product->max_stock === null ? 0 : max(0, $current - (float) $product->max_stock);

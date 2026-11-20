@@ -7,6 +7,7 @@ use App\Models\CustomerPaymentAllocation;
 use App\Models\CustomerCreditNote;
 use App\Models\Invoice;
 use App\Models\Payment;
+use App\Models\SalesOrder;
 use Carbon\CarbonImmutable;
 
 class CustomerCreditService
@@ -65,8 +66,15 @@ class CustomerCreditService
             }
         }
 
+        $openOrderExposure = $this->openOrderExposure($customer);
+        $availableCredit = (float) $customer->credit_limit > 0
+            ? max(0, (float) $customer->credit_limit - $outstanding - $openOrderExposure)
+            : null;
+
         return [
             'outstanding' => round($outstanding, 6),
+            'open_order_exposure' => round($openOrderExposure, 6),
+            'available_credit' => $availableCredit === null ? null : round($availableCredit, 6),
             'overdue_amount' => round($overdueAmount, 6),
             'oldest_overdue_days' => $oldestOverdueDays,
             'collection_status' => $this->collectionStatus($customer, $overdueAmount, $oldestOverdueDays),
@@ -80,7 +88,7 @@ class CustomerCreditService
         return $oldestOverdueDays >= 90 ? 'escalated' : 'overdue';
     }
 
-    public function assertCanApprove(Customer $customer, float $orderValue): void
+    public function assertCanApprove(Customer $customer, float $orderValue, ?int $excludeOrderId = null): void
     {
         if ($customer->credit_hold) throw new \RuntimeException('Customer is on credit hold.');
         $assessment = $this->assess($customer);
@@ -88,8 +96,43 @@ class CustomerCreditService
         if ($threshold > 0 && $assessment['overdue_amount'] > 0.000001 && $assessment['oldest_overdue_days'] >= $threshold) {
             throw new \RuntimeException('Customer has overdue credit beyond the configured '.$threshold.'-day limit.');
         }
-        if ((float) $customer->credit_limit > 0 && $assessment['outstanding'] + $orderValue > (float) $customer->credit_limit + 0.000001) {
+        $openExposure = $this->openOrderExposure($customer, $excludeOrderId);
+        if ((float) $customer->credit_limit > 0 && $assessment['outstanding'] + $openExposure + $orderValue > (float) $customer->credit_limit + 0.000001) {
             throw new \RuntimeException('Customer credit limit would be exceeded.');
         }
+    }
+
+    /**
+     * Include submitted and approved sales orders so multiple open orders
+     * cannot collectively over-commit a customer's credit limit.
+     */
+    public function openOrderExposure(Customer $customer, ?int $excludeOrderId = null): float
+    {
+        $orders = SalesOrder::with('lines')
+            ->where('customer_id', $customer->id)
+            ->whereIn('status', ['submitted', 'approved', 'partially_delivered'])
+            ->when($excludeOrderId, fn ($query) => $query->where('id', '!=', $excludeOrderId))
+            ->when($customer->company_id, fn ($query, $companyId) => $query->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id')))
+            ->get();
+
+        return $this->calculateOpenOrderExposure($orders);
+    }
+
+    /** @param iterable<SalesOrder> $orders */
+    public function calculateOpenOrderExposure(iterable $orders): float
+    {
+        $total = 0.0;
+        foreach ($orders as $order) {
+            $total += (float) $order->lines->sum(function ($line): float {
+                $ordered = max(0, (float) $line->ordered_qty);
+                $remaining = max(0, $ordered - (float) $line->delivered_qty);
+                if ($remaining <= 0.000001) return 0.0;
+                $gross = $remaining * (float) $line->unit_price;
+                $discount = $ordered > 0 ? ((float) $line->discount_amount * ($remaining / $ordered)) : 0.0;
+                return max(0, $gross - $discount);
+            });
+        }
+
+        return round($total, 6);
     }
 }

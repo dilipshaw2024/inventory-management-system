@@ -726,6 +726,15 @@ class ErpFoundationTest extends TestCase
         self::assertSame('on_hold', $service->collectionStatus($customer, 10, 30));
     }
 
+    public function test_customer_credit_exposure_counts_only_undelivered_open_order_value(): void
+    {
+        $line = new \App\Models\SalesOrderLine(['ordered_qty' => 10, 'delivered_qty' => 4, 'unit_price' => 20, 'discount_amount' => 20]);
+        $order = new \App\Models\SalesOrder(['status' => 'partially_delivered']);
+        $order->setRelation('lines', collect([$line]));
+
+        self::assertSame(108.0, (new CustomerCreditService())->calculateOpenOrderExposure([$order]));
+    }
+
     public function test_supplier_score_uses_bounded_weighted_metrics(): void
     {
         $score = (new SupplierPerformanceScoringService())->score([

@@ -18,6 +18,20 @@ class RegionalCompliancePackRegistry
         $this->register(new EuropeanVatCompliancePack());
         $this->register(new UnitedKingdomVatCompliancePack());
         $this->register(new CanadianGstCompliancePack());
+        $this->register(new UnitedArabEmiratesVatCompliancePack());
+        $this->register(new AustralianGstCompliancePack());
+        $this->register(new SingaporeGstCompliancePack());
+        $this->register(new SouthAfricanVatCompliancePack());
+        $this->register(new NewZealandGstCompliancePack());
+        $this->register(new MexicoVatCompliancePack());
+        $this->register(new SouthKoreaVatCompliancePack());
+        $this->register(new JapanQualifiedInvoiceCompliancePack());
+        $this->register(new UnitedStatesSalesTaxCompliancePack());
+        $this->register(new BrazilTaxCompliancePack());
+        $this->register(new SaudiVatCompliancePack());
+        $this->register(new ChinaVatCompliancePack());
+        $this->register(new SwissVatCompliancePack());
+        $this->register(new NorwegianVatCompliancePack());
         foreach ($packs as $pack) $this->register($pack);
     }
 

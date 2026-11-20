@@ -61,6 +61,33 @@ class SerialStockIntegrationTest extends TestCase
         $this->assertSame(1, $response->json('meta.total'));
     }
 
+    public function test_batch_reports_filter_by_manufacturing_date(): void
+    {
+        $company = Company::create(['name' => 'Manufacturing Date Tenant', 'code' => 'MFG-DATE-TENANT']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Manufacturing Date Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Manufacturing Date Goods', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Dated goods', 'sku' => 'MFG-DATE-001', 'tracking_type' => 'batch', 'quantity' => 2, 'status' => 1]);
+        $older = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'MFG-OLD', 'manufacturing_date' => '2026-01-15', 'expiry_date' => '2027-01-15', 'warranty_until' => '2026-04-15']);
+        $newer = InventoryBatch::create(['product_id' => $product->id, 'batch_no' => 'MFG-NEW', 'manufacturing_date' => '2026-06-15', 'expiry_date' => '2027-06-15', 'warranty_until' => '2027-06-15']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 1, 'unit_cost' => 4, 'batch_id' => $older->id, 'reason' => 'Older dated receipt']);
+        InventoryMovement::create(['company_id' => $company->id, 'product_id' => $product->id, 'movement_type' => 'receipt', 'quantity' => 1, 'unit_cost' => 4, 'batch_id' => $newer->id, 'reason' => 'Newer dated receipt']);
+        $token = $user->createToken('manufacturing-date-test', ['inventory:read'])->plainTextToken;
+
+        $stock = $this->withToken($token)->getJson('/api/inventory/batches/stock?manufacturing_date_from=2026-06-01');
+        $stock->assertOk()->assertJsonPath('data.0.id', $newer->id)->assertJsonPath('meta.manufacturing_date_from', '2026-06-01');
+        $this->assertSame(1, $stock->json('meta.total'));
+
+        $expiry = $this->withToken($token)->getJson('/api/inventory/batches/expiry?manufacturing_date_to=2026-03-01&include_expired=1');
+        $expiry->assertOk()->assertJsonPath('data.0.id', $older->id)->assertJsonPath('meta.manufacturing_date_to', '2026-03-01');
+        $this->assertSame(1, $expiry->json('meta.total'));
+
+        $warranty = $this->withToken($token)->getJson('/api/inventory/batches/warranty?product_id='.$product->id);
+        $warranty->assertOk()->assertJsonPath('data.0.id', $newer->id)->assertJsonPath('data.0.warranty_status', 'active')->assertJsonPath('data.0.stock_quantity', 1);
+        $this->assertSame(1, $warranty->json('meta.total'));
+    }
+
     public function test_inventory_api_exposes_batch_traceability_with_direction_filter(): void
     {
         $company = Company::create(['name' => 'Trace Tenant', 'code' => 'TRACE-TENANT']);

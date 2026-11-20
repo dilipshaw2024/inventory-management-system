@@ -163,6 +163,10 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('accounting')->group
 
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(function (): void {
     Route::get('/products', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'products'])->middleware('abilities:inventory:read');
+    Route::get('/catalog-channels', [\App\Http\Controllers\Api\CatalogChannelIntegrationController::class, 'index'])->middleware('abilities:inventory:read');
+    Route::post('/catalog-channels', [\App\Http\Controllers\Api\CatalogChannelIntegrationController::class, 'store'])->middleware('ability:inventory:write,integration:write');
+    Route::patch('/catalog-channels/{id}', [\App\Http\Controllers\Api\CatalogChannelIntegrationController::class, 'update'])->middleware('ability:inventory:write,integration:write');
+    Route::post('/catalog-channels/{id}/deactivate', [\App\Http\Controllers\Api\CatalogChannelIntegrationController::class, 'deactivate'])->middleware('ability:inventory:write,integration:write');
     Route::get('/product-import-template', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'importTemplate'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/costing-policies', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'costingPolicies'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/cost-history', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'costHistory'])->middleware('abilities:inventory:read');
@@ -174,6 +178,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::get('/products/lookup', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'lookup'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/uoms', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'uoms'])->middleware('abilities:inventory:read');
     Route::get('/products/{id}/media', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'media'])->middleware('abilities:inventory:read');
+    Route::patch('/products/{id}/media/{attachmentId}', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'updateMedia'])->middleware('ability:inventory:write,integration:write');
     Route::get('/products/{id}/translations', [\App\Http\Controllers\Api\ProductIntegrationController::class, 'translations'])->middleware('abilities:inventory:read');
     Route::get('/attachments', [\App\Http\Controllers\Api\DocumentAttachmentIntegrationController::class, 'index'])->middleware('ability:inventory:read,purchasing:read,sales:read,accounting:read,manufacturing:read,service:read,integration:read');
     Route::post('/attachments', [\App\Http\Controllers\Api\DocumentAttachmentIntegrationController::class, 'store'])->middleware('ability:inventory:write,purchasing:write,sales:write,accounting:write,manufacturing:write,service:write,integration:write');
@@ -189,6 +194,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::post('/quality/plans', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'storePlan'])->middleware('ability:inventory:write,integration:write');
     Route::patch('/quality/plans/{id}', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'updatePlan'])->middleware('ability:inventory:write,integration:write');
     Route::get('/quality/inspections', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'inspections'])->middleware('abilities:inventory:read');
+    Route::get('/quality/summary', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'summary'])->middleware('abilities:inventory:read');
     Route::post('/quality/inspections', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'storeInspection'])->middleware('ability:inventory:write,integration:write');
     Route::post('/quality/inspections/{id}/results', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'recordResults'])->middleware('ability:inventory:write,integration:write');
     Route::post('/quality/inspections/{id}/complete', [\App\Http\Controllers\Api\QualityInspectionIntegrationController::class, 'complete'])->middleware('ability:inventory:write,integration:write');
@@ -258,6 +264,10 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('inventory')->group(
     Route::get('/reconciliation-snapshots/{id}', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'reconciliationSnapshot'])->middleware('abilities:inventory:read');
     Route::get('/batches/stock', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'stock'])->middleware('abilities:inventory:read');
     Route::get('/batches/expiry', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'expiry'])->middleware('abilities:inventory:read');
+    Route::get('/batches/warranty', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'warranty'])->middleware('abilities:inventory:read');
+    Route::get('/batches/recalls', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'recalls'])->middleware('abilities:inventory:read');
+    Route::post('/batches/{id}/recall', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'recall'])->middleware('abilities:inventory:write');
+    Route::post('/batches/{id}/recall/release', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'releaseRecall'])->middleware('abilities:inventory:write');
     Route::get('/batches/{id}/traceability', [\App\Http\Controllers\Api\BatchIntegrationController::class, 'traceability'])->middleware('abilities:inventory:read');
     Route::get('/serials', [\App\Http\Controllers\Api\SerialIntegrationController::class, 'stock'])->middleware('abilities:inventory:read');
     Route::get('/serials/{id}/traceability', [\App\Http\Controllers\Api\SerialIntegrationController::class, 'traceability'])->middleware('abilities:inventory:read');
@@ -335,6 +345,7 @@ Route::middleware('throttle:api')->post('/public/carrier-tracking/{companyId}/{p
 
 Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->group(function (): void {
     Route::post('/sales-orders', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'createSalesOrder'])->middleware('abilities:sales:write');
+    Route::patch('/sales-orders/{id}', [\App\Http\Controllers\Api\InventoryIntegrationController::class, 'updateSalesOrder'])->middleware('abilities:sales:write');
     Route::get('/sales-quotations', [\App\Http\Controllers\Api\SalesQuotationIntegrationController::class, 'index'])->middleware('abilities:sales:read');
     Route::post('/sales-quotations', [\App\Http\Controllers\Api\SalesQuotationIntegrationController::class, 'store'])->middleware('abilities:sales:write');
     Route::patch('/sales-quotations/{id}', [\App\Http\Controllers\Api\SalesQuotationIntegrationController::class, 'update'])->middleware('abilities:sales:write');
@@ -344,6 +355,8 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::post('/sales-quotations/{id}/customer-portal-invitation', [\App\Http\Controllers\Api\CustomerPortalController::class, 'issueInvitation'])->middleware('abilities:sales:write');
     Route::post('/sales-quotations/{id}/customer-portal-invitation/revoke', [\App\Http\Controllers\Api\CustomerPortalController::class, 'revokeInvitation'])->middleware('abilities:sales:write');
     Route::post('/purchase-orders', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'createOrder'])->middleware('abilities:purchasing:write');
+    Route::get('/purchase-orders/closure-report', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'purchaseOrderClosureReport'])->middleware('abilities:purchasing:read');
+    Route::patch('/purchase-orders/{id}', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'updateOrder'])->middleware('abilities:purchasing:write');
     Route::get('/requisitions', [\App\Http\Controllers\Api\PurchaseRequisitionIntegrationController::class, 'index'])->middleware('abilities:purchasing:read');
     Route::post('/requisitions', [\App\Http\Controllers\Api\PurchaseRequisitionIntegrationController::class, 'store'])->middleware('abilities:purchasing:write');
     Route::post('/requisitions/{id}/approve', [\App\Http\Controllers\Api\PurchaseRequisitionIntegrationController::class, 'approve'])->middleware('abilities:purchasing:write');
@@ -368,6 +381,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->prefix('integration')->grou
     Route::post('/goods-receipts/{id}/resolve-discrepancy', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'resolveReceiptDiscrepancy'])->middleware('abilities:purchasing:write');
     Route::post('/purchase-invoices', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'createInvoice'])->middleware('abilities:purchasing:write');
     Route::post('/purchase-invoices/{id}/approve', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'approveInvoice'])->middleware('abilities:purchasing:write');
+    Route::post('/purchase-invoices/{id}/resolve-variance', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'resolveInvoiceVariance'])->middleware('abilities:purchasing:write');
     Route::post('/purchase-invoices/{id}/reject', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'rejectInvoice'])->middleware('abilities:purchasing:write');
     Route::get('/landed-costs', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'landedCosts'])->middleware('abilities:purchasing:read');
     Route::post('/landed-costs', [\App\Http\Controllers\Api\ProcurementIntegrationController::class, 'createLandedCost'])->middleware('abilities:purchasing:write');

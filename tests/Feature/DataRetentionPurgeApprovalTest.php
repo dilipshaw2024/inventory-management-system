@@ -77,4 +77,21 @@ class DataRetentionPurgeApprovalTest extends TestCase
         $this->assertDatabaseHas('data_retention_archives', ['company_id' => $company->id, 'record_type' => 'document_attachments', 'record_id' => $attachment->id]);
         $this->assertDatabaseHas('data_retention_purge_requests', ['id' => $purge->id, 'status' => 'consumed']);
     }
+
+    public function test_external_archive_is_written_and_integrity_command_verifies_it(): void
+    {
+        Storage::fake('local');
+        Storage::fake('retention-test');
+        config(['retention.archive_disk' => 'retention-test']);
+        $company = Company::create(['name' => 'External Retention Co', 'code' => 'RETENTION-EXT']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $path = 'erp-attachments/external-retention.pdf';
+        Storage::disk('local')->put($path, 'external archive content');
+        $attachment = DocumentAttachment::create(['company_id' => $company->id, 'attachable_type' => Company::class, 'attachable_id' => $company->id, 'original_name' => 'external-retention.pdf', 'stored_path' => $path, 'mime_type' => 'application/pdf', 'size_bytes' => 24, 'uploaded_by' => $user->id, 'created_at' => now()->subDays(60), 'updated_at' => now()->subDays(60)]);
+        DataRetentionPolicy::create(['company_id' => $company->id, 'name' => 'External archive', 'record_type' => 'document_attachments', 'retention_days' => 30, 'archive_enabled' => true, 'purge_enabled' => false, 'is_active' => true]);
+
+        $this->artisan('erp:retention:process')->assertExitCode(0);
+        $this->assertDatabaseHas('data_retention_archives', ['company_id' => $company->id, 'record_id' => $attachment->id, 'external_disk' => 'retention-test']);
+        $this->artisan('erp:retention:verify-archives', ['--company' => $company->id])->assertExitCode(0);
+    }
 }

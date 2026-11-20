@@ -24,6 +24,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Http\UploadedFile;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
 
@@ -421,6 +422,32 @@ class DeliveryIntegrationTest extends TestCase
             'external_reference' => 'BROWSER-MANIFEST-EXT',
         ])->assertRedirect();
         $this->assertDatabaseHas('dispatch_manifests', ['company_id' => $company->id, 'external_reference' => 'BROWSER-MANIFEST-EXT', 'status' => 'planned']);
+    }
+
+    public function test_browser_can_capture_structured_proof_for_dispatched_delivery(): void
+    {
+        $company = Company::create(['name' => 'Browser POD Co', 'code' => 'BROWSER-POD']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $permission = Permission::create(['name' => 'Sales manage', 'code' => 'sales.manage', 'module' => 'sales']);
+        $role = Role::create(['name' => 'POD operator', 'code' => 'pod-operator']);
+        $role->permissions()->attach($permission);
+        $user->roles()->attach($role);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Browser POD Customer', 'is_active' => true]);
+        $order = SalesOrder::create(['company_id' => $company->id, 'customer_id' => $customer->id, 'order_no' => 'SO-BROWSER-POD', 'date' => now()->toDateString(), 'status' => 'partially_delivered']);
+        $delivery = Delivery::create(['company_id' => $company->id, 'sales_order_id' => $order->id, 'delivery_no' => 'DN-BROWSER-POD', 'date' => now()->toDateString(), 'status' => 'approved', 'fulfillment_status' => 'dispatched']);
+        DeliveryOperation::create(['delivery_id' => $delivery->id, 'operation_type' => 'dispatch', 'status' => 'completed', 'performed_by' => $user->id, 'completed_at' => now()]);
+
+        $this->actingAs($user)->post('/fulfillment/deliveries/'.$delivery->id.'/proof', [
+            'proof_type' => 'recipient',
+            'external_reference' => 'BROWSER-POD-EXT',
+            'recipient_name' => 'Browser Receiver',
+            'recipient_contact' => '+47 12345678',
+            'file' => UploadedFile::fake()->create('signed-pod.pdf', 12, 'application/pdf'),
+        ])->assertRedirect();
+
+        $this->assertDatabaseHas('delivery_proofs', ['company_id' => $company->id, 'delivery_id' => $delivery->id, 'external_reference' => 'BROWSER-POD-EXT', 'recipient_name' => 'Browser Receiver']);
+        $this->assertDatabaseHas('document_attachments', ['company_id' => $company->id, 'attachable_type' => $delivery->getMorphClass(), 'attachable_id' => $delivery->id, 'original_name' => 'signed-pod.pdf', 'attachment_type' => 'document']);
+        $this->assertDatabaseHas('deliveries', ['id' => $delivery->id, 'fulfillment_status' => 'delivered', 'proof_of_delivery' => 'BROWSER-POD-EXT']);
     }
 
     public function test_assigned_store_cannot_create_dispatch_manifest_for_another_store(): void

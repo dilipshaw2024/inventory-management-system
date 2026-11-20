@@ -18,7 +18,7 @@ class ProductVariantController extends Controller
     public function index()
     {
         $parents = Product::whereNull('parent_product_id')->where('status', 1)->orderBy('name')->get();
-        $variants = Product::with(['parentProduct', 'attributeAssignments.attribute', 'attributeAssignments.value'])->where('is_variant', true)->latest()->paginate(40);
+        $variants = Product::with(['parentProduct', 'attributeAssignments.attribute', 'attributeAssignments.value', 'attachments'])->where('is_variant', true)->latest()->paginate(40);
         $attributes = ProductAttribute::with('values')->where('is_active', true)->orderBy('name')->get();
         return view('backend.product.variants', compact('parents', 'variants', 'attributes'));
     }

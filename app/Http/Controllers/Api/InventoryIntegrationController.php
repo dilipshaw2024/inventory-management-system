@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\InventoryAdjustment;
 use App\Models\InventoryAdjustmentLine;
 use App\Models\InventoryStatusBalance;
+use App\Models\CatalogChannel;
 use App\Models\Product;
 use App\Models\StockReservation;
 use App\Models\SalesOrder;
@@ -362,7 +363,8 @@ class InventoryIntegrationController extends Controller
             ->findOrFail($id);
         try { app(\App\Services\SalesDiscountPolicyService::class)->assertCanApprove($pendingOrder); }
         catch (\RuntimeException $exception) { return response()->json(['message' => $exception->getMessage()], 422); }
-        $order = DB::transaction(function () use ($id): SalesOrder {
+        try {
+            $order = DB::transaction(function () use ($id): SalesOrder {
             $order = $this->companyScope(SalesOrder::with(['lines', 'customer']), auth()->user()?->company_id)
                 ->when((int) auth()->user()->store_id > 0, fn ($query) => $query->where('store_id', (int) auth()->user()->store_id))
                 ->lockForUpdate()->findOrFail($id);
@@ -370,14 +372,72 @@ class InventoryIntegrationController extends Controller
             app(\App\Services\ApprovalGuard::class)->assertDifferent($order);
             foreach ($order->lines as $line) app(ProductLifecycleService::class)->assertSellable($line->product);
             $orderValue = (float) $order->lines->sum(fn ($line) => ((float) $line->ordered_qty * (float) $line->unit_price) - (float) $line->discount_amount);
-            app(\App\Services\CustomerCreditService::class)->assertCanApprove($order->customer, $orderValue);
+            app(\App\Services\CustomerCreditService::class)->assertCanApprove($order->customer, $orderValue, $order->id);
             app(\App\Services\StockReservationService::class)->reserveSalesOrder($order);
             $order->update(['status' => 'approved', 'approved_by' => auth()->id(), 'approved_at' => now()]);
             foreach (($order->promotion_ids ?: ($order->promotion_id ? [$order->promotion_id] : [])) as $promotionId) app(PromotionService::class)->redeem((int) $promotionId);
             app(AuditService::class)->record('sales_order.approved', $order, ['status' => 'submitted'], ['status' => 'approved']);
-            return $order->fresh();
-        });
+                return $order->fresh();
+            });
+        } catch (\RuntimeException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
         return response()->json(['data' => $order->load('customer', 'lines.product'), 'status' => $order->status]);
+    }
+
+    public function updateSalesOrder(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $data = $request->validate([
+            'external_reference' => ['nullable', 'string', 'max:150'], 'customer_id' => ['required', 'integer', $owned('customers')],
+            'store_id' => ['nullable', 'integer', $owned('stores')], 'sales_channel' => ['nullable', 'string', 'max:50'], 'delivery_method' => ['nullable', 'string', 'max:30'],
+            'salesperson_id' => ['nullable', 'integer', Rule::exists('users', 'id')->where(fn ($query) => $query->where('company_id', $companyId))],
+            'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'sales'))],
+            'location_id' => ['nullable', 'integer'], 'date' => ['required', 'date'], 'requested_date' => ['nullable', 'date', 'after_or_equal:date'],
+            'currency_code' => ['nullable', 'string', 'size:3'], 'exchange_rate' => ['nullable', 'numeric', 'gt:0'], 'allow_backorders' => ['nullable', 'boolean'],
+            'fulfillment_priority' => ['nullable', 'integer', 'min:0', 'max:100'], 'description' => ['nullable', 'string', 'max:2000'],
+            'promotion_code' => ['nullable', 'string', 'max:80'], 'promotion_codes' => ['nullable', 'array', 'max:10'], 'promotion_codes.*' => ['string', 'max:80', 'distinct'],
+            'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')], 'lines.*.batch_id' => ['nullable', 'integer'],
+            'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'], 'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'], 'lines.*.discount_amount' => ['nullable', 'numeric', 'min:0'],
+        ]);
+        $order = $this->companyScope(SalesOrder::with(['lines', 'deliveries']), $companyId)->when((int) $request->user()?->store_id > 0, fn ($query) => $query->where('store_id', (int) $request->user()->store_id))->findOrFail($id);
+        if ($order->status !== 'submitted') throw new \RuntimeException('Only submitted sales orders can be revised before approval.');
+        if ($order->deliveries->isNotEmpty() || (float) $order->lines->sum('delivered_qty') > 0) throw new \RuntimeException('A sales order with fulfillment activity cannot be revised.');
+        if (!empty($data['external_reference']) && $this->companyScope(SalesOrder::query(), $companyId)->where('external_reference', $data['external_reference'])->where('id', '!=', $id)->exists()) abort(422, 'The sales-order external reference is already used by this company.');
+        if ($request->user()?->store_id && (!isset($data['store_id']) || (int) $data['store_id'] !== (int) $request->user()->store_id)) abort(403, 'This user is assigned to a different store.');
+        $customer = $this->companyScope(Customer::query(), $companyId)->findOrFail($data['customer_id']);
+        $store = !empty($data['store_id']) ? $this->companyScope(Store::query(), $companyId)->findOrFail($data['store_id']) : null;
+        if (!empty($data['location_id']) && !$this->companyScope(InventoryLocation::query(), $companyId)->whereKey($data['location_id'])->exists()) abort(422, 'Location is not authorized for this company.');
+        $currency = strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD'));
+        $priceList = !empty($data['price_list_id']) ? PriceList::where('company_id', $companyId)->where('list_type', 'sales')->findOrFail($data['price_list_id']) : null;
+        if ($priceList && (!$priceList->is_active || ($priceList->starts_on && $priceList->starts_on->toDateString() > $data['date']) || ($priceList->ends_on && $priceList->ends_on->toDateString() < $data['date']))) abort(422, 'The selected sales price list is not active for the order date.');
+        if ($priceList && $priceList->currency_code !== $currency) abort(422, 'The selected sales price list currency does not match the order currency.');
+        $promotionCodes = $data['promotion_codes'] ?? (!empty($data['promotion_code']) ? [$data['promotion_code']] : []);
+        $revised = DB::transaction(function () use ($data, $order, $customer, $store, $priceList, $currency, $companyId, $request, $promotionCodes): SalesOrder {
+            $locked = $this->companyScope(SalesOrder::with('lines'), $companyId)->lockForUpdate()->findOrFail($order->id);
+            $before = $locked->toArray() + ['lines' => $locked->lines->map(fn (SalesOrderLine $line): array => $line->only(['product_id', 'batch_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price', 'discount_amount']))->values()->all()];
+            $locked->update(['external_reference' => $data['external_reference'] ?? null, 'customer_id' => $customer->id, 'store_id' => $store?->id, 'price_list_id' => $priceList?->id, 'sales_channel' => $data['sales_channel'] ?? ($customer->sales_channel ?: null), 'delivery_method' => $data['delivery_method'] ?? null, 'salesperson_id' => $data['salesperson_id'] ?? $request->user()?->id, 'location_id' => $data['location_id'] ?? null, 'date' => $data['date'], 'requested_date' => $data['requested_date'] ?? null, 'description' => $data['description'] ?? null, 'allow_backorders' => $data['allow_backorders'] ?? false, 'fulfillment_priority' => $data['fulfillment_priority'] ?? 50, 'currency_code' => $currency, 'exchange_rate' => $data['exchange_rate'] ?? 1, 'promotion_id' => null, 'promotion_ids' => null]);
+            $lineRows = [];
+            foreach ($data['lines'] as $line) {
+                $product = $this->companyScope(Product::query(), $companyId)->findOrFail($line['product_id']); app(ProductLifecycleService::class)->assertSellable($product);
+                $batchId = !empty($line['batch_id']) ? (int) $line['batch_id'] : null;
+                if ($batchId !== null && (!in_array($product->tracking_type, ['batch', 'lot'], true) || !$this->companyScope(InventoryBatch::query(), $companyId)->whereKey($batchId)->where('product_id', $product->id)->exists())) abort(422, 'The selected batch does not belong to the selected batch-tracked product.');
+                $entered = (float) $line['quantity']; $uomId = $line['uom_id'] ?? null; $stockQuantity = app(UomConversionService::class)->toStock($product, $entered, $uomId ? (int) $uomId : null, 'sales');
+                $unitPrice = array_key_exists('unit_price', $line) && $line['unit_price'] !== null ? (float) $line['unit_price'] : 0; $discount = (float) ($line['discount_amount'] ?? 0);
+                $agreement = app(CustomerProductPriceService::class)->bestFor($product, $customer, $stockQuantity, $locked->date->toDateString(), $locked->currency_code, $locked->price_list_id);
+                if ($agreement && $unitPrice <= 0) { $unitPrice = (float) $agreement->unit_price; $discount = $stockQuantity * $unitPrice * ((float) $agreement->discount_percent / 100); }
+                if ($uomId) $unitPrice /= max($stockQuantity / $entered, 0.000001);
+                $lineRows[] = ['product_id' => (int) $product->id, 'batch_id' => $batchId, 'uom_id' => $uomId, 'uom_quantity' => $entered, 'quantity' => $stockQuantity, 'unit_price' => $unitPrice, 'discount' => $discount];
+            }
+            $promotionResult = app(PromotionService::class)->applyCodesToLines($promotionCodes, $lineRows, (int) $locked->customer_id, $locked->date->toDateString());
+            if ($promotionResult['promotion']) $locked->update(['promotion_id' => $promotionResult['promotion']->id, 'promotion_ids' => collect($promotionResult['promotions'])->pluck('id')->values()->all()]);
+            $locked->lines()->delete();
+            foreach ($promotionResult['lines'] as $line) SalesOrderLine::create(['sales_order_id' => $locked->id, 'product_id' => $line['product_id'], 'batch_id' => $line['batch_id'] ?? null, 'uom_id' => $line['uom_id'], 'uom_quantity' => $line['uom_quantity'], 'ordered_qty' => $line['quantity'], 'unit_price' => $line['unit_price'], 'discount_amount' => $line['discount']]);
+            $after = $locked->fresh('lines'); app(AuditService::class)->record('sales_order.revised', $after, $before, $after->toArray() + ['lines' => $after->lines->map(fn (SalesOrderLine $line): array => $line->only(['product_id', 'batch_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price', 'discount_amount']))->values()->all(), 'revised_by' => $request->user()?->id]);
+            return $after;
+        });
+        return response()->json(['data' => $revised->load('customer', 'priceList', 'lines.product'), 'status' => 'pending_approval']);
     }
 
     public function cancelSalesOrder(Request $request, int $id): JsonResponse
@@ -406,11 +466,42 @@ class InventoryIntegrationController extends Controller
             'q' => ['nullable', 'string', 'max:150'], 'lifecycle_status' => ['nullable', 'in:draft,active,discontinued,blocked,archived'],
             'product_type' => ['nullable', 'in:stock,service,consumable,asset,bundle'], 'can_purchase' => ['nullable', 'boolean'],
             'can_sell' => ['nullable', 'boolean'], 'is_stock_item' => ['nullable', 'boolean'], 'is_variant' => ['nullable', 'boolean'], 'parent_product_id' => ['nullable', 'integer'], 'language_code' => ['nullable', 'string', 'max:35'], 'updated_since' => ['nullable', 'date'],
+            'catalog' => ['nullable', 'boolean'], 'include_media' => ['nullable', 'boolean'], 'channel' => ['nullable', 'string', 'max:50', 'regex:/^[a-z0-9][a-z0-9._-]*$/i'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
         $boolean = static fn ($value): bool => (bool) filter_var($value, FILTER_VALIDATE_BOOLEAN);
+        $catalog = $boolean($data['catalog'] ?? false);
+        $channel = strtolower(trim((string) ($data['channel'] ?? '')));
+        $governedChannel = $catalog && $channel !== ''
+            ? CatalogChannel::where('company_id', $companyId)->where('code', $channel)->first()
+            : null;
+        if ($governedChannel && !$governedChannel->is_active) {
+            return response()->json(['message' => 'The requested catalog channel is inactive.'], 422);
+        }
+        $includeMedia = $boolean($data['include_media'] ?? false) || !empty($data['channel']) || $catalog;
         $language = isset($data['language_code']) ? \App\Models\ProductTranslation::normalizeLanguageCode($data['language_code']) : null;
-        $products = $this->companyScope(Product::with(['category', 'unit', 'brand', 'barcodes', 'taxDefinition.components', 'translations' => fn ($query) => $query->where('company_id', $companyId)->when($language, fn ($nested) => $nested->where('language_code', $language)), 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value']), $companyId)
+        $relations = ['category', 'unit', 'brand', 'barcodes', 'taxDefinition.components', 'translations' => fn ($query) => $query->where('company_id', $companyId)->when($language, fn ($nested) => $nested->where('language_code', $language)), 'parentProduct:id,name,sku', 'attributeAssignments.attribute', 'attributeAssignments.value'];
+        if ($includeMedia) {
+            $mediaChannel = strtolower((string) ($data['channel'] ?? ''));
+            $relations['attachments'] = function ($query) use ($mediaChannel): void {
+                $query->where('attachment_type', 'image')->where('is_published', true)
+                    ->when($mediaChannel !== '', function ($nested) use ($mediaChannel): void {
+                        $nested->where(function ($scope) use ($mediaChannel): void {
+                            $scope->whereNull('publication_channels')->orWhereJsonContains('publication_channels', $mediaChannel);
+                        });
+                    })->orderByDesc('is_primary')->orderBy('sort_order')->orderBy('id')
+                    ->select(['id', 'attachable_type', 'attachable_id', 'original_name', 'mime_type', 'size_bytes', 'attachment_type', 'title', 'alt_text', 'version', 'is_primary', 'sort_order', 'is_published', 'publication_channels', 'created_at']);
+            };
+        }
+        if ($catalog) {
+            $relations['bundleComponents.componentProduct'] = function ($query) use ($companyId): void {
+                $query->where(fn ($scope) => $scope->where('company_id', $companyId)->orWhereNull('company_id'))
+                    ->select(['id', 'company_id', 'name', 'sku', 'barcode', 'product_type', 'lifecycle_status', 'can_sell', 'status', 'is_variant', 'parent_product_id', 'category_id', 'brand_id', 'unit_id', 'classification_id', 'sales_price', 'tax_rate']);
+            };
+        }
+        $products = $this->companyScope(Product::with($relations), $companyId)
+            ->when($catalog, fn ($query) => $query->select(['id', 'company_id', 'name', 'sku', 'barcode', 'product_type', 'lifecycle_status', 'can_sell', 'status', 'is_variant', 'parent_product_id', 'category_id', 'brand_id', 'unit_id', 'classification_id', 'sales_price', 'tax_rate', 'weight_kg', 'length_m', 'width_m', 'height_m', 'updated_at']))
+            ->when($catalog, fn ($query) => $query->where('status', 1)->where('lifecycle_status', 'active')->where('can_sell', true))
             ->when($data['q'] ?? null, function ($query, string $search): void {
                 $query->where(function ($nested) use ($search): void {
                     $nested->where('name', 'like', "%{$search}%")

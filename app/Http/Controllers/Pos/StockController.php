@@ -298,13 +298,74 @@ class StockController extends Controller
 
     public function ExpiryReport(Request $request)
     {
+        $filters = $request->validate(['manufacturing_date_from' => ['nullable', 'date'], 'manufacturing_date_to' => ['nullable', 'date', 'after_or_equal:manufacturing_date_from']]);
         $days = min(3650, max(0, (int) $request->input('days', 90)));
         $cutoff = now()->addDays($days)->toDateString();
         $batches = InventoryBatch::with(['product', 'serials'])
             ->where(fn ($query) => $query->whereDate('expiry_date', '<=', $cutoff)->orWhere(fn ($nested) => $nested->whereNull('expiry_date')->whereDate('best_before_date', '<=', $cutoff)))
             ->where(fn ($query) => $query->whereNotNull('expiry_date')->orWhereNotNull('best_before_date'))
+            ->when($filters['manufacturing_date_from'] ?? null, fn ($query, $date) => $query->whereDate('manufacturing_date', '>=', $date))
+            ->when($filters['manufacturing_date_to'] ?? null, fn ($query, $date) => $query->whereDate('manufacturing_date', '<=', $date))
             ->orderByRaw('COALESCE(expiry_date, best_before_date)')->paginate(50)->withQueryString();
-        return view('backend.stock.expiry_report', compact('batches', 'days'));
+        return view('backend.stock.expiry_report', compact('batches', 'days', 'filters'));
+    }
+
+    public function RecallReport(Request $request)
+    {
+        $validated = $request->validate([
+            'status' => ['nullable', 'in:active,released,all'],
+            'product_id' => ['nullable', 'integer', $this->owned('products')],
+        ]);
+        $status = $validated['status'] ?? 'active';
+        $batches = InventoryBatch::with(['product', 'location', 'recalledBy', 'recallReleasedBy'])
+            ->whereNotNull('recalled_at')
+            ->when($validated['product_id'] ?? null, fn ($query, $id) => $query->where('product_id', $id))
+            ->when($status === 'active', fn ($query) => $query->whereNull('recall_released_at'))
+            ->when($status === 'released', fn ($query) => $query->whereNotNull('recall_released_at'))
+            ->orderByDesc('recalled_at')->orderBy('id')->paginate(50)->withQueryString();
+        $in = ['opening', 'receipt', 'transfer_in', 'adjustment_in', 'return_in', 'quarantine_out', 'release'];
+        $out = ['issue', 'transfer_out', 'adjustment_out', 'return_out', 'scrap', 'quarantine_in'];
+        $batches->getCollection()->transform(function (InventoryBatch $batch) use ($in, $out): InventoryBatch {
+            $allocationBatch = 'COALESCE(inventory_movement_allocations.batch_id, inventory_movements.batch_id)';
+            $allocationQuantity = 'COALESCE(inventory_movement_allocations.quantity, inventory_movements.quantity)';
+            $quantity = InventoryMovement::query()->leftJoin('inventory_movement_allocations', 'inventory_movement_allocations.movement_id', '=', 'inventory_movements.id')
+                ->where('inventory_movements.product_id', $batch->product_id)->whereRaw($allocationBatch.' = ?', [$batch->id])
+                ->selectRaw('COALESCE(SUM(CASE WHEN inventory_movements.movement_type IN ('.implode(',', array_fill(0, count($in), '?')).') THEN '.$allocationQuantity.' WHEN inventory_movements.movement_type IN ('.implode(',', array_fill(0, count($out), '?')).') THEN -'.$allocationQuantity.' ELSE 0 END), 0) AS balance', array_merge($in, $out))->value('balance');
+            $quantity = (float) $quantity;
+            $layers = InventoryCostLayer::withoutGlobalScopes()->where('product_id', $batch->product_id)->where('batch_id', $batch->id)->where('remaining_quantity', '>', 0)->get(['remaining_quantity', 'unit_cost']);
+            $value = (float) $layers->sum(fn ($layer): float => (float) $layer->remaining_quantity * (float) $layer->unit_cost);
+            $batch->setAttribute('stock_quantity', $quantity);
+            $batch->setAttribute('stock_value', $value > 0 ? $value : $quantity * (float) ($batch->product?->purchase_price ?? 0));
+            $batch->setAttribute('recall_status', $batch->recall_released_at ? 'released' : 'active');
+            return $batch;
+        });
+        return view('backend.stock.recall_report', compact('batches', 'status'));
+    }
+
+    public function RecallBatch(Request $request, int $id)
+    {
+        $data = $request->validate(['recall_reference' => ['required', 'string', 'max:150'], 'recall_reason' => ['required', 'string', 'max:4000']]);
+        $companyId = auth()->user()?->company_id;
+        $batch = InventoryBatch::whereKey($id)->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->lockForUpdate()->firstOrFail();
+        if (!$batch->recalled_at || $batch->recall_released_at) {
+            $before = $batch->only(['recalled_at', 'recalled_by', 'recall_reference', 'recall_reason', 'recall_released_at', 'recall_released_by']);
+            $batch->update(['recalled_at' => now(), 'recalled_by' => auth()->id(), 'recall_reference' => $data['recall_reference'], 'recall_reason' => $data['recall_reason'], 'recall_released_at' => null, 'recall_released_by' => null]);
+            app(\App\Services\AuditService::class)->record('inventory_batch.recalled', $batch, $before, $batch->only(array_keys($before)));
+        }
+        return back()->with(['message' => 'Batch recall recorded.', 'alert-type' => 'success']);
+    }
+
+    public function ReleaseBatchRecall(Request $request, int $id)
+    {
+        $data = $request->validate(['release_reason' => ['required', 'string', 'max:4000']]);
+        $companyId = auth()->user()?->company_id;
+        $batch = InventoryBatch::whereKey($id)->whereHas('product', fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->lockForUpdate()->firstOrFail();
+        if ($batch->recalled_at && !$batch->recall_released_at) {
+            $before = $batch->only(['recalled_at', 'recall_released_at', 'recall_released_by', 'recall_reason']);
+            $batch->update(['recall_released_at' => now(), 'recall_released_by' => auth()->id(), 'recall_reason' => trim((string) $batch->recall_reason)."\nRelease: ".$data['release_reason']]);
+            app(\App\Services\AuditService::class)->record('inventory_batch.recall_released', $batch, $before, $batch->only(array_keys($before)));
+        }
+        return back()->with(['message' => 'Batch recall released.', 'alert-type' => 'success']);
     }
 
     public function BatchStockReport()

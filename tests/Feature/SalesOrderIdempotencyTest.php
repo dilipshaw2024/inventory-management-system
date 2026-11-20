@@ -48,4 +48,23 @@ class SalesOrderIdempotencyTest extends TestCase
         $replayed->assertOk()->assertJsonPath('status', 'duplicate_ignored')->assertJsonPath('data.id', $created->json('data.id'));
         $this->assertSame(1, SalesOrder::where('company_id', $company->id)->count());
     }
+
+    public function test_submitted_sales_order_revision_resets_lines_and_records_before_after_snapshot(): void
+    {
+        $company = Company::create(['name' => 'SO Revision Co', 'code' => 'SO-REVISION']);
+        $user = User::factory()->create(['company_id' => $company->id]);
+        $customer = Customer::create(['company_id' => $company->id, 'name' => 'Revision Customer', 'is_active' => true]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'SO Revision Supplier', 'is_active' => true]);
+        $unit = Unit::create(['company_id' => $company->id, 'name' => 'SO Revision Each', 'code' => 'EA-SO-REV', 'dimension' => 'unit', 'status' => 1]);
+        $category = Category::create(['company_id' => $company->id, 'name' => 'SO Revision Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'SO revision item', 'status' => 1, 'is_stock_item' => true, 'can_sell' => true, 'sales_price' => 10]);
+        Sanctum::actingAs($user, ['sales:write']);
+        $created = $this->postJson('/api/integration/sales-orders', ['customer_id' => $customer->id, 'date' => '2026-09-20', 'lines' => [['product_id' => $product->id, 'quantity' => 2, 'unit_price' => 10]]])->assertCreated();
+        $id = $created->json('data.id');
+        $revised = $this->patchJson('/api/integration/sales-orders/'.$id, ['customer_id' => $customer->id, 'date' => '2026-09-21', 'description' => 'Revised customer terms', 'lines' => [['product_id' => $product->id, 'quantity' => 4, 'unit_price' => 11]]]);
+        $revised->assertOk()->assertJsonPath('status', 'pending_approval')->assertJsonPath('data.status', 'submitted')->assertJsonPath('data.lines.0.ordered_qty', '4.000000');
+        $revision = DocumentRevision::where('document_type', SalesOrder::class)->where('document_id', $id)->latest('version')->firstOrFail();
+        $this->assertSame('2.000000', (string) data_get($revision->old_values, 'lines.0.ordered_qty'));
+        $this->assertSame('4.000000', (string) data_get($revision->new_values, 'lines.0.ordered_qty'));
+    }
 }

@@ -97,6 +97,9 @@ class InventoryLedgerService
             $batch = $batchRecord
                 ? $batchRecord
                 : ($serialId ? InventorySerial::where('product_id', $productId)->with('batch')->findOrFail($serialId)->batch : null);
+            if ($batch && $batch->recalled_at && !$batch->recall_released_at) {
+                throw new \RuntimeException('Recalled batch '.$batch->batch_no.' cannot be issued until the recall is released.');
+            }
             if ($batch && $batch->expiry_date && $batch->expiry_date->lt(Carbon::today()) && !app(ErpSettingService::class)->get('allow_expired_batch_issue', false, $companyId) && !$this->hasExpiryOverride($reference, 'expired')) {
                 throw new \RuntimeException('Expired batch '.$batch->batch_no.' cannot be issued without the company expiry-policy override.');
             }

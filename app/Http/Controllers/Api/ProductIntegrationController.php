@@ -110,10 +110,46 @@ class ProductIntegrationController extends Controller
     public function media(Request $request, int $id): JsonResponse
     {
         $product = $this->companyScope(Product::query())->findOrFail($id);
-        $attachments = $product->attachments()->orderByDesc('is_primary')->orderBy('attachment_type')->orderByDesc('version')->get([
-            'id', 'original_name', 'mime_type', 'size_bytes', 'attachment_type', 'title', 'version', 'is_primary', 'created_at',
+        $data = $request->validate(['channel' => ['nullable', 'string', 'max:50', 'regex:/^[a-z0-9][a-z0-9._-]*$/i']]);
+        $attachments = $product->attachments()->orderByDesc('is_primary')->orderBy('sort_order')->orderBy('attachment_type')->orderByDesc('version')->get([
+            'id', 'original_name', 'mime_type', 'size_bytes', 'attachment_type', 'title', 'alt_text', 'version', 'is_primary', 'sort_order', 'created_at',
         ]);
+        if (!empty($data['channel'])) {
+            $channel = strtolower($data['channel']);
+            $attachments = $product->attachments()->where('is_published', true)->where(function ($query) use ($channel): void {
+                $query->whereNull('publication_channels')->orWhereJsonContains('publication_channels', $channel);
+            })->orderByDesc('is_primary')->orderBy('sort_order')->orderBy('attachment_type')->orderByDesc('version')->get([
+                'id', 'original_name', 'mime_type', 'size_bytes', 'attachment_type', 'title', 'alt_text', 'version', 'is_primary', 'sort_order', 'is_published', 'publication_channels', 'created_at',
+            ]);
+        }
         return response()->json(['data' => $attachments, 'product_id' => $product->id]);
+    }
+
+    public function updateMedia(Request $request, int $id, int $attachmentId): JsonResponse
+    {
+        $this->assertWriteAccess($request);
+        $product = $this->companyScope(Product::query())->findOrFail($id);
+        $attachment = $product->attachments()->whereKey($attachmentId)->firstOrFail();
+        $data = $request->validate([
+            'title' => ['sometimes', 'nullable', 'string', 'max:255'],
+            'alt_text' => ['sometimes', 'nullable', 'string', 'max:255'],
+            'sort_order' => ['sometimes', 'integer', 'min:0', 'max:2147483647'],
+            'is_primary' => ['sometimes', 'boolean'],
+            'is_published' => ['sometimes', 'boolean'],
+            'publication_channels' => ['sometimes', 'nullable', 'array', 'max:20'],
+            'publication_channels.*' => ['string', 'max:50', 'regex:/^[a-z0-9][a-z0-9._-]*$/i'],
+        ]);
+        if (array_key_exists('publication_channels', $data) && $data['publication_channels'] !== null) $data['publication_channels'] = array_values(array_unique(array_map('strtolower', $data['publication_channels'])));
+        if (($data['is_primary'] ?? false) && $attachment->attachment_type !== 'image') abort(422, 'Only image attachments can be marked as primary media.');
+        $before = $attachment->only(array_keys($data));
+        DB::transaction(function () use ($attachment, $data): void {
+            if (($data['is_primary'] ?? false) === true) {
+                DocumentAttachment::where('attachable_type', $attachment->attachable_type)->where('attachable_id', $attachment->attachable_id)->where('attachment_type', 'image')->where('id', '<>', $attachment->id)->update(['is_primary' => false]);
+            }
+            $attachment->update($data);
+        });
+        app(AuditService::class)->record('document_attachment.media_updated', $attachment, $before, $attachment->fresh()->only(array_keys($data)) + ['api' => true]);
+        return response()->json(['data' => $attachment->fresh(), 'status' => 'updated']);
     }
 
     public function uoms(Request $request, int $id): JsonResponse

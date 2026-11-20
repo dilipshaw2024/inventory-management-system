@@ -89,6 +89,49 @@ class ThreeWayMatchingTest extends TestCase
         app(PurchaseInvoiceService::class)->approve($invoice->fresh('lines'));
     }
 
+    public function test_above_tolerance_variance_requires_independent_resolution_before_invoice_approval(): void
+    {
+        $company = Company::create(['name' => 'Variance Governance Co', 'code' => 'VARIANCE-GOV']);
+        $creator = User::factory()->create(['company_id' => $company->id]);
+        $checker = User::factory()->create(['company_id' => $company->id]);
+        $approver = User::factory()->create(['company_id' => $company->id]);
+        $supplier = Supplier::create(['company_id' => $company->id, 'name' => 'Variance Supplier', 'is_active' => true]);
+        $unit = Unit::create(['name' => 'Variance Each', 'status' => 1]);
+        $category = Category::create(['name' => 'Variance Category', 'status' => 1]);
+        $product = Product::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'unit_id' => $unit->id, 'category_id' => $category->id, 'name' => 'Variance item', 'quantity' => 0, 'status' => 1]);
+        $order = PurchaseOrder::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'po_no' => 'PO-VARIANCE-GOV', 'date' => now()->toDateString(), 'status' => 'approved']);
+        $orderLine = $order->lines()->create(['product_id' => $product->id, 'ordered_qty' => 2, 'received_qty' => 2, 'unit_price' => 10]);
+        $receipt = GoodsReceipt::create(['company_id' => $company->id, 'purchase_order_id' => $order->id, 'grn_no' => 'GRN-VARIANCE-GOV', 'date' => now()->toDateString(), 'status' => 'approved']);
+        $receiptLine = $receipt->lines()->create(['purchase_order_line_id' => $orderLine->id, 'product_id' => $product->id, 'received_qty' => 2, 'unit_cost' => 10]);
+        $invoice = PurchaseInvoice::create(['company_id' => $company->id, 'supplier_id' => $supplier->id, 'purchase_order_id' => $order->id, 'invoice_no' => 'PINV-VARIANCE-GOV', 'invoice_date' => now()->toDateString(), 'status' => 'pending', 'created_by' => $creator->id, 'subtotal_amount' => 30, 'total_amount' => 30]);
+        $invoice->lines()->create(['purchase_order_line_id' => $orderLine->id, 'goods_receipt_line_id' => $receiptLine->id, 'product_id' => $product->id, 'quantity' => 2, 'unit_price' => 15, 'line_total' => 30]);
+        app(ErpSettingService::class)->put('purchase_price_variance_percent', 5, 'float', $company->id);
+
+        $this->actingAs($approver);
+        try {
+            app(PurchaseInvoiceService::class)->approve($invoice->fresh('lines'));
+            $this->fail('An above-tolerance invoice must require variance resolution.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('independent variance approval is required', $exception->getMessage());
+        }
+
+        Sanctum::actingAs($checker, ['purchasing:write']);
+        $this->postJson('/api/integration/purchase-invoices/'.$invoice->id.'/resolve-variance', ['resolution' => 'accept_variance', 'resolution_reason' => 'Supplier price increase approved by procurement checker.'])
+            ->assertOk()->assertJsonPath('status', 'pending')->assertJsonPath('variance_status', 'approved');
+        $this->assertDatabaseHas('purchase_invoices', ['id' => $invoice->id, 'variance_approved_by' => $checker->id, 'variance_status' => 'approved']);
+
+        try {
+            app(PurchaseInvoiceService::class)->approve($invoice->fresh('lines'));
+            $this->fail('The variance checker must not approve the same invoice.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('cannot approve the same invoice', $exception->getMessage());
+        }
+
+        Sanctum::actingAs($approver, ['purchasing:write']);
+        app(PurchaseInvoiceService::class)->approve($invoice->fresh('lines'));
+        $this->assertDatabaseHas('purchase_invoices', ['id' => $invoice->id, 'status' => 'approved', 'variance_status' => 'approved']);
+    }
+
     public function test_final_receipt_shortage_can_be_resolved_by_checker(): void
     {
         $company = Company::create(['name' => 'Receipt Discrepancy Co', 'code' => 'RECEIPT-DISCREPANCY']);

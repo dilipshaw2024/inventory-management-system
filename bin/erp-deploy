@@ -37,6 +37,12 @@ if [[ "${ERP_DEPLOY_MIGRATE:-1}" == "1" ]]; then
   php artisan migrate --force
 fi
 
+archive_disk=$(grep -E "^ERP_RETENTION_ARCHIVE_DISK=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"" || true)
+deploy_verify_retention="${ERP_DEPLOY_VERIFY_RETENTION:-$(grep -E '^ERP_DEPLOY_VERIFY_RETENTION=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\"' || true)}"
+if [[ -n "$archive_disk" && "${deploy_verify_retention:-1}" == "1" ]]; then
+  php artisan erp:retention:verify-archives
+fi
+
 php artisan erp:system:health --strict --json
 php artisan optimize:clear
 php artisan config:cache

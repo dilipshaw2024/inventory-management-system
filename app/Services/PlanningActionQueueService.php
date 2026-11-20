@@ -22,11 +22,8 @@ class PlanningActionQueueService
         $availability = app(InventoryAvailabilityService::class)->availableMany($products, true, null, $companyId);
         $excess = $products->filter(fn (Product $product): bool => $product->max_stock !== null && (float) ($availability[$product->id] ?? 0) > (float) $product->max_stock)->count();
         $deadDays = (int) app(ErpSettingService::class)->get('dead_stock_days', 180, $companyId);
-        $recentIssues = InventoryMovement::whereIn('product_id', $products->pluck('id'))
-            ->where('movement_type', 'issue')->where('posted_at', '>=', now()->subDays($deadDays))
-            ->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))
-            ->pluck('product_id')->unique();
-        $dead = $products->filter(fn (Product $product): bool => (float) ($availability[$product->id] ?? 0) > 0 && !$recentIssues->contains($product->id))->count();
+        $issueQuantities = app(InventoryMovementMetricsService::class)->issueQuantitiesSince($products->pluck('id'), now()->subDays($deadDays), $companyId);
+        $dead = $products->filter(fn (Product $product): bool => (float) ($availability[$product->id] ?? 0) > 0 && (float) ($issueQuantities[$product->id] ?? 0) <= 0.000001)->count();
 
         return collect([
             [

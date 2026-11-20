@@ -55,6 +55,7 @@
                             <li><a href="{{ route('procurement.supplier.prices.index') }}" class="waves-effect"><i class="ri-price-tag-3-line"></i><span>Supplier Pricing</span></a></li>
                             <li><a href="{{ route('procurement.supplier.performance') }}" class="waves-effect"><i class="ri-bar-chart-grouped-line"></i><span>Supplier Performance</span></a></li>
                             <li><a href="{{ route('reports.inventory.analytics') }}" class="waves-effect"><i class="ri-pie-chart-2-line"></i><span>Inventory Analytics</span></a></li>
+                            <li><a href="{{ route('quality.inspections.report') }}" class="waves-effect"><i class="ri-shield-check-line"></i><span>Quality Inspections</span></a></li>
                             <li><a href="{{ route('reports.sales') }}" class="waves-effect"><i class="ri-bar-chart-grouped-line"></i><span>Sales Report</span></a></li>
                             <li><a href="{{ route('sales.quotations.index') }}" class="waves-effect"><i class="ri-file-paper-2-line"></i><span>Sales Quotations</span></a></li>
                             <li><a href="{{ route('sales.customer.prices.index') }}" class="waves-effect"><i class="ri-price-tag-2-line"></i><span>Customer Pricing</span></a></li>
@@ -211,6 +212,7 @@
             <li><a href="{{ route('stock.valuation') }}">Stock Valuation</a></li>
             <li><a href="{{ route('stock.location.stock') }}">Location Stock</a></li>
             <li><a href="{{ route('stock.expiry') }}">Batch Expiry Alerts</a></li>
+            <li><a href="{{ route('stock.recalls') }}">Batch Recall Report</a></li>
             <li><a href="{{ route('stock.batch.stock') }}">Batch-wise Stock</a></li>
             <li><a href="{{ route('stock.serial.stock') }}">Serial-wise Stock</a></li>
             <li><a href="{{ route('inventory.adjustments') }}">Stock Adjustments</a></li>

@@ -42,7 +42,7 @@ class DocumentAttachmentController extends Controller
 
     public function store(Request $request)
     {
-        $data = $request->validate(['attachable_type' => ['required', \Illuminate\Validation\Rule::in(array_keys($this->types))], 'attachable_id' => ['required', 'integer'], 'attachment_type' => ['required', 'in:image,document'], 'title' => ['nullable', 'string', 'max:255'], 'version' => ['nullable', 'integer', 'min:1'], 'is_primary' => ['nullable', 'boolean'], 'file' => ['required', 'file', 'max:10240', 'mimes:pdf,jpg,jpeg,png,webp,csv,xls,xlsx,doc,docx']]);
+        $data = $request->validate(['attachable_type' => ['required', \Illuminate\Validation\Rule::in(array_keys($this->types))], 'attachable_id' => ['required', 'integer'], 'attachment_type' => ['required', 'in:image,document'], 'title' => ['nullable', 'string', 'max:255'], 'alt_text' => ['nullable', 'string', 'max:255'], 'sort_order' => ['nullable', 'integer', 'min:0', 'max:2147483647'], 'is_published' => ['nullable', 'boolean'], 'publication_channels' => ['nullable', 'array', 'max:20'], 'publication_channels.*' => ['string', 'max:50', 'regex:/^[a-z0-9][a-z0-9._-]*$/i'], 'version' => ['nullable', 'integer', 'min:1'], 'is_primary' => ['nullable', 'boolean'], 'file' => ['required', 'file', 'max:10240', 'mimes:pdf,jpg,jpeg,png,webp,csv,xls,xlsx,doc,docx']]);
         $this->assertTypePermission($data['attachable_type']);
         $model = $this->types[$data['attachable_type']]::findOrFail($data['attachable_id']);
         $this->assertAttachableOwnership($model);
@@ -58,7 +58,8 @@ class DocumentAttachmentController extends Controller
         }
         $path = $file->store('erp-attachments', 'local');
         if (!empty($data['is_primary'])) DocumentAttachment::where('attachable_type', $model->getMorphClass())->where('attachable_id', $model->getKey())->where('attachment_type', $data['attachment_type'])->update(['is_primary' => false]);
-        $attachment = DocumentAttachment::create(['company_id' => $model->company_id ?: auth()->user()?->company_id, 'attachable_type' => $model->getMorphClass(), 'attachable_id' => $model->getKey(), 'original_name' => $file->getClientOriginalName(), 'stored_path' => $path, 'mime_type' => $file->getMimeType() ?: 'application/octet-stream', 'size_bytes' => $file->getSize(), 'attachment_type' => $data['attachment_type'], 'title' => $data['title'] ?? null, 'version' => $version, 'is_primary' => (bool) ($data['is_primary'] ?? false), 'uploaded_by' => auth()->id()]);
+        $channels = isset($data['publication_channels']) ? array_values(array_unique(array_map('strtolower', $data['publication_channels']))) : null;
+        $attachment = DocumentAttachment::create(['company_id' => $model->company_id ?: auth()->user()?->company_id, 'attachable_type' => $model->getMorphClass(), 'attachable_id' => $model->getKey(), 'original_name' => $file->getClientOriginalName(), 'stored_path' => $path, 'mime_type' => $file->getMimeType() ?: 'application/octet-stream', 'size_bytes' => $file->getSize(), 'attachment_type' => $data['attachment_type'], 'title' => $data['title'] ?? null, 'alt_text' => $data['alt_text'] ?? null, 'sort_order' => $data['sort_order'] ?? 0, 'is_published' => (bool) ($data['is_published'] ?? true), 'publication_channels' => $channels, 'version' => $version, 'is_primary' => (bool) ($data['is_primary'] ?? false), 'uploaded_by' => auth()->id()]);
         app(AuditService::class)->record('document_attachment.created', $attachment, null, $attachment->toArray());
         return back()->with(['message' => 'Document attached securely.', 'alert-type' => 'success']);
     }

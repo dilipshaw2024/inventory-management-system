@@ -83,6 +83,18 @@ class QualityInspectionWorkflowTest extends TestCase
         $this->assertDatabaseHas('quality_inspection_results', ['inspection_id' => $inspectionId, 'status' => 'passed']);
         $this->getJson('/api/inventory/quality/inspections?status=passed')
             ->assertOk()->assertJsonPath('data.0.id', $inspectionId);
+        $this->getJson('/api/inventory/quality/summary?from=2026-01-01&to=2026-12-31')
+            ->assertOk()->assertJsonPath('summary.inspection_count', 1)
+            ->assertJsonPath('summary.completed_count', 1)
+            ->assertJsonPath('summary.passed_count', 1)
+            ->assertJsonPath('summary.pass_rate_percent', 100)
+            ->assertJsonPath('by_type.0.inspection_type', 'receiving')
+            ->assertJsonPath('by_location.0.location_id', null)
+            ->assertJsonPath('meta.location_id', null);
+        $this->getJson('/api/inventory/quality/summary?from=2026-01-01&to=2026-12-31&status=failed')
+            ->assertOk()->assertJsonPath('summary.inspection_count', 0);
+        $this->getJson('/api/inventory/quality/inspections?status=passed&location_id=999999')
+            ->assertOk()->assertJsonCount(0, 'data');
     }
 
     public function test_failed_quality_result_cannot_be_released_and_is_tenant_scoped(): void
@@ -141,10 +153,13 @@ class QualityInspectionWorkflowTest extends TestCase
             'code' => 'QC-SCOPE-01', 'name' => 'Warehouse scope plan', 'inspection_type' => 'receiving', 'product_id' => $product->id,
             'lines' => [['sequence' => 1, 'characteristic' => 'Visual', 'data_type' => 'boolean']],
         ])->assertCreated();
+        $assignedLocation = InventoryLocation::create(['warehouse_id' => $assignedWarehouse->id, 'name' => 'Assigned Bin', 'code' => 'QUALITY-BIN-A', 'type' => 'bin', 'is_active' => true]);
+        QualityInspection::create(['company_id' => $company->id, 'plan_id' => $plan->json('data.id'), 'product_id' => $product->id, 'location_id' => $assignedLocation->id, 'inspection_no' => 'QI-SCOPE-A', 'quantity' => 1, 'sample_quantity' => 1, 'status' => 'pending']);
 
         $this->postJson('/api/inventory/quality/inspections', [
             'plan_id' => $plan->json('data.id'), 'product_id' => $product->id, 'location_id' => $otherLocation->id, 'quantity' => 1,
         ])->assertNotFound();
+        $this->getJson('/api/inventory/quality/inspections')->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.inspection_no', 'QI-SCOPE-A');
     }
 
 

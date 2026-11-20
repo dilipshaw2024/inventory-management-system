@@ -5,6 +5,7 @@ namespace App\Services;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Console\Scheduling\Schedule;
 
 class ErpHealthService
 {
@@ -66,6 +67,27 @@ class ErpHealthService
             $checks['queue'] = ['ok', 'configured: '.$queueName];
         }
 
+        $requiredScheduledCommands = [
+            'erp:inventory:expiry-alerts', 'erp:inventory:low-stock-alerts', 'erp:inventory:exception-alerts',
+            'erp:planning:generate-purchase-orders', 'erp:accounting:generate-recurring-journals',
+            'erp:approvals:escalate', 'erp:integration:deliver-webhooks', 'erp:security:verify-audit-chain',
+            'erp:reconcile-inventory-ledger', 'erp:retention:verify-archives',
+            'erp:accounting:retry-tax-filings', 'erp:accounting:retry-e-invoices',
+            'erp:logistics:sync-carrier-tracking', 'erp:products:process-import-jobs',
+        ];
+        try {
+            $scheduledCommands = collect(app(Schedule::class)->events())
+                ->map(fn ($event): string => (string) ($event->command ?? ''));
+            $missingScheduledCommands = collect($requiredScheduledCommands)
+                ->reject(fn (string $command): bool => $scheduledCommands->contains(fn (string $scheduled): bool => str_contains($scheduled, $command)))
+                ->values()->all();
+            $checks['scheduler'] = empty($missingScheduledCommands)
+                ? ['ok', count($requiredScheduledCommands).' critical ERP schedules registered']
+                : ['fail', 'missing scheduled commands: '.implode(', ', $missingScheduledCommands)];
+        } catch (\Throwable $exception) {
+            $checks['scheduler'] = ['fail', 'scheduler registration could not be inspected: '.$exception->getMessage()];
+        }
+
         $cacheName = (string) config('cache.default');
         $cacheConfig = config('cache.stores.'.$cacheName);
         $checks['cache'] = filled($cacheName) && is_array($cacheConfig)
@@ -82,6 +104,18 @@ class ErpHealthService
             $checks['private_storage'] = ['ok', 'writable'];
         } catch (\Throwable $exception) {
             $checks['private_storage'] = ['fail', $exception->getMessage()];
+        }
+
+        $archiveDisk = trim((string) config('retention.archive_disk', ''));
+        if ($archiveDisk === '') {
+            $checks['retention_archive_storage'] = ['ok', 'not configured; database-only retention archives are active'];
+        } else {
+            try {
+                Storage::disk($archiveDisk);
+                $checks['retention_archive_storage'] = ['ok', 'configured: '.$archiveDisk.' (run erp:retention:verify-archives for object integrity)'];
+            } catch (\Throwable $exception) {
+                $checks['retention_archive_storage'] = ['fail', 'configured disk '.$archiveDisk.' is unavailable: '.$exception->getMessage()];
+            }
         }
 
         $failed = collect($checks)->filter(fn (array $check): bool => $check[0] !== 'ok')->count();

@@ -21,6 +21,8 @@ use App\Services\WarehouseFulfillmentService;
 use App\Services\ProductLifecycleService;
 use App\Services\NumberingSequenceService;
 use App\Models\DeliveryOperation;
+use App\Models\DeliveryProof;
+use App\Models\DocumentAttachment;
 use App\Models\CustomerProductPrice;
 use App\Services\SerialLifecycleService;
 use App\Services\PromotionService;
@@ -31,6 +33,7 @@ use App\Models\InventoryMovementAllocation;
 use App\Models\Store;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 class SalesFulfillmentController extends Controller
 {
@@ -101,7 +104,7 @@ class SalesFulfillmentController extends Controller
         try { app(\App\Services\SalesDiscountPolicyService::class)->assertCanApprove($order); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         try { foreach ($order->lines as $line) app(ProductLifecycleService::class)->assertSellable($line->product); } catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         $orderValue = (float) $order->lines->sum(fn ($line) => ((float) $line->ordered_qty * (float) $line->unit_price) - (float) $line->discount_amount);
-        try { app(\App\Services\CustomerCreditService::class)->assertCanApprove($order->customer, $orderValue); }
+        try { app(\App\Services\CustomerCreditService::class)->assertCanApprove($order->customer, $orderValue, $order->id); }
         catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
         try { app(StockReservationService::class)->reserveSalesOrder($order->load('lines')); }
         catch (\RuntimeException $exception) { return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']); }
@@ -183,6 +186,63 @@ class SalesFulfillmentController extends Controller
         app(WarehouseFulfillmentService::class)->markDelivered($delivery, $delivery->delivered_at);
         app(AuditService::class)->record('delivery.delivered', $delivery, ['fulfillment_status' => $delivery->getOriginal('fulfillment_status')], ['fulfillment_status' => 'delivered', 'delivered_at' => now()->toISOString()]);
         return back()->with(['message' => 'Delivery marked as delivered.', 'alert-type' => 'success']);
+    }
+
+    public function storeDeliveryProof(Request $request, int $id)
+    {
+        $companyId = $this->companyId();
+        $data = $request->validate([
+            'proof_type' => ['required', Rule::in(['recipient', 'signature', 'photo', 'otp', 'other'])],
+            'external_reference' => ['required', 'string', 'max:150'],
+            'recipient_name' => ['nullable', 'string', 'max:150'],
+            'recipient_contact' => ['nullable', 'string', 'max:100'],
+            'delivered_at' => ['nullable', 'date'],
+            'latitude' => ['nullable', 'numeric', 'between:-90,90'],
+            'longitude' => ['nullable', 'numeric', 'between:-180,180'],
+            'notes' => ['nullable', 'string', 'max:3000'],
+            'file' => ['nullable', 'file', 'max:10240', 'mimes:pdf,jpg,jpeg,png,webp,csv,xls,xlsx,doc,docx'],
+        ]);
+
+        try {
+            DB::transaction(function () use ($request, $companyId, $id, $data): void {
+                $existing = DeliveryProof::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->first();
+                if ($existing) return;
+                $delivery = $this->companyDelivery($id)->load('operations');
+                if ($delivery->status !== 'approved' || $delivery->fulfillment_status === 'cancelled' || !$delivery->operations->firstWhere('operation_type', 'dispatch')) {
+                    throw new \RuntimeException('Only dispatched deliveries can receive proof of delivery.');
+                }
+                $deliveredAt = $data['delivered_at'] ?? now();
+                $attachmentId = null;
+                if ($request->hasFile('file')) {
+                    $file = $request->file('file');
+                    $attachment = DocumentAttachment::create([
+                        'company_id' => $companyId,
+                        'attachable_type' => $delivery->getMorphClass(),
+                        'attachable_id' => $delivery->id,
+                        'original_name' => $file->getClientOriginalName(),
+                        'stored_path' => $file->store('erp-attachments', 'local'),
+                        'mime_type' => $file->getMimeType() ?: 'application/octet-stream',
+                        'size_bytes' => $file->getSize(),
+                        'attachment_type' => str_starts_with((string) $file->getMimeType(), 'image/') ? 'image' : 'document',
+                        'title' => 'Proof of delivery '.$data['external_reference'],
+                        'version' => ((int) DocumentAttachment::where('attachable_type', $delivery->getMorphClass())->where('attachable_id', $delivery->id)->max('version')) + 1,
+                        'uploaded_by' => $request->user()?->id,
+                    ]);
+                    $attachmentId = $attachment->id;
+                    app(AuditService::class)->record('document_attachment.created', $attachment, null, $attachment->toArray());
+                }
+                $proof = DeliveryProof::create(collect($data)->except('file')->all() + ['company_id' => $companyId, 'delivery_id' => $delivery->id, 'delivered_at' => $deliveredAt, 'captured_by' => $request->user()?->id, 'attachment_id' => $attachmentId]);
+                $before = $delivery->only(['fulfillment_status', 'delivered_at', 'proof_of_delivery']);
+                $delivery->update(['fulfillment_status' => 'delivered', 'delivered_at' => $deliveredAt, 'proof_of_delivery' => $data['external_reference']]);
+                app(WarehouseFulfillmentService::class)->markDelivered($delivery, $deliveredAt);
+                app(AuditService::class)->record('delivery.proof_of_delivery.created_from_browser', $proof, null, $proof->toArray());
+                app(AuditService::class)->record('delivery.delivered', $delivery, $before, $delivery->fresh()->only(['fulfillment_status', 'delivered_at', 'proof_of_delivery']));
+            });
+        } catch (\RuntimeException $exception) {
+            return back()->with(['message' => $exception->getMessage(), 'alert-type' => 'error']);
+        }
+
+        return back()->with(['message' => 'Structured proof of delivery captured.', 'alert-type' => 'success']);
     }
     public function cancelDelivery(Request $request, int $id)
     {

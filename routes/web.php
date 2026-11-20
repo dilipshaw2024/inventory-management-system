@@ -238,6 +238,9 @@ Route::controller(StockController::class)->middleware('permission:reports.view')
     Route::get('/stock/aging/export', 'AgingReport')->name('stock.aging.export')->middleware('permission:reports.export');
     Route::get('/stock/location-stock', 'LocationStockReport')->name('stock.location.stock');
     Route::get('/stock/expiry', 'ExpiryReport')->name('stock.expiry');
+    Route::get('/stock/recalls', 'RecallReport')->name('stock.recalls');
+    Route::post('/stock/recalls/{id}/recall', 'RecallBatch')->name('stock.recalls.recall')->middleware('permission:inventory.post');
+    Route::post('/stock/recalls/{id}/release', 'ReleaseBatchRecall')->name('stock.recalls.release')->middleware('permission:inventory.post');
     Route::get('/stock/batch-stock', 'BatchStockReport')->name('stock.batch.stock');
     Route::get('/stock/serial-stock', 'SerialStockReport')->name('stock.serial.stock');
     Route::get('/stock/traceability', 'TraceabilityReport')->name('stock.traceability');
@@ -357,6 +360,8 @@ Route::middleware(['auth', 'permission:purchasing.manage'])->controller(\App\Htt
     Route::patch('/{id}', 'update')->name('update');
 });
 Route::middleware(['auth', 'permission:reports.view'])->get('/reports/inventory-analytics', [InventoryAnalyticsController::class, 'index'])->name('reports.inventory.analytics');
+Route::middleware(['auth', 'permission:reports.view'])->get('/reports/quality-inspections', [\App\Http\Controllers\QualityInspectionReportController::class, 'index'])->name('quality.inspections.report');
+Route::middleware(['auth', 'permission:reports.export'])->get('/reports/quality-inspections/export', [\App\Http\Controllers\QualityInspectionReportController::class, 'export'])->name('quality.inspections.export');
 Route::middleware(['auth', 'permission:reports.view'])->get('/reports/sales', [SalesReportController::class, 'index'])->name('reports.sales');
 Route::middleware(['auth', 'permission:reports.export'])->get('/reports/sales/export', [SalesReportController::class, 'export'])->name('reports.sales.export');
 Route::middleware(['auth', 'permission:reports.view'])->get('/erp/accounting/reconciliation', [ReconciliationController::class, 'index'])->name('erp.accounting.reconciliation');
@@ -367,8 +372,13 @@ Route::middleware(['auth', 'permission:accounting.manage'])->controller(BankReco
     Route::post('/accounts', 'storeAccount')->name('accounts.store');
     Route::post('/lines', 'storeLine')->name('lines.store');
     Route::post('/lines/import', 'importCsv')->name('lines.import');
+    Route::post('/statements', 'storeReconciliation')->name('statements.store');
+    Route::post('/statements/{id}/close', 'closeReconciliation')->name('statements.close');
+    Route::post('/statements/{id}/reopen', 'reopenReconciliation')->name('statements.reopen');
     Route::post('/lines/{id}/match', 'match')->name('lines.match');
     Route::post('/lines/{id}/match/reverse', 'reverseMatch')->name('lines.match.reverse');
+    Route::post('/lines/{id}/settle', 'settle')->name('lines.settle');
+    Route::post('/lines/{id}/settle/reverse', 'reverseSettlement')->name('lines.settle.reverse');
     Route::get('/lines/{id}/suggestions', 'suggestions')->name('lines.suggestions');
     Route::patch('/lines/{id}/status', 'setStatus')->name('lines.status');
 });
@@ -416,6 +426,7 @@ Route::middleware(['auth', 'permission:sales.manage'])->controller(SalesFulfillm
     Route::post('/deliveries/{id}/approve', 'approveDelivery')->name('deliveries.approve')->middleware('permission:inventory.approve');
     Route::post('/deliveries/{id}/reject', 'rejectDelivery')->name('deliveries.reject')->middleware('permission:inventory.approve');
     Route::post('/deliveries/{id}/delivered', 'confirmDelivered')->name('deliveries.delivered')->middleware('permission:sales.manage');
+    Route::post('/deliveries/{id}/proof', 'storeDeliveryProof')->name('deliveries.proof')->middleware('permission:sales.manage');
     Route::post('/deliveries/{id}/cancel', 'cancelDelivery')->name('deliveries.cancel')->middleware('permission:sales.manage');
     Route::post('/deliveries/{id}/operation/{type}', 'completeOperation')->where('type', 'pick|pack')->name('deliveries.operation')->middleware('permission:warehouse.manage');
 });

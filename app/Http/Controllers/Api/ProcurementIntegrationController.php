@@ -42,6 +42,47 @@ use Carbon\CarbonPeriod;
 
 class ProcurementIntegrationController extends Controller
 {
+    public function purchaseOrderClosureReport(Request $request): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $data = $request->validate([
+            'from' => ['nullable', 'date'], 'to' => ['nullable', 'date', 'after_or_equal:from'],
+            'supplier_id' => ['nullable', 'integer'], 'status' => ['nullable', 'in:submitted,approved,partially_received,received,cancelled'],
+            'open_only' => ['nullable', 'boolean'], 'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
+        $orders = PurchaseOrder::with(['supplier', 'lines.product', 'receipts.lines'])
+            ->where('company_id', $companyId)
+            ->when($data['from'] ?? null, fn ($query, $from) => $query->whereDate('date', '>=', $from))
+            ->when($data['to'] ?? null, fn ($query, $to) => $query->whereDate('date', '<=', $to))
+            ->when($data['supplier_id'] ?? null, fn ($query, $supplierId) => $query->where('supplier_id', $supplierId))
+            ->when($data['status'] ?? null, fn ($query, $status) => $query->where('status', $status))
+            ->orderByDesc('date')->orderByDesc('id')->get();
+        $rows = $orders->map(function (PurchaseOrder $order): array {
+            $ordered = (float) $order->lines->sum('ordered_qty');
+            $received = (float) $order->lines->sum('received_qty');
+            $remaining = max(0, $ordered - $received);
+            $orderedValue = (float) $order->lines->sum(fn ($line): float => (float) $line->ordered_qty * (float) $line->unit_price);
+            $receivedValue = (float) $order->lines->sum(fn ($line): float => (float) $line->received_qty * (float) $line->unit_price);
+            $closureStatus = $order->receiving_closed || $order->status === 'received'
+                ? ($remaining > 0.000001 ? 'closed_shortage' : 'closed')
+                : ($remaining > 0.000001 ? 'open' : 'ready_to_close');
+            return [
+                'id' => (int) $order->id, 'po_no' => $order->po_no, 'supplier_id' => (int) $order->supplier_id,
+                'supplier' => $order->supplier?->name, 'status' => $order->status, 'date' => optional($order->date)->toDateString(),
+                'expected_date' => optional($order->expected_date)->toDateString(), 'receiving_closed' => (bool) $order->receiving_closed,
+                'ordered_quantity' => $ordered, 'received_quantity' => $received, 'remaining_quantity' => $remaining,
+                'ordered_value' => round($orderedValue, 6), 'received_value' => round($receivedValue, 6),
+                'remaining_value' => round(max(0, $orderedValue - $receivedValue), 6), 'closure_status' => $closureStatus,
+            ];
+        })->when(($data['open_only'] ?? false), fn ($rows) => $rows->whereIn('closure_status', ['open', 'ready_to_close'])->values())->values();
+        $perPage = (int) ($data['per_page'] ?? 50); $page = max(1, (int) $request->input('page', 1));
+        return response()->json([
+            'data' => $rows->forPage($page, $perPage)->values(),
+            'summary' => ['orders' => $rows->count(), 'ordered_quantity' => (float) $rows->sum('ordered_quantity'), 'received_quantity' => (float) $rows->sum('received_quantity'), 'remaining_quantity' => (float) $rows->sum('remaining_quantity'), 'ordered_value' => (float) $rows->sum('ordered_value'), 'received_value' => (float) $rows->sum('received_value'), 'remaining_value' => (float) $rows->sum('remaining_value'), 'open_orders' => $rows->where('closure_status', 'open')->count(), 'closed_shortage_orders' => $rows->where('closure_status', 'closed_shortage')->count()],
+            'meta' => ['from' => $data['from'] ?? null, 'to' => $data['to'] ?? null, 'supplier_id' => $data['supplier_id'] ?? null, 'open_only' => (bool) ($data['open_only'] ?? false), 'current_page' => $page, 'per_page' => $perPage, 'total' => $rows->count(), 'last_page' => max(1, (int) ceil($rows->count() / $perPage))],
+        ]);
+    }
+
     public function purchasePriceVariances(Request $request): JsonResponse
     {
         $data = $request->validate([
@@ -312,6 +353,44 @@ class ProcurementIntegrationController extends Controller
         return response()->json(['data' => $invoice->load('supplier', 'purchaseOrder', 'lines.product'), 'status' => $invoice->status]);
     }
 
+    public function resolveInvoiceVariance(Request $request, int $id): JsonResponse
+    {
+        $data = $request->validate([
+            'resolution' => ['required', 'in:accept_variance,reject_variance'],
+            'resolution_reason' => ['required', 'string', 'max:3000'],
+        ]);
+        $companyId = $request->user()?->company_id;
+        $actorId = $request->user()?->id ?? auth()->id();
+        $invoice = DB::transaction(function () use ($data, $id, $companyId, $actorId): PurchaseInvoice {
+            $invoice = PurchaseInvoice::with(['lines.purchaseOrderLine', 'lines.goodsReceiptLine.goodsReceipt', 'lines.product'])
+                ->where('company_id', $companyId)->lockForUpdate()->findOrFail($id);
+            if ($invoice->status !== 'pending' || !in_array($invoice->variance_status, ['none', 'pending'], true)) {
+                throw new \RuntimeException('Only pending invoices with an unresolved variance can be resolved.');
+            }
+            $tolerance = (float) app(\App\Services\ErpSettingService::class)->get('purchase_price_variance_percent', 0, $companyId);
+            $hasVariance = false;
+            foreach ($invoice->lines as $line) {
+                $receiptLine = $line->goodsReceiptLine;
+                $baseline = $receiptLine?->unit_cost !== null ? (float) $receiptLine->unit_cost : (float) ($line->purchaseOrderLine?->unit_price ?? 0);
+                if ($tolerance > 0 && $baseline > 0 && abs((float) $line->unit_price - $baseline) / $baseline * 100 > $tolerance + 0.000001) {
+                    $hasVariance = true;
+                    break;
+                }
+            }
+            if (!$hasVariance) throw new \RuntimeException('This invoice has no price variance above the configured tolerance.');
+            app(ApprovalGuard::class)->assertDifferent($invoice, $actorId, $companyId);
+            $before = $invoice->only(['status', 'variance_status', 'variance_reason', 'variance_approved_by', 'variance_approved_at', 'variance_rejected_by', 'variance_rejected_at']);
+            if ($data['resolution'] === 'accept_variance') {
+                $invoice->update(['variance_status' => 'approved', 'variance_reason' => $data['resolution_reason'], 'variance_approved_by' => $actorId, 'variance_approved_at' => now(), 'variance_rejected_by' => null, 'variance_rejected_at' => null]);
+            } else {
+                $invoice->update(['status' => 'rejected', 'rejection_reason' => $data['resolution_reason'], 'rejected_by' => $actorId, 'rejected_at' => now(), 'variance_status' => 'rejected', 'variance_reason' => $data['resolution_reason'], 'variance_rejected_by' => $actorId, 'variance_rejected_at' => now()]);
+            }
+            app(AuditService::class)->record('purchase_invoice.variance_resolved', $invoice, $before, $invoice->fresh()->only(['status', 'variance_status', 'variance_reason', 'variance_approved_by', 'variance_approved_at', 'variance_rejected_by', 'variance_rejected_at']));
+            return $invoice->fresh();
+        });
+        return response()->json(['data' => $invoice->load('supplier', 'purchaseOrder', 'lines.product'), 'status' => $invoice->status, 'variance_status' => $invoice->variance_status]);
+    }
+
     public function createReceipt(Request $request): JsonResponse
     {
         $companyId = $request->user()?->company_id;
@@ -493,6 +572,61 @@ class ProcurementIntegrationController extends Controller
             return $order->fresh();
         });
         return response()->json(['data' => $order->load('supplier', 'lines.product'), 'status' => $order->status]);
+    }
+
+    public function updateOrder(Request $request, int $id): JsonResponse
+    {
+        $companyId = $request->user()?->company_id;
+        $owned = fn (string $table) => Rule::exists($table, 'id')->where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'));
+        $data = $request->validate([
+            'external_reference' => ['nullable', 'string', 'max:150'],
+            'supplier_id' => ['required', 'integer', $owned('suppliers')], 'date' => ['required', 'date'],
+            'price_list_id' => ['nullable', 'integer', Rule::exists('price_lists', 'id')->where(fn ($query) => $query->where('company_id', $companyId)->where('list_type', 'purchase'))],
+            'expected_date' => ['nullable', 'date', 'after_or_equal:date'], 'currency_code' => ['nullable', 'string', 'size:3'],
+            'exchange_rate' => ['nullable', 'numeric', 'gt:0'], 'description' => ['nullable', 'string', 'max:2000'],
+            'lines' => ['required', 'array', 'min:1'], 'lines.*.product_id' => ['required', 'integer', $owned('products')],
+            'lines.*.location_id' => ['nullable', 'integer', $owned('inventory_locations')], 'lines.*.uom_id' => ['nullable', 'integer', $owned('units')], 'lines.*.quantity' => ['required', 'numeric', 'gt:0'],
+            'lines.*.unit_price' => ['nullable', 'numeric', 'min:0'],
+        ]);
+        $order = PurchaseOrder::with('lines')->where('company_id', $companyId)->findOrFail($id);
+        if (!in_array($order->status, ['submitted', 'rejected'], true)) throw new \RuntimeException('Only submitted or rejected purchase orders can be revised.');
+        if ($order->receipts()->where('status', 'approved')->exists() || (float) $order->lines->sum('received_qty') > 0) throw new \RuntimeException('A purchase order with posted receipts cannot be revised.');
+        if (!empty($data['external_reference'])) {
+            $duplicate = PurchaseOrder::where('company_id', $companyId)->where('external_reference', $data['external_reference'])->where('id', '!=', $id)->exists();
+            if ($duplicate) abort(422, 'The purchase-order external reference is already used by this company.');
+        }
+        $supplier = Supplier::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($data['supplier_id']);
+        $priceList = !empty($data['price_list_id']) ? PriceList::where('company_id', $companyId)->where('list_type', 'purchase')->findOrFail($data['price_list_id']) : null;
+        $currency = strtoupper($data['currency_code'] ?? ($request->user()?->company?->base_currency ?? 'USD'));
+        if ($priceList && (!$priceList->is_active || ($priceList->starts_on && $priceList->starts_on->toDateString() > $data['date']) || ($priceList->ends_on && $priceList->ends_on->toDateString() < $data['date']))) abort(422, 'The selected purchase price list is not active for the order date.');
+        if ($priceList && $priceList->currency_code !== $currency) abort(422, 'The selected purchase price list currency does not match the order currency.');
+
+        $revised = DB::transaction(function () use ($data, $order, $supplier, $priceList, $currency, $companyId, $request): PurchaseOrder {
+            $locked = PurchaseOrder::with('lines')->where('company_id', $companyId)->lockForUpdate()->findOrFail($order->id);
+            $before = $locked->toArray() + ['lines' => $locked->lines->map(fn (PurchaseOrderLine $line): array => $line->only(['product_id', 'location_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price']))->values()->all()];
+            $locked->update([
+                'external_reference' => $data['external_reference'] ?? null, 'supplier_id' => $supplier->id, 'price_list_id' => $priceList?->id,
+                'date' => $data['date'], 'expected_date' => $data['expected_date'] ?? null, 'description' => $data['description'] ?? null,
+                'currency_code' => $currency, 'exchange_rate' => $data['exchange_rate'] ?? 1, 'status' => 'submitted',
+                'approved_by' => null, 'approved_at' => null, 'rejection_reason' => null, 'rejected_by' => null, 'rejected_at' => null,
+            ]);
+            $locked->lines()->delete();
+            foreach ($data['lines'] as $line) {
+                $product = Product::where(fn ($query) => $query->where('company_id', $companyId)->orWhereNull('company_id'))->findOrFail($line['product_id']);
+                app(ProductLifecycleService::class)->assertPurchasable($product);
+                $enteredQuantity = (float) $line['quantity']; $uomId = $line['uom_id'] ?? null;
+                $stockQuantity = app(UomConversionService::class)->toStock($product, $enteredQuantity, $uomId ? (int) $uomId : null, 'purchase');
+                $unitPrice = array_key_exists('unit_price', $line) && $line['unit_price'] !== null ? (float) $line['unit_price'] : 0;
+                $agreement = app(SupplierProductPriceService::class)->bestFor($supplier, $product, $stockQuantity, $locked->date->toDateString(), $locked->currency_code, $locked->price_list_id);
+                if ($agreement && $unitPrice <= 0) $unitPrice = (float) $agreement->unit_price;
+                if ($uomId) $unitPrice /= max($stockQuantity / $enteredQuantity, 0.000001);
+                PurchaseOrderLine::create(['purchase_order_id' => $locked->id, 'product_id' => $product->id, 'location_id' => $line['location_id'] ?? null, 'uom_id' => $uomId, 'uom_quantity' => $enteredQuantity, 'ordered_qty' => $stockQuantity, 'unit_price' => $unitPrice]);
+            }
+            $after = $locked->fresh('lines');
+            app(AuditService::class)->record('purchase_order.revised', $after, $before, $after->toArray() + ['lines' => $after->lines->map(fn (PurchaseOrderLine $line): array => $line->only(['product_id', 'location_id', 'uom_id', 'uom_quantity', 'ordered_qty', 'unit_price']))->values()->all(), 'revised_by' => $request->user()?->id]);
+            return $after;
+        });
+        return response()->json(['data' => $revised->load('supplier', 'priceList', 'lines.product'), 'status' => 'pending_approval']);
     }
 
     public function inspectReceipt(Request $request, int $id): JsonResponse

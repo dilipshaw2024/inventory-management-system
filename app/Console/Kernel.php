@@ -45,12 +45,14 @@ class Kernel extends ConsoleKernel
         $schedule->command('erp:accounting:sync-bank-statements')->dailyAt('01:00')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:accounting:auto-match-bank-statements')->dailyAt('01:05')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:accounting:retry-tax-filings')->dailyAt('01:20')->withoutOverlapping(60)->onOneServer();
+        $schedule->command('erp:accounting:retry-e-invoices')->dailyAt('01:25')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:approvals:escalate')->hourly()->withoutOverlapping(55)->onOneServer();
         $schedule->command('erp:accounting:budget-alerts')->dailyAt('07:00')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:procurement:corrective-action-alerts')->dailyAt('07:05')->withoutOverlapping(60)->onOneServer();
         $schedule->command('erp:inventory:capture-snapshot')->dailyAt('23:55')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:warehouse:capture-utilization')->dailyAt('23:50')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:security:verify-audit-chain')->dailyAt('00:10')->withoutOverlapping(120)->onOneServer();
+        $schedule->command('erp:retention:verify-archives')->dailyAt('00:15')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:reconcile-inventory-ledger --fail-on-mismatch')->dailyAt('00:20')->withoutOverlapping(120)->onOneServer();
         $schedule->command('erp:products:process-import-jobs')->hourly()->withoutOverlapping(55)->onOneServer();
     }

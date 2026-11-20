@@ -122,7 +122,11 @@ class InventoryCostingService
             ->when($locationId !== null, fn ($query) => $query->where('location_id', $locationId))
             ->when($batchId !== null, fn ($query) => $query->where('batch_id', $batchId))
             ->orderBy('received_at')->orderBy('id')->lockForUpdate()->get();
+        $hadBatchLayers = $layers->isNotEmpty();
+        $hasRecalledBatch = false;
         if (in_array($product?->tracking_type, ['batch', 'lot'], true)) {
+            $hasRecalledBatch = $layers->contains(fn ($layer): bool => $layer->batch?->recalled_at !== null && $layer->batch?->recall_released_at === null);
+            $layers = $layers->reject(fn ($layer): bool => $layer->batch?->recalled_at !== null && $layer->batch?->recall_released_at === null)->values();
             $layers = $layers->sortBy(fn ($layer) => ($layer->batch?->expiry_date ?? $layer->batch?->best_before_date)?->timestamp ?? PHP_INT_MAX)->values();
             $hasBatchDate = $layers->contains(fn ($layer) => $layer->batch?->expiry_date !== null || $layer->batch?->best_before_date !== null);
             if ($hasBatchDate) {
@@ -165,6 +169,10 @@ class InventoryCostingService
 
         if ($remaining > 0) {
             if ($batchId !== null) throw new \RuntimeException('Insufficient stock in the selected batch.');
+            if ($hasRecalledBatch) throw new \RuntimeException('Insufficient non-recalled batch stock for '.($product?->name ?? 'product').'.');
+            if (in_array($product?->tracking_type, ['batch', 'lot'], true) && $hadBatchLayers) {
+                throw new \RuntimeException('Insufficient eligible batch stock for '.($product?->name ?? 'product').'.');
+            }
             if (in_array($product?->tracking_type, ['batch', 'lot'], true) && $hasBatchDate) {
                 throw new \RuntimeException('Insufficient non-expired batch stock for '.($product?->name ?? 'product').'.');
             }

@@ -1,0 +1,63 @@
+<?php
+
+namespace App\Services\Integrations;
+
+use App\Models\Invoice;
+
+/**
+ * Builds a transport-neutral Japanese qualified-invoice payload.
+ * Registration validation, qualified-invoice issuance and gateway delivery
+ * remain deployment responsibilities.
+ */
+class JapanQualifiedInvoiceEInvoiceProvider implements EInvoiceProvider
+{
+    public function key(): string { return 'japan_qualified_invoice'; }
+
+    public function prepare(Invoice $invoice): array
+    {
+        $invoice->loadMissing(['company', 'customer', 'invoice_details.product']);
+        $lines = $invoice->invoice_details->values()->map(function ($line, int $index): array {
+            $quantity = round((float) ($line->selling_qty ?? 0), 4);
+            $unitPrice = round((float) ($line->unit_price ?? 0), 2);
+            $amount = round((float) ($line->selling_price ?? ($quantity * $unitPrice)), 2);
+            $rate = round((float) ($line->tax_rate ?? 0), 4);
+            $tax = round((float) ($line->tax_amount ?? ($amount * $rate / 100)), 2);
+            return [
+                'line_number' => $index + 1,
+                'item_code' => (string) ($line->product?->sku ?: $line->product_id),
+                'description' => (string) ($line->product?->name ?: 'Item '.$line->product_id),
+                'quantity' => $quantity,
+                'unit_price' => $unitPrice,
+                'amount' => $amount,
+                'tax_rate' => $rate,
+                'tax_category' => $rate > 0 ? 'standard' : 'exempt_or_zero_rated',
+                'tax_amount' => $tax,
+            ];
+        })->all();
+        $payload = [
+            'schema' => 'JAPAN_QUALIFIED_INVOICE',
+            'invoice' => [
+                'id' => (string) ($invoice->invoice_no ?: 'INV-'.$invoice->id),
+                'issue_date' => optional($invoice->date ?: $invoice->created_at)->toDateString(),
+                'currency' => strtoupper((string) ($invoice->currency_code ?: 'JPY')),
+                'subtotal' => $this->amount($invoice->subtotal_amount),
+                'tax_amount' => $this->amount($invoice->tax_amount),
+                'total' => $this->amount($invoice->total_amount),
+            ],
+            'seller' => ['name' => (string) ($invoice->company?->name ?? ''), 'qualified_invoice_registration_number' => $this->taxNumber($invoice->company)],
+            'buyer' => ['name' => (string) ($invoice->customer?->name ?? ''), 'tax_identifier' => $this->taxNumber($invoice->customer)],
+            'lines' => $lines,
+            'japan' => ['qualified_invoice_display_required' => true, 'registration_scheme' => 'JCT', 'requires_gateway_submission' => true],
+        ];
+        $payload['payload_hash'] = hash('sha256', json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION));
+        return $payload;
+    }
+
+    private function amount($value): float { return round((float) ($value ?? 0), 2); }
+
+    private function taxNumber($party): ?string
+    {
+        if (!$party) return null;
+        return strtoupper(preg_replace('/\s+/', '', (string) ($party->tax_registration_number ?? $party->tax_number ?? ''))) ?: null;
+    }
+}

@@ -25,7 +25,14 @@ class PurchaseInvoiceService
                 $baselinePrice = $receiptLine ? (float) $receiptLine->unit_cost : (float) $poLine->unit_price;
                 if ($tolerance > 0 && $baselinePrice > 0) {
                     $variance = abs((float) $line->unit_price - $baselinePrice) / $baselinePrice * 100;
-                    if ($variance > $tolerance + 0.000001) throw new \RuntimeException('Invoice price variance exceeds the configured '.$tolerance.'% tolerance against the '.($receiptLine ? 'receipt' : 'purchase-order').' price for '.$line->product->name.'.');
+                    if ($variance > $tolerance + 0.000001) {
+                        if ($invoice->variance_status !== 'approved') {
+                            throw new \RuntimeException('Invoice price variance exceeds the configured '.$tolerance.'% tolerance against the '.($receiptLine ? 'receipt' : 'purchase-order').' price for '.$line->product->name.'; an independent variance approval is required.');
+                        }
+                        if ((int) $invoice->variance_approved_by === (int) auth()->id()) {
+                            throw new \RuntimeException('The user who approved the invoice variance cannot approve the same invoice.');
+                        }
+                    }
                 }
                 $alreadyBilled = (float) $invoice->lines()->where('purchase_order_line_id', $line->purchase_order_line_id)->where('id', '<>', $line->id)->sum('quantity');
                 $approvedOther = (float) DB::table('purchase_invoice_lines')->join('purchase_invoices', 'purchase_invoices.id', '=', 'purchase_invoice_lines.purchase_invoice_id')->where('purchase_invoice_lines.purchase_order_line_id', $line->purchase_order_line_id)->where('purchase_invoices.status', 'approved')->sum('purchase_invoice_lines.quantity');

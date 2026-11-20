@@ -113,16 +113,16 @@ class DataRetentionController extends Controller
     {
         $request->validate(['format' => ['nullable', 'in:csv,xlsx']]);
         $archives = DataRetentionArchive::where('company_id', $this->companyId())->orderBy('id')->cursor();
-        $headers = ['id', 'record_type', 'record_id', 'archived_at', 'payload_hash', 'payload'];
+        $headers = ['id', 'record_type', 'record_id', 'archived_at', 'payload_hash', 'external_disk', 'external_path', 'external_bytes', 'external_hash', 'payload'];
         if ($request->input('format') === 'xlsx') {
-            $values = $archives->map(fn ($archive): array => [$archive->id, $archive->record_type, $archive->record_id, optional($archive->archived_at)->toIso8601String(), $archive->payload_hash, json_encode($archive->payload, JSON_UNESCAPED_SLASHES)])->all();
+            $values = $archives->map(fn ($archive): array => [$archive->id, $archive->record_type, $archive->record_id, optional($archive->archived_at)->toIso8601String(), $archive->payload_hash, $archive->external_disk, $archive->external_path, $archive->external_bytes, $archive->external_hash, json_encode($archive->payload, JSON_UNESCAPED_SLASHES)])->all();
             return response($spreadsheet->write($headers, $values), 200, ['Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition' => 'attachment; filename="retention-archives-'.now()->format('YmdHis').'.xlsx"']);
         }
         return response()->streamDownload(function () use ($archives, $headers): void {
             $handle = fopen('php://output', 'wb');
             fputcsv($handle, $headers);
             foreach ($archives as $archive) {
-                fputcsv($handle, [$archive->id, $archive->record_type, $archive->record_id, optional($archive->archived_at)->toIso8601String(), $archive->payload_hash, json_encode($archive->payload, JSON_UNESCAPED_SLASHES)]);
+                fputcsv($handle, [$archive->id, $archive->record_type, $archive->record_id, optional($archive->archived_at)->toIso8601String(), $archive->payload_hash, $archive->external_disk, $archive->external_path, $archive->external_bytes, $archive->external_hash, json_encode($archive->payload, JSON_UNESCAPED_SLASHES)]);
             }
             fclose($handle);
         }, 'retention-archives-'.now()->format('YmdHis').'.csv', ['Content-Type' => 'text/csv']);
